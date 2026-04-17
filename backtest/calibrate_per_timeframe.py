@@ -85,10 +85,15 @@ from backtest.optimizer import ParameterOptimizer
 
 PARAM_GRIDS: Dict[str, Dict[str, List]] = {
     "5m": {
-        "regime__trend_strength_threshold": [0.0008, 0.0014, 0.0020],
-        "regime__efficiency_trend_threshold": [0.10, 0.18, 0.26],
+        # Grid floors expanded 2026-04-17 to match observed empirical distribution
+        # on BTC-USDT 5m: trend_bias p25≈-1e-4, anchor_slope p25≈-1e-4,
+        # efficiency_ratio p25≈0.06. Old floors (0.0008 / 0.10 / 0.0006) were
+        # above the 67th percentile so the optimizer was forced into corner
+        # solutions and could never learn bear-side trend detection.
+        "regime__trend_strength_threshold": [-0.0001, 0.0006, 0.0015],
+        "regime__efficiency_trend_threshold": [0.06, 0.15, 0.25],
         "min_confidence": [0.35, 0.45, 0.55],
-        "regime__anchor_slope_threshold": [0.0006, 0.0010, 0.0015],
+        "regime__anchor_slope_threshold": [-0.0001, 0.0004, 0.0010],
     },
     "15m": {
         "regime__trend_strength_threshold": [0.0006, 0.0010, 0.0016],
