@@ -7,11 +7,14 @@ Grid search over strategy parameters with comparison output.
 import os
 import sys
 import itertools
+from copy import deepcopy
 from typing import Dict, List
 
 import pandas as pd
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(project_root, 'scripts'))
+sys.path.insert(0, project_root)
 from trading_strategy import create_strategy
 from backtest.backtester import Backtester, BacktestConfig, BacktestResult
 
@@ -19,9 +22,24 @@ from backtest.backtester import Backtester, BacktestConfig, BacktestResult
 class ParameterOptimizer:
     """Grid search over strategy parameters"""
 
-    def __init__(self, candles_df: pd.DataFrame, base_strategy_config: Dict):
+    def __init__(self, candles_df: pd.DataFrame, base_strategy_config: Dict,
+                 strategy_name: str = "advanced"):
         self.candles_df = candles_df
         self.base_config = dict(base_strategy_config)
+        self.strategy_name = strategy_name
+
+    @staticmethod
+    def _set_nested(config: Dict, key: str, value) -> None:
+        """Set a value on config, supporting '__' as nested dict separator.
+
+        Example: _set_nested(cfg, 'regime__efficiency_trend_threshold', 0.15)
+        sets cfg['regime']['efficiency_trend_threshold'] = 0.15
+        """
+        parts = key.split('__')
+        target = config
+        for part in parts[:-1]:
+            target = target.setdefault(part, {})
+        target[parts[-1]] = value
 
     def optimize(self, param_grid: Dict[str, List],
                  backtest_config: BacktestConfig = None) -> pd.DataFrame:
@@ -55,7 +73,7 @@ class ParameterOptimizer:
             print(f"  [{i+1}/{len(combinations)}] {params}")
 
             # Build strategy config
-            strategy_config = dict(self.base_config)
+            strategy_config = deepcopy(self.base_config)
             bt_cfg = BacktestConfig(
                 initial_balance=backtest_config.initial_balance,
                 fee_rate=backtest_config.fee_rate,
@@ -75,10 +93,10 @@ class ParameterOptimizer:
                 elif name == 'risk_per_trade_pct':
                     bt_cfg.risk_per_trade_pct = value
                 else:
-                    strategy_config[name] = value
+                    self._set_nested(strategy_config, name, value)
 
             # Create strategy and run backtest
-            strategy = create_strategy("advanced", strategy_config)
+            strategy = create_strategy(self.strategy_name, strategy_config)
             backtester = Backtester(strategy, bt_cfg)
             result = backtester.run(self.candles_df)
 
@@ -158,11 +176,11 @@ class ParameterOptimizer:
 
             for combo in combinations:
                 params = dict(zip(param_names, combo))
-                strategy_config = dict(self.base_config)
+                strategy_config = deepcopy(self.base_config)
                 bt_cfg = self._make_bt_config(backtest_config, params,
                                               strategy_config)
 
-                strategy = create_strategy("advanced", strategy_config)
+                strategy = create_strategy(self.strategy_name, strategy_config)
                 backtester = Backtester(strategy, bt_cfg)
                 result = backtester.run(train_data)
 
@@ -180,10 +198,10 @@ class ParameterOptimizer:
                   f"(Sharpe={best_sharpe:.2f})")
 
             # Phase 2: Test best params on OOS data
-            strategy_config = dict(self.base_config)
+            strategy_config = deepcopy(self.base_config)
             bt_cfg = self._make_bt_config(backtest_config, best_params,
                                           strategy_config)
-            strategy = create_strategy("advanced", strategy_config)
+            strategy = create_strategy(self.strategy_name, strategy_config)
             backtester = Backtester(strategy, bt_cfg)
             oos_result = backtester.run(test_data)
 
@@ -234,7 +252,7 @@ class ParameterOptimizer:
             elif name == 'risk_per_trade_pct':
                 bt_cfg.risk_per_trade_pct = value
             else:
-                strategy_config[name] = value
+                self._set_nested(strategy_config, name, value)
         return bt_cfg
 
     @staticmethod

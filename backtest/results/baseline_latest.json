@@ -1,24 +1,24 @@
 {
-  "total_trades": 36,
-  "long_trades": 36,
+  "total_trades": 31,
+  "long_trades": 31,
   "short_trades": 0,
-  "win_rate": 0.08333333333333333,
-  "avg_win": 0.11707003155833329,
-  "avg_loss": -0.33747713027809717,
-  "profit_factor": 0.031536152191695324,
-  "total_pnl": -10.785535204502207,
-  "total_roi": -9.378726264784527,
-  "max_drawdown_pct": 9.378726264784506,
-  "sharpe_ratio": -17.261024914019554,
+  "win_rate": 0.0967741935483871,
+  "avg_win": 0.1636521456173217,
+  "avg_loss": -0.35395684102471686,
+  "profit_factor": 0.04953756059138956,
+  "total_pnl": -9.419835111840106,
+  "total_roi": -8.191160966817483,
+  "max_drawdown_pct": 8.468558974176798,
+  "sharpe_ratio": -15.137778182773546,
   "initial_balance": 115.0,
-  "final_balance": 104.21446479549782,
+  "final_balance": 105.5801648881599,
   "regime_metrics": {
     "range": {
-      "trades": 36,
-      "win_rate": 0.08333333333333333,
-      "profit_factor": 0.031536152191695324,
-      "total_pnl": -10.785535204502207,
-      "avg_hold_bars": 4.027777777777778
+      "trades": 31,
+      "win_rate": 0.0967741935483871,
+      "profit_factor": 0.04953756059138956,
+      "total_pnl": -9.419835111840106,
+      "avg_hold_bars": 3.4516129032258065
     }
   },
   "baseline_config": {
@@ -29,15 +29,15 @@
     "slippage_pct": 0.05
   },
   "rejection_stats": {
-    "chop_regime": 18754,
-    "range_no_edge": 6819,
+    "range_no_edge": 6212,
+    "chop_regime": 19400,
     "trade_spacing": 1
   },
   "near_miss_stats": {
-    "bull_near_miss": 2731,
-    "bear_near_miss": 2966
+    "bear_near_miss": 3028,
+    "bull_near_miss": 2881
   },
   "data_file": "regime_diagnostics.csv",
-  "data_rows": 25919,
-  "timestamp": "2026-04-05T00:48:57.393056"
+  "data_rows": 25920,
+  "timestamp": "2026-04-17T19:46:59.321282"
 }

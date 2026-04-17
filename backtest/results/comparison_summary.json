@@ -1,0 +1,87 @@
+{
+  "advanced_baseline": {
+    "total_trades": 31,
+    "long_trades": 31,
+    "short_trades": 0,
+    "win_rate": 0.0967741935483871,
+    "avg_win": 14.433002759671353,
+    "avg_loss": -31.716692972333725,
+    "profit_factor": 0.04875644362326299,
+    "total_pnl": -844.7683949463302,
+    "total_roi": -8.447683949463302,
+    "max_drawdown_pct": 8.72955004615551,
+    "sharpe_ratio": -15.135792058840721,
+    "initial_balance": 10000.0,
+    "final_balance": 9155.231605053663,
+    "regime_metrics": {
+      "range": {
+        "trades": 31,
+        "win_rate": 0.0967741935483871,
+        "profit_factor": 0.04875644362326299,
+        "total_pnl": -844.7683949463302,
+        "avg_hold_bars": 3.5161290322580645
+      }
+    }
+  },
+  "robust_baseline": {
+    "total_trades": 356,
+    "long_trades": 167,
+    "short_trades": 189,
+    "win_rate": 0.2443820224719101,
+    "avg_win": 62.224476374445985,
+    "avg_loss": -38.53495456362008,
+    "profit_factor": 0.5222438952705457,
+    "total_pnl": -4952.373333037001,
+    "total_roi": -49.523733330370014,
+    "max_drawdown_pct": 49.63738827800404,
+    "sharpe_ratio": -10.996090754928673,
+    "initial_balance": 10000.0,
+    "final_balance": 5047.626666963002,
+    "regime_metrics": {
+      "bear_trend": {
+        "trades": 189,
+        "win_rate": 0.21693121693121692,
+        "profit_factor": 0.49897540938448737,
+        "total_pnl": -3039.112371541248,
+        "avg_hold_bars": 11.058201058201059
+      },
+      "bull_trend": {
+        "trades": 167,
+        "win_rate": 0.2754491017964072,
+        "profit_factor": 0.5550667599795985,
+        "total_pnl": -1913.2609614957528,
+        "avg_hold_bars": 9.7125748502994
+      }
+    }
+  },
+  "advanced_best": {
+    "params": {
+      "regime__efficiency_trend_threshold": 0.1,
+      "regime__trend_strength_threshold": 0.002,
+      "regime__anchor_slope_threshold": 0.001
+    },
+    "metrics": {
+      "total_trades": "23",
+      "win_rate": 0.08695652173913043,
+      "total_roi": -6.232401166588748,
+      "profit_factor": 0.0615873990494072,
+      "sharpe_ratio": -12.855802136676713,
+      "max_drawdown_pct": 6.521158467689826
+    }
+  },
+  "robust_best": {
+    "params": {
+      "min_trend_strength": 0.0035,
+      "pullback_atr_multiple": 0.8,
+      "stop_atr_multiple": 2.2
+    },
+    "metrics": {
+      "total_trades": "271",
+      "win_rate": 0.25461254612546125,
+      "total_roi": -38.401416240234596,
+      "profit_factor": 0.5550391980836162,
+      "sharpe_ratio": -7.953185398421301,
+      "max_drawdown_pct": 38.401416240234546
+    }
+  }
+}
