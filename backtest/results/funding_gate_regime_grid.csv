@@ -1,0 +1,2 @@
+regime,baseline_trades,passed_trades,skipped_trades,baseline_wr,passed_wr,skipped_wr,baseline_pnl,passed_pnl,skipped_pnl
+range,31,19,12,0.0967741935483871,0.10526315789473684,0.08333333333333333,-9.419835111840106,-5.427291654579551,-3.992543457260556
