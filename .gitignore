@@ -1,0 +1,49 @@
+# API Credentials - NEVER COMMIT!
+config.json
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Logs
+memory/
+*.log
+*.jsonl
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# One-time scripts (bevatten embedded credentials)
+do-upgrade.sh
+upgrade-to-hybrid.sh
+deploy-fixes.sh
+setup-tailscale.sh
+setup-tailscale-fixed.sh
+sync-docs.sh
+
+# Interne docs (bevatten wachtwoorden/IPs)
+UPGRADE-INSTRUCTIES.md
+SETUP-INSTRUCTIES.md
+UPGRADE-SAMENVATTING.md
+
+# Applied patches
+*.patch
+
+# Backtest data (regenereerbaar via data_collector.py)
+backtest/data/*.csv
+backtest/results/regime_diagnostics.csv
+backtest/results/archive/
+
+# Archive (oude configs met credentials)
+archive/

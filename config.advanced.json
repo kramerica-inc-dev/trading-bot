@@ -1,0 +1,64 @@
+{
+  "_comment": "Advanced Multi-Indicator Confluence Strategy",
+  
+  "api_key": "YOUR_API_KEY",
+  "api_secret": "YOUR_API_SECRET",
+  "passphrase": "YOUR_PASSPHRASE",
+  
+  "demo_mode": false,
+  "dry_run": true,
+  
+  "trading_pair": "BTC-USDT",
+  "timeframe": "5m",
+  
+  "strategy_name": "advanced",
+  
+  "strategy": {
+    "_comment": "Multi-Indicator Confluence Parameters",
+    
+    "_RSI_settings": "Momentum indicator",
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    
+    "_MACD_settings": "Trend strength",
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    
+    "_Bollinger_Bands": "Volatility bands",
+    "bb_period": 20,
+    "bb_std": 2.0,
+    
+    "_Volume_confirmation": "Volume filter",
+    "volume_period": 20,
+    "volume_threshold": 1.2,
+    
+    "_ATR_adaptive_sizing": "Volatility-based position sizing",
+    "atr_period": 14,
+    "stop_loss_atr_mult": 2.0,
+    "take_profit_atr_mult": 3.0,
+    
+    "_Confluence_threshold": "Minimum confidence to trade",
+    "min_confidence": 0.45,
+    "min_votes": 2
+  },
+  
+  "risk_per_trade_pct": 10.0,
+  "min_confidence": 0.45,
+  
+  "_How_it_works": {
+    "description": "Combines 4 indicators: RSI, MACD, Bollinger Bands, Volume",
+    "trade_condition": "Requires 2+ indicators agreeing (confluence)",
+    "position_sizing": "Adaptive based on ATR volatility",
+    "stop_loss": "2x ATR distance (dynamic)",
+    "take_profit": "3x ATR distance (dynamic)",
+    "advantage": "Higher win rate, fewer false signals, volatility protection"
+  },
+  
+  "_Example_signals": {
+    "strong_buy": "RSI<30 + MACD bullish + Price at lower BB + High volume",
+    "weak_buy": "Only RSI<30 (no trade, needs 2+ indicators)",
+    "no_signal": "Indicators conflicting or neutral"
+  }
+}

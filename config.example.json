@@ -1,0 +1,91 @@
+{
+  "_comment": "Trading Bot Configuration — v2 schema",
+  "_version": "2.4",
+  "exchange": "blofin",
+  "blofin": {
+    "api_key": "YOUR_BLOFIN_API_KEY",
+    "api_secret": "YOUR_BLOFIN_API_SECRET",
+    "passphrase": "YOUR_BLOFIN_PASSPHRASE",
+    "demo_mode": false
+  },
+  "dry_run": true,
+  "trading_pair": "BTC-USDT",
+  "timeframe": "5m",
+  "strategy_name": "advanced",
+  "trading": {
+    "allow_long": true,
+    "allow_short": true,
+    "max_positions": 1,
+    "position_side_mode": "hedge"
+  },
+  "risk": {
+    "risk_per_trade_pct": 5.0,
+    "max_drawdown_pct": 25.0,
+    "leverage": 1,
+    "margin_mode": "isolated",
+    "contract_size": 0.001,
+    "contract_step": 0.1,
+    "min_contracts": 0.1
+  },
+  "strategy": {
+    "min_confidence": 0.45,
+    "min_votes": 3,
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "atr_period": 14,
+    "stop_loss_atr_mult": 2.0,
+    "take_profit_atr_mult": 3.0,
+    "stop_loss_floor_pct": 1.0,
+    "take_profit_floor_pct": 1.5
+  },
+  "protection": {
+    "use_server_side_tpsl": true,
+    "require_server_side_tpsl": true,
+    "tp_order_price": "-1",
+    "sl_order_price": "-1",
+    "sync_exchange_each_cycle": true
+  },
+  "circuit_breaker": {
+    "enabled": true,
+    "daily_loss_limit_pct": 5.0,
+    "max_consecutive_losses": 3,
+    "max_consecutive_errors": 5,
+    "max_price_move_pct_per_cycle": 8.0,
+    "cooldown_minutes": 60
+  },
+  "market_data": {
+    "use_websocket": false,
+    "max_cached_candles": 960,
+    "stale_data_seconds": 120
+  },
+  "trailing_stop": {
+    "_comment": "Trailing stop and breakeven settings. Disabled by default.",
+    "enabled": false,
+    "breakeven_enabled": true,
+    "breakeven_trigger_atr": 1.0,
+    "breakeven_offset_atr": 0.05,
+    "trail_enabled": true,
+    "trail_activation_atr": 1.5,
+    "trail_distance_atr": 1.5,
+    "remove_tp_on_trail": false,
+    "min_update_interval_seconds": 30,
+    "regime_overrides": {
+      "bull_trend": { "trail_distance_atr": 2.0, "trail_activation_atr": 1.5, "remove_tp_on_trail": true },
+      "bear_trend": { "trail_distance_atr": 2.0, "trail_activation_atr": 1.5, "remove_tp_on_trail": true },
+      "range":      { "trail_enabled": false, "breakeven_trigger_atr": 1.2 }
+    }
+  },
+  "execution": {
+    "reconcile_pending_orders_each_cycle": true,
+    "max_pending_order_age_minutes": 30,
+    "attach_tpsl_on_entry": false,
+    "use_private_order_websocket": false,
+    "history_reconciliation_lookback_hours": 48
+  }
+}

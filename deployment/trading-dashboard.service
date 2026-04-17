@@ -1,0 +1,28 @@
+[Unit]
+Description=Trading Bot Dashboard
+After=network.target trading-bot.service
+Wants=trading-bot.service
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/trading-bot
+Environment=BOT_DIR=/opt/trading-bot
+Environment=DASHBOARD_PORT=8080
+ExecStart=/usr/bin/python3 /opt/trading-bot/scripts/dashboard_api.py
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-dashboard
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot
+
+[Install]
+WantedBy=multi-user.target
