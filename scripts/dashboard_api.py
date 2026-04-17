@@ -223,17 +223,18 @@ def build_api_response() -> Dict:
             except Exception:
                 pass
 
-    # Parse balance from logs
+    # Balance from runtime state (reliable), fall back to USDT log parsing
     latest_balance = state.get("last_balance")
-    for entry in reversed(logs):
-        msg = entry.get("message", "")
-        if "💰 Balance:" in msg:
-            try:
-                bal_str = msg.split("Balance:")[1].strip().split()[0]
-                latest_balance = float(bal_str)
-            except Exception:
-                pass
-            break
+    if not latest_balance:
+        for entry in reversed(logs):
+            msg = entry.get("message", "")
+            if "💰 Balance:" in msg and "USDT" in msg:
+                try:
+                    bal_str = msg.split("Balance:")[1].strip().split()[0]
+                    latest_balance = float(bal_str)
+                except Exception:
+                    pass
+                break
 
 
     # Build trade stats
