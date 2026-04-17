@@ -87,5 +87,37 @@
     "attach_tpsl_on_entry": false,
     "use_private_order_websocket": false,
     "history_reconciliation_lookback_hours": 48
+  },
+  "regime_timeframes": {
+    "_comment": "Step 3: Dynamic timeframe selection based on regime. Disabled by default.",
+    "enabled": false,
+    "confirmation_bars": 3,
+    "fallback_regime": "unclear",
+    "timeframes": {
+      "bull_trend": "15m",
+      "bear_trend": "15m",
+      "range": "5m",
+      "chop": "1h",
+      "unclear": "1h"
+    },
+    "check_intervals": {
+      "bull_trend": 300,
+      "bear_trend": 300,
+      "range": 60,
+      "chop": 900,
+      "unclear": 900
+    },
+    "urgency": {
+      "chop": 3,
+      "bear_trend": 2,
+      "bull_trend": 2,
+      "range": 1,
+      "unclear": 0
+    }
+  },
+  "timeframe_profiles": {
+    "_comment": "Step 5: Per-TF calibrated parameter profiles. Run backtest/calibrate_per_timeframe.py to generate.",
+    "enabled": false,
+    "path": "memory/timeframe_profiles.json"
   }
 }
