@@ -75,6 +75,7 @@ class MultiIndicatorConfluence(TradingStrategy):
         self.anchor_slope_period = int(regime_cfg.get("anchor_slope_period", 12))
         self.anchor_slope_threshold = float(regime_cfg.get("anchor_slope_threshold", 0.0015))
         self.trend_persistence_bars = int(regime_cfg.get("trend_persistence_bars", 6))
+        self.trend_min_score = float(regime_cfg.get("trend_min_score", 5.0))
         self.trade_spacing_bars = int(regime_cfg.get("trade_spacing_bars", 10))
         self.regime_spacing_bars = dict(regime_cfg.get("regime_spacing_bars", {
             "bull_trend": 12,
@@ -187,6 +188,7 @@ class MultiIndicatorConfluence(TradingStrategy):
                 'trend_strength_threshold': self.trend_strength_threshold,
                 'efficiency_trend_threshold': self.efficiency_trend_threshold,
                 'range_atr_pct_ceiling': self.range_atr_pct_ceiling,
+                'trend_min_score': self.trend_min_score,
             },
             'trend_following': {
                 'min_confidence': self.trend_min_confidence,
@@ -569,24 +571,27 @@ class MultiIndicatorConfluence(TradingStrategy):
             "persistent_below": 1.0 if persistent_below else 0.0,
         }
 
-        strong_bull = (
-            price > ema_fast > ema_slow > ema_anchor
-            and persistent_above
-            and trend_bias >= self.trend_strength_threshold
-            and anchor_bias > 0
-            and anchor_slope >= self.anchor_slope_threshold
-            and er >= self.efficiency_trend_threshold
-            and atr_pct < self.chop_atr_pct_threshold
-        )
-        strong_bear = (
-            price < ema_fast < ema_slow < ema_anchor
-            and persistent_below
-            and trend_bias <= -self.trend_strength_threshold
-            and anchor_bias < 0
-            and anchor_slope <= -self.anchor_slope_threshold
-            and er >= self.efficiency_trend_threshold
-            and atr_pct < self.chop_atr_pct_threshold
-        )
+        bull_score = sum([
+            1.0 if price > ema_fast > ema_slow > ema_anchor else 0.0,
+            1.0 if persistent_above else 0.0,
+            1.0 if trend_bias >= self.trend_strength_threshold else 0.0,
+            1.0 if anchor_bias > 0 else 0.0,
+            1.0 if anchor_slope >= self.anchor_slope_threshold else 0.0,
+            1.0 if er >= self.efficiency_trend_threshold else 0.0,
+            1.0 if atr_pct < self.chop_atr_pct_threshold else 0.0,
+        ])
+        bear_score = sum([
+            1.0 if price < ema_fast < ema_slow < ema_anchor else 0.0,
+            1.0 if persistent_below else 0.0,
+            1.0 if trend_bias <= -self.trend_strength_threshold else 0.0,
+            1.0 if anchor_bias < 0 else 0.0,
+            1.0 if anchor_slope <= -self.anchor_slope_threshold else 0.0,
+            1.0 if er >= self.efficiency_trend_threshold else 0.0,
+            1.0 if atr_pct < self.chop_atr_pct_threshold else 0.0,
+        ])
+
+        strong_bull = bull_score >= self.trend_min_score
+        strong_bear = bear_score >= self.trend_min_score
         range_like = (
             abs(trend_bias) <= self.range_bias_threshold * 1.5
             and abs(anchor_bias) <= self.range_bias_threshold * 2.0
@@ -598,47 +603,28 @@ class MultiIndicatorConfluence(TradingStrategy):
             or (er < self.efficiency_trend_threshold and abs(anchor_slope) < self.anchor_slope_threshold / 2 and atr_pct > self.range_atr_pct_ceiling)
         )
 
-        # Near-miss tracking: how many of 7 conditions pass for each trend direction
-        bull_conditions_passing = sum([
-            price > ema_fast > ema_slow > ema_anchor,
-            persistent_above,
-            trend_bias >= self.trend_strength_threshold,
-            anchor_bias > 0,
-            anchor_slope >= self.anchor_slope_threshold,
-            er >= self.efficiency_trend_threshold,
-            atr_pct < self.chop_atr_pct_threshold,
-        ])
-        bear_conditions_passing = sum([
-            price < ema_fast < ema_slow < ema_anchor,
-            persistent_below,
-            trend_bias <= -self.trend_strength_threshold,
-            anchor_bias < 0,
-            anchor_slope <= -self.anchor_slope_threshold,
-            er >= self.efficiency_trend_threshold,
-            atr_pct < self.chop_atr_pct_threshold,
-        ])
-        if not strong_bull and bull_conditions_passing >= 5:
+        # Near-miss tracking reuses the scores (no duplicate condition evaluation)
+        bull_conditions_passing = bull_score
+        bear_conditions_passing = bear_score
+        if not strong_bull and bull_score >= self.trend_min_score - 2:
             self._record_near_miss('bull_near_miss')
-        if not strong_bear and bear_conditions_passing >= 5:
+        if not strong_bear and bear_score >= self.trend_min_score - 2:
             self._record_near_miss('bear_near_miss')
         metrics['bull_conditions_passing'] = float(bull_conditions_passing)
         metrics['bear_conditions_passing'] = float(bear_conditions_passing)
 
         if strong_bull:
             regime = "bull_trend"
+            metrics["regime_confidence"] = bull_score / 7.0
         elif strong_bear:
             regime = "bear_trend"
+            metrics["regime_confidence"] = bear_score / 7.0
         elif range_like:
             regime = "range"
         elif choppy:
             regime = "chop"
         else:
-            if trend_bias > self.range_bias_threshold and anchor_slope > self.anchor_slope_threshold / 2 and er > self.efficiency_range_threshold:
-                regime = "bull_trend"
-            elif trend_bias < -self.range_bias_threshold and anchor_slope < -self.anchor_slope_threshold / 2 and er > self.efficiency_range_threshold:
-                regime = "bear_trend"
-            else:
-                regime = "unclear"
+            regime = "unclear"
 
         metrics["base_regime_code"] = self._REGIME_CODE[regime]
         return regime, metrics
@@ -1202,6 +1188,7 @@ class MultiIndicatorConfluence(TradingStrategy):
         self.trend_strength_threshold = float(profile['regime']['trend_strength_threshold'])
         self.efficiency_trend_threshold = float(profile['regime']['efficiency_trend_threshold'])
         self.range_atr_pct_ceiling = float(profile['regime']['range_atr_pct_ceiling'])
+        self.trend_min_score = float(profile['regime'].get('trend_min_score', self.trend_min_score))
         self.trend_min_confidence = float(profile['trend_following']['min_confidence'])
         self.trend_max_rsi = float(profile['trend_following']['trend_max_rsi'])
         self.pullback_zone_atr_mult = float(profile['trend_following']['pullback_zone_atr_mult'])
