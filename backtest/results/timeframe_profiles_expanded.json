@@ -1,0 +1,34 @@
+{
+  "generated_at": "2026-04-17T21:54:50.757893+00:00",
+  "source": {
+    "inst_id": "BTC-USDT",
+    "days": 90,
+    "base_timeframe": "5m (resampled for 15m/1h)",
+    "total_bars": 25920
+  },
+  "calibration": {
+    "walk_forward": true,
+    "n_splits": 3,
+    "min_trades": 5
+  },
+  "profiles": {
+    "5m": {
+      "regime__trend_strength_threshold": 0.0006,
+      "regime__efficiency_trend_threshold": 0.15,
+      "min_confidence": 0.35,
+      "regime__anchor_slope_threshold": 0.001
+    }
+  },
+  "metrics": {
+    "5m": {
+      "oos_sharpe": -4.46765972926099,
+      "oos_roi_pct": -0.18255541029948183,
+      "oos_trades": 3,
+      "oos_win_rate": 0.3333333333333333,
+      "oos_max_drawdown_pct": 0.48994212366866124,
+      "oos_profit_factor": 0.43035575967724254,
+      "n_splits_valid": 3
+    }
+  },
+  "warnings": []
+}
