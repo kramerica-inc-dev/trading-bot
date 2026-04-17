@@ -27,9 +27,13 @@ After 4 weeks of live operation with the funding gate enabled:
 - Win rate on remaining trades is equal or higher than pre-gate baseline
 - No increase in max drawdown
 - Sharpe ratio measurably improved, or explicit decision to revert
+- **Expectancy per trade** (avg_win × WR − avg_loss × (1−WR)) must be
+  positive and higher than pre-gate baseline
+- **Net P&L after fees** (not just gross) must be positive and improved
 
 Failure criteria (revert and reassess): win rate degrades, gate suppresses
->60% of trades, or no measurable effect on Sharpe after 4 weeks.
+>60% of trades, no measurable effect on Sharpe after 4 weeks, or expectancy
+per trade turns negative after fees.
 
 ---
 
@@ -149,20 +153,68 @@ rates and aligns with backtest expectations.
 
 - Week 1: daily check — gate firing rate, win rate on filtered vs unfiltered
   trades, any anomalies
-- Weeks 2-4: weekly review of Sharpe, drawdown, trade count
+- Weeks 2-4: weekly review of the full metric set below
 - End of week 4: write `backtest/results/funding_gate_live_report.md` with
-  the same metrics as success criteria above, and a **go / no-go decision on
-  starting Plan C**.
+  the full metric set and a **go / no-go decision on starting Plan C**.
+
+**Full metric set for weekly and final reports:**
+
+*Baseline metrics (pre-gate and post-gate comparison):*
+- Sharpe ratio
+- Max drawdown
+- Win rate
+- Trade count
+
+*Per-trade quality:*
+- **Expectancy per trade** — (avg_win × WR) − (avg_loss × (1−WR)). The
+  single number that determines whether a strategy is worth running. Must
+  rise with the gate on; if it falls, the gate is filtering winners.
+- Average win size, average loss size (components of expectancy — track both
+  to see *why* expectancy moves)
+
+*Gross vs. net economics:*
+- **Gross P&L** — raw mark-to-market return without fee/funding debits
+- **Net P&L** — after taker fees on entry + TP/SL exit, and after cumulative
+  funding paid/received on open positions
+- **Fee share of gross alpha** — (total fees paid) / (gross P&L). If fees
+  eat >30% of gross, the strategy is running too hot for its edge; if
+  >60%, B (maker execution) becomes the next priority regardless of
+  DECISIONS.md sequencing.
+- Funding paid/received per held position (funding side-effect of the bot
+  itself holding longs/shorts across 8h settlements)
+
+*Gate-quality diagnostics:*
+- **Filtered winners vs filtered losers** — of the trades the gate *skipped*,
+  how many would have won vs lost at the 1R/TP-hit level? If the gate skips
+  more winners than losers, it is destroying edge — revert immediately.
+  Computed by forward-simulating skipped entries with the same TP/SL logic.
+- Gate firing rate (% of signals suppressed) broken down by direction
+
+*Regime-segmented gate impact:*
+- Split all of the above metrics by **regime classifier output**
+  (bull_trend, bear_trend, chop, breakout, etc. — whatever the live
+  classifier emits). The gate may help in some regimes and hurt in others;
+  reporting only aggregates can hide strong regime-conditional effects.
+  If results are strongly heterogeneous, the funding gate may belong inside
+  the regime router rather than as a global filter — log this as a finding
+  for a subsequent refinement, do not act on it inside Plan A.
+
+**Tooling:** Step 6 is primarily calendar-bound (4 weeks of live data) but
+the report generator itself is a concrete deliverable built in advance —
+`scripts/funding_gate_report.py` reads `memory/trading-log.jsonl` plus the
+funding cache and emits all of the above as a single markdown report. This
+tool is built alongside Step 5 so weekly reports can be run immediately
+once shadow mode begins.
 
 If go: begin Plan C (OI divergence) using the same data-infrastructure
 pattern established in Steps 1-4.
 If no-go: append a new entry to `DECISIONS.md` documenting what was learned,
 and re-prioritize between C, D, E.
 
-**Deliverable:** written report, decision recorded in DECISIONS.md, next plan
-scoped.
+**Deliverable:** reporting script + weekly reports + final written report,
+decision recorded in DECISIONS.md, next plan scoped.
 
-**Effort:** ongoing monitoring, no new code unless a bug surfaces.
+**Effort:** ~1 day to build the reporting script, then ongoing monitoring.
 
 ---
 

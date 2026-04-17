@@ -189,9 +189,41 @@ class BlofinAPI:
     
     def get_mark_price(self, inst_id: str = "BTC-USDT") -> Dict:
         """Get index and mark price"""
-        return self._request("GET", "/api/v1/market/mark-price", 
+        return self._request("GET", "/api/v1/market/mark-price",
                            params={"instId": inst_id})
-    
+
+    def get_funding_rate(self, inst_id: str = "BTC-USDT") -> Dict:
+        """Get current funding rate for a perpetual contract.
+
+        Returns current rate, next funding time, and settlement interval.
+        Public endpoint, no auth required.
+        """
+        return self._request("GET", "/api/v1/market/funding-rate",
+                             params={"instId": inst_id})
+
+    def get_funding_rate_history(self, inst_id: str = "BTC-USDT",
+                                 before: Optional[str] = None,
+                                 after: Optional[str] = None,
+                                 limit: int = 100) -> Dict:
+        """Get historical funding rates, paginated.
+
+        Args:
+            inst_id: Trading pair (e.g. BTC-USDT)
+            before: Return records newer than this fundingTime (ms), for forward pagination
+            after: Return records older than this fundingTime (ms), for backward pagination
+            limit: Max records per page (API max is 100)
+
+        Returns historical funding rates with fundingTime (ms) and fundingRate fields.
+        Public endpoint, no auth required.
+        """
+        params = {"instId": inst_id, "limit": str(limit)}
+        if before:
+            params["before"] = before
+        if after:
+            params["after"] = after
+        return self._request("GET", "/api/v1/market/funding-rate-history",
+                             params=params)
+
     # ==================== ACCOUNT ====================
     
     def get_balance(self, account_type: str = "futures", currency: Optional[str] = None) -> Dict:
