@@ -128,6 +128,26 @@ journalctl -u trading-bot -n 100
 
 ---
 
+## Services outside this repo
+
+The LXC also runs `coinbase-ws-listener.service`, which is **not** part of this repo and is not deployed by `deployment/03-deploy-bot.sh`. It was installed manually in Feb 2026, before this repo existed, and has persisted through subsequent deploys because the deploy script never touches it.
+
+| Aspect | Value |
+|---|---|
+| Service unit | `/etc/systemd/system/coinbase-ws-listener.service` |
+| Source | `/opt/trading-bot/scripts/coinbase_ws_listener.py` |
+| Config | `/opt/trading-bot/config-coinbase.json` |
+| Log | `/opt/trading-bot/memory/ws-events.jsonl` |
+| Runs as | `root` (no `User=` directive) |
+| Purpose | Subscribes to Coinbase user channel for order fills on BTC/ETH/SOL-USDC; posts Telegram notifications |
+| Relation to trading bot | None — separate process, separate exchange, separate notifier |
+
+Known issues worth addressing if/when touched:
+- Telegram bot token and chat ID are hardcoded in the source file rather than read from the config.
+- Runs as root, unlike `trading-bot.service` which runs as `botuser`.
+
+---
+
 ## File locations on container
 
 | Path | Content |
