@@ -33,7 +33,13 @@ def calculate_risk_position_size(
     min_contracts: float = 0.1,
     leverage: float = 1.0,
     max_position_notional_pct: float = 100.0,
+    max_margin_usage_pct: float = 100.0,
     slippage_buffer_pct: float = 0.0,
+    liquidation_buffer_pct: float = 0.0,
+    annualized_volatility: float = 0.0,
+    target_annualized_volatility: float = 0.0,
+    min_volatility_scale: float = 0.5,
+    max_volatility_scale: float = 1.25,
 ) -> PositionSizingResult:
     if balance <= 0:
         return PositionSizingResult(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, reason="Balance is zero")
@@ -45,7 +51,11 @@ def calculate_risk_position_size(
     if stop_distance <= 0:
         return PositionSizingResult(0.0, 0.0, stop_distance, stop_distance, 0.0, 0.0, 0.0, reason="Stop distance is zero")
 
-    effective_stop_distance = stop_distance * (1 + max(slippage_buffer_pct, 0.0) / 100.0)
+    effective_stop_distance = stop_distance * (
+        1
+        + max(slippage_buffer_pct, 0.0) / 100.0
+        + max(liquidation_buffer_pct, 0.0) / 100.0
+    )
     risk_amount = balance * (risk_percent / 100.0)
     risk_per_contract = effective_stop_distance * contract_size
 
@@ -53,6 +63,12 @@ def calculate_risk_position_size(
         return PositionSizingResult(0.0, risk_amount, stop_distance, effective_stop_distance, 0.0, 0.0, 0.0, reason="Invalid risk per contract")
 
     raw_contracts = risk_amount / risk_per_contract
+
+    if annualized_volatility > 0 and target_annualized_volatility > 0:
+        vol_scale = target_annualized_volatility / annualized_volatility
+        vol_scale = max(min_volatility_scale, min(max_volatility_scale, vol_scale))
+        raw_contracts *= vol_scale
+
     contracts = _floor_to_step(raw_contracts, contract_step)
 
     if contracts < min_contracts:
@@ -71,6 +87,7 @@ def calculate_risk_position_size(
     notional_value = contracts * contract_size * entry_price
     max_notional_value = balance * max(leverage, 1.0) * (max_position_notional_pct / 100.0)
     capped_by_notional = False
+    capped_by_margin = False
 
     if max_notional_value > 0 and notional_value > max_notional_value:
         max_contracts_by_notional = _floor_to_step(
@@ -80,6 +97,20 @@ def calculate_risk_position_size(
         capped_by_notional = True
         contracts = min(contracts, max_contracts_by_notional)
         notional_value = contracts * contract_size * entry_price
+
+    # Secondary cap: maximum margin usage. Prevents oversized leveraged positions
+    # that fit notional rules but consume too much account margin.
+    max_margin_value = balance * (max_margin_usage_pct / 100.0)
+    if max_margin_value > 0:
+        implied_margin = notional_value / max(leverage, 1.0)
+        if implied_margin > max_margin_value:
+            max_contracts_by_margin = _floor_to_step(
+                (max_margin_value * max(leverage, 1.0)) / (contract_size * entry_price),
+                contract_step,
+            )
+            capped_by_margin = True
+            contracts = min(contracts, max_contracts_by_margin)
+            notional_value = contracts * contract_size * entry_price
 
     if contracts < min_contracts:
         return PositionSizingResult(
@@ -91,8 +122,8 @@ def calculate_risk_position_size(
             0.0,
             0.0,
             contracts_raw=round(raw_contracts, 8),
-            capped_by_notional=capped_by_notional,
-            reason="Maximum notional cap leaves no valid order size",
+            capped_by_notional=(capped_by_notional or capped_by_margin),
+            reason="Maximum notional/margin cap leaves no valid order size",
         )
 
     estimated_loss = contracts * risk_per_contract

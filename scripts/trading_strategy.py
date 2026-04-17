@@ -298,7 +298,14 @@ def create_strategy(strategy_name: str, config: Dict) -> TradingStrategy:
             return MultiIndicatorConfluence(config)
         except ImportError:
             raise ValueError("Advanced strategy module not found")
-    
+
+    if strategy_name.lower() == "robust":
+        try:
+            from robust_strategy import RobustTrendPullback
+            return RobustTrendPullback(config)
+        except ImportError:
+            raise ValueError("Robust strategy module not found")
+
     strategies = {
         "rsi": RSIMeanReversion,
         "trend": TrendFollowing,
@@ -307,7 +314,7 @@ def create_strategy(strategy_name: str, config: Dict) -> TradingStrategy:
     
     strategy_class = strategies.get(strategy_name.lower())
     if not strategy_class:
-        raise ValueError(f"Unknown strategy: {strategy_name}. Available: {list(strategies.keys()) + ['advanced']}")
+        raise ValueError(f"Unknown strategy: {strategy_name}. Available: {list(strategies.keys()) + ['advanced', 'robust']}")
     
     return strategy_class(config)
 

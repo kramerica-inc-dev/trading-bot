@@ -8,12 +8,14 @@ import hmac
 import hashlib
 import base64
 import json
+import random
 import threading
 import time
 from collections import deque
 from uuid import uuid4
 from typing import Optional, Dict, Any, List
 import requests
+from urllib.parse import urlencode
 
 
 class BlofinAPI:
@@ -23,6 +25,7 @@ class BlofinAPI:
         self.api_key = api_key
         self.api_secret = api_secret
         self.passphrase = passphrase
+        self.session = requests.Session()
 
         # Use demo or production endpoint
         self.base_url = (
@@ -35,6 +38,8 @@ class BlofinAPI:
         self._rate_max = 20
         self._rate_timestamps: deque = deque()
         self._rate_lock = threading.Lock()
+        self._max_retries = 3
+        self._base_retry_delay = 0.5
 
     def _wait_for_rate_limit(self) -> None:
         with self._rate_lock:
@@ -54,73 +59,104 @@ class BlofinAPI:
             self._rate_timestamps.append(time.monotonic())
     
     def _sign_request(self, path: str, method: str, body: Optional[Dict] = None) -> tuple:
-        """Generate Blofin API signature (hex->base64 encoding!)"""
+        """Generate Blofin API signature (hex->base64 encoding)."""
         timestamp = str(int(time.time() * 1000))
         nonce = str(uuid4())
-        
+
         # Create prehash string
         body_str = json.dumps(body) if body is not None else ""
         prehash = f"{path}{method}{timestamp}{nonce}{body_str}"
-        
+
         # Generate HMAC-SHA256 hex signature
         hex_signature = hmac.new(
             self.api_secret.encode(),
             prehash.encode(),
             hashlib.sha256
         ).hexdigest()
-        
+
         # Convert hex string to bytes, then base64 encode
         signature = base64.b64encode(hex_signature.encode()).decode()
-        
+
         return signature, timestamp, nonce
     
     def _request(self, method: str, path: str, params: Optional[Dict] = None,
                  body: Optional[Dict] = None) -> Dict[str, Any]:
         """Make authenticated API request"""
-        self._wait_for_rate_limit()
-
-        # Build full URL with query params for GET
         url = f"{self.base_url}{path}"
         if params and method == "GET":
-            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+            query_string = urlencode(params)
             path_with_params = f"{path}?{query_string}"
             url = f"{self.base_url}{path_with_params}"
         else:
             path_with_params = path
-        
-        # Generate signature
-        signature, timestamp, nonce = self._sign_request(path_with_params, method, body)
-        
-        # Build headers
-        headers = {
-            "ACCESS-KEY": self.api_key,
-            "ACCESS-SIGN": signature,
-            "ACCESS-TIMESTAMP": timestamp,
-            "ACCESS-NONCE": nonce,
-            "ACCESS-PASSPHRASE": self.passphrase,
-            "Content-Type": "application/json"
-        }
-        
-        # Make request
-        try:
-            if method == "GET":
-                response = requests.get(url, headers=headers, timeout=10)
-            elif method == "POST":
-                response = requests.post(url, headers=headers, json=body, timeout=10)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
+
+        last_error = None
+        for attempt in range(1, self._max_retries + 1):
+            self._wait_for_rate_limit()
+            signature, timestamp, nonce = self._sign_request(path_with_params, method, body)
+
+            headers = {
+                "ACCESS-KEY": self.api_key,
+                "ACCESS-SIGN": signature,
+                "ACCESS-TIMESTAMP": timestamp,
+                "ACCESS-NONCE": nonce,
+                "ACCESS-PASSPHRASE": self.passphrase,
+                "Content-Type": "application/json"
+            }
 
             try:
-                data = response.json()
-                return data
-            except requests.exceptions.JSONDecodeError:
-                response.raise_for_status()
-                return {"code": "error",
-                        "msg": f"Non-JSON response: {response.status_code}",
-                        "data": None}
+                if method == "GET":
+                    response = self.session.get(url, headers=headers, timeout=10)
+                elif method == "POST":
+                    response = self.session.post(url, headers=headers, json=body, timeout=10)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
 
-        except requests.exceptions.RequestException as e:
-            return {"code": "error", "msg": str(e), "data": None}
+                if response.status_code in (429, 500, 502, 503, 504):
+                    last_error = f"HTTP {response.status_code}"
+                    if attempt < self._max_retries:
+                        delay = self._base_retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                        time.sleep(delay)
+                        continue
+
+                try:
+                    data = response.json()
+                except ValueError:
+                    if response.status_code >= 400:
+                        last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                    else:
+                        last_error = f"Non-JSON response: {response.status_code}"
+                    if attempt < self._max_retries:
+                        delay = self._base_retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                        time.sleep(delay)
+                        continue
+                    return {"code": "error", "msg": last_error, "data": None}
+
+                if response.status_code >= 400:
+                    msg = (
+                        data.get("msg")
+                        if isinstance(data, dict) else f"HTTP {response.status_code}"
+                    )
+                    last_error = f"HTTP {response.status_code}: {msg}"
+                    if response.status_code in (429, 500, 502, 503, 504) and attempt < self._max_retries:
+                        delay = self._base_retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                        time.sleep(delay)
+                        continue
+
+                return data if isinstance(data, dict) else {
+                    "code": "error",
+                    "msg": "Unexpected response shape",
+                    "data": data,
+                }
+
+            except requests.exceptions.RequestException as e:
+                last_error = str(e)
+                if attempt < self._max_retries:
+                    delay = self._base_retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                    time.sleep(delay)
+                    continue
+
+        return {"code": "error", "msg": last_error or "Unknown request error", "data": None}
     
     # ==================== MARKET DATA ====================
     

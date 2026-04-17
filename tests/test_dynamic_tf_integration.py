@@ -392,7 +392,8 @@ class ProfilesRoundTripThroughBot(unittest.TestCase):
 
             bot = _build_bot(config_path, strategy, FakeAdapter())
 
-            self.assertEqual(strategy.loaded_profile_path, str(profile_path))
+            self.assertEqual(os.path.realpath(strategy.loaded_profile_path),
+                              os.path.realpath(str(profile_path)))
             self.assertEqual(set(strategy.timeframe_profiles.keys()),
                               {"5m", "15m", "1h"})
             # Verify one param round-trip

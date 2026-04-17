@@ -8,7 +8,9 @@ Features: regime-aware strategy, private order WS, live profiles,
 """
 
 import json
+import os
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -20,6 +22,7 @@ from config_utils import ConfigError, load_and_validate_config, generate_config_
 from exchange_adapter import create_exchange_adapter
 from regime_timeframe import RegimeTimeframeResolver
 from risk_utils import PositionSizingResult, calculate_risk_position_size
+from institutional_risk import InstitutionalRiskManager
 from trading_strategy import Signal, create_strategy
 
 try:
@@ -86,6 +89,7 @@ class TradingBot:
         self.position_side_mode = self.trading.get("position_side_mode", "hedge")
 
         self.dry_run = bool(self.config.get("dry_run", True))
+        self._io_lock = threading.RLock()
 
         self.active_positions = self._load_json(self.positions_file, [])
         self.pending_orders = self._load_json(self.pending_orders_file, [])
@@ -97,6 +101,10 @@ class TradingBot:
 
         # Performance tracking
         self.performance_file = self.memory_dir / "performance.jsonl"
+        self.inst_risk = InstitutionalRiskManager(
+            self.config.get("institutional_risk", {}),
+            logger=self._log
+        )
 
         # Live profile support
         self.profile_report_dir = self.memory_dir / "profile-refresh-reports"
@@ -256,7 +264,8 @@ class TradingBot:
         if not path.exists():
             return default
         try:
-            data = json.loads(path.read_text())
+            with self._io_lock:
+                data = json.loads(path.read_text())
             return data if isinstance(data, type(default)) else default
         except Exception as e:
             self._log("error", f"Failed to load {path.name}: {e}")
@@ -264,9 +273,22 @@ class TradingBot:
 
     def _save_json(self, path: Path, data) -> None:
         try:
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(data, indent=2))
-            tmp.replace(path)
+            payload = json.dumps(data, indent=2, sort_keys=True)
+            with self._io_lock:
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f"{path.name}.",
+                    suffix=".tmp",
+                    dir=str(path.parent),
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(payload)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp_name, path)
+                finally:
+                    if os.path.exists(tmp_name):
+                        os.unlink(tmp_name)
         except Exception as e:
             self._log("error", f"Failed to save {path.name}: {e}")
 
@@ -295,19 +317,45 @@ class TradingBot:
             self._save_state(state)
             return state
         try:
-            state = json.loads(self.state_file.read_text())
+            with self._io_lock:
+                state = json.loads(self.state_file.read_text())
         except Exception:
             state = self._default_state()
         self._roll_state_if_needed(state)
         self._save_state(state)
         return state
 
+    def _build_risk_context(self, current_price: float, signal) -> dict:
+        return {
+            "equity": float(self.state.get("equity_peak", 0.0) or 0.0),
+            "balance": float(self.state.get("last_balance", 0.0) or 0.0),
+            "open_positions": len(self.active_positions or []),
+            "pending_orders": len(self.pending_orders or []),
+            "signal_quality": float(getattr(signal, "quality_score", 0.0) or 0.0),
+            "risk_multiplier": float(getattr(signal, "risk_multiplier", 1.0) or 1.0),
+            "entry_price": float(current_price),
+            "regime": getattr(signal, "regime", None),
+        }
+
     def _save_state(self, state: Optional[Dict] = None) -> None:
         payload = self.state if state is None else state
         try:
-            tmp = self.state_file.with_suffix(self.state_file.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, indent=2))
-            tmp.replace(self.state_file)
+            body = json.dumps(payload, indent=2, sort_keys=True)
+            with self._io_lock:
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f"{self.state_file.name}.",
+                    suffix=".tmp",
+                    dir=str(self.state_file.parent),
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(body)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp_name, self.state_file)
+                finally:
+                    if os.path.exists(tmp_name):
+                        os.unlink(tmp_name)
         except Exception as e:
             self._log("error", f"Failed to save state: {e}")
 
@@ -1133,6 +1181,10 @@ class TradingBot:
 
         if not candles or not isinstance(candles, list):
             raise RuntimeError("Candles fetch failed or returned empty")
+        if len(candles) < 50:
+            raise RuntimeError(f"Too few candles returned: {len(candles)}")
+        if not all(isinstance(c, (list, tuple)) and len(c) >= 6 for c in candles):
+            raise RuntimeError("Candles response shape invalid")
 
         if self.market_stream is not None:
             self.market_stream.seed_snapshot(current_price, candles)
@@ -1146,6 +1198,7 @@ class TradingBot:
             snapshot = self.market_stream.get_snapshot()
             if snapshot and self.market_stream.is_healthy(staleness):
                 return snapshot
+            self._log("warning", "Market websocket stale/unhealthy, falling back to REST")
             rest_data = self._fetch_market_data_rest()
             deadline = time.time() + int(
                 self.market_data_cfg.get("warmup_timeout_seconds", 8))
@@ -1174,19 +1227,36 @@ class TradingBot:
             return None
 
         if signal.stop_loss:
+            risk_ctx = self._build_risk_context(current_price, signal)
+            risk_decision = self.inst_risk.evaluate_trade(risk_ctx)
+            if not risk_decision["allowed"]:
+                self._log("warning", f"Trade blocked by institutional risk: {risk_decision['reason']}")
+                return None
+
             sizing = calculate_risk_position_size(
                 balance=balance,
                 entry_price=current_price,
                 stop_loss=float(signal.stop_loss),
-                risk_percent=effective_risk_pct,
+                risk_percent=float(risk_decision["risk_percent"]),
                 contract_size=float(self.risk_cfg.get("contract_size", 0.001)),
                 contract_step=float(self.risk_cfg.get("contract_step", 0.1)),
                 min_contracts=float(self.risk_cfg.get("min_contracts", 0.1)),
                 leverage=float(self.risk_cfg.get("leverage", 1.0)),
                 max_position_notional_pct=float(
                     self.risk_cfg.get("max_position_notional_pct", 100.0)),
+                max_margin_usage_pct=float(
+                    self.risk_cfg.get("max_margin_usage_pct", 35.0)),
                 slippage_buffer_pct=float(
                     self.risk_cfg.get("slippage_buffer_pct", 0.0)),
+                liquidation_buffer_pct=float(
+                    self.risk_cfg.get("liquidation_buffer_pct", 0.25)),
+                annualized_volatility=float(self.state.get("annualized_volatility", 0.0) or 0.0),
+                target_annualized_volatility=float(
+                    self.risk_cfg.get("target_annualized_volatility", 0.35)),
+                min_volatility_scale=float(
+                    self.risk_cfg.get("min_volatility_scale", 0.5)),
+                max_volatility_scale=float(
+                    self.risk_cfg.get("max_volatility_scale", 1.25)),
             )
             if sizing.contracts <= 0:
                 self._log("warning", f"⚠️ Position sizing: {sizing.reason}")
@@ -1396,7 +1466,24 @@ class TradingBot:
             "atr": float(getattr(signal, "atr", 0.0) or 0.0),
             "regime": getattr(signal, "regime", None),
         }
-        self.pending_orders.append(pending)
+        existing = next(
+            (
+                p for p in self.pending_orders
+                if (
+                    pending.get("client_order_id")
+                    and p.get("client_order_id") == pending.get("client_order_id")
+                ) or (
+                    pending.get("order_id")
+                    and p.get("order_id") == pending.get("order_id")
+                )
+            ),
+            None,
+        )
+        if existing is None:
+            self.pending_orders.append(pending)
+        else:
+            existing.update(pending)
+            self._log("warning", "Pending order already tracked; updated existing record")
         self._save_pending_orders()
 
         # Immediately poll for fill

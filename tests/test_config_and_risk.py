@@ -86,7 +86,7 @@ class RiskSizingTests(unittest.TestCase):
             slippage_buffer_pct=0,
         )
         self.assertEqual(result.contracts, 0)
-        self.assertIn('Maximum notional cap', result.reason)
+        self.assertIn('Maximum notional', result.reason)
 
 
 class NewConfigSectionsTests(unittest.TestCase):

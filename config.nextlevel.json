@@ -1,0 +1,30 @@
+{
+  "strategy_name": "robust",
+  "strategy": {
+    "fast_ema": 20,
+    "slow_ema": 50,
+    "anchor_ema": 200,
+    "rsi_period": 14,
+    "atr_period": 14,
+    "pullback_atr_multiple": 0.6,
+    "stop_atr_multiple": 1.8,
+    "take_profit_atr_multiple": 2.8,
+    "min_trend_strength": 0.0025,
+    "max_atr_pct": 0.018,
+    "min_atr_pct": 0.002,
+    "long_rsi_floor": 45,
+    "short_rsi_ceiling": 55,
+    "max_hold_bars": 36
+  },
+  "institutional_risk": {
+    "per_trade_risk_pct": 0.50,
+    "max_portfolio_heat_pct": 1.50,
+    "max_margin_usage_pct": 35.0,
+    "max_daily_drawdown_pct": 2.0,
+    "max_trailing_drawdown_pct": 6.0,
+    "vol_target_atr_pct": 0.008,
+    "min_size_multiplier": 0.25,
+    "max_size_multiplier": 1.25,
+    "min_quality_score": 0.55
+  }
+}
