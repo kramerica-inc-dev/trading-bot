@@ -1,0 +1,61 @@
+{
+  "generated_at": "2026-04-17T20:28:26.747628+00:00",
+  "source": {
+    "inst_id": "BTC-USDT",
+    "days": 90,
+    "base_timeframe": "5m (resampled for 15m/1h)",
+    "total_bars": 25920
+  },
+  "calibration": {
+    "walk_forward": false,
+    "n_splits": 3,
+    "min_trades": 5
+  },
+  "profiles": {
+    "5m": {
+      "regime__trend_strength_threshold": 0.002,
+      "regime__efficiency_trend_threshold": 0.1,
+      "min_confidence": 0.35,
+      "regime__anchor_slope_threshold": 0.001
+    },
+    "15m": {
+      "regime__trend_strength_threshold": 0.0006,
+      "regime__efficiency_trend_threshold": 0.1,
+      "min_confidence": 0.35,
+      "regime__anchor_slope_threshold": 0.0004
+    },
+    "1h": {
+      "regime__trend_strength_threshold": 0.0004,
+      "regime__efficiency_trend_threshold": 0.1,
+      "min_confidence": 0.4,
+      "regime__anchor_slope_threshold": 0.0003
+    }
+  },
+  "metrics": {
+    "5m": {
+      "sharpe": -13.310236802223594,
+      "roi_pct": -6.528655562738458,
+      "trades": 25,
+      "win_rate": 0.08,
+      "max_drawdown_pct": 6.81650123844695,
+      "profit_factor": 0.05881705068622574
+    },
+    "15m": {
+      "sharpe": 0.0,
+      "roi_pct": 0.003969702821262544,
+      "trades": 1,
+      "win_rate": 1.0,
+      "max_drawdown_pct": 0.17523337528753474,
+      "profit_factor": Infinity
+    },
+    "1h": {
+      "sharpe": 0.0,
+      "roi_pct": 0.0,
+      "trades": 0,
+      "win_rate": 0.0,
+      "max_drawdown_pct": 0.0,
+      "profit_factor": 0.0
+    }
+  },
+  "warnings": []
+}

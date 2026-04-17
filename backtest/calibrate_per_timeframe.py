@@ -85,25 +85,22 @@ from backtest.optimizer import ParameterOptimizer
 
 PARAM_GRIDS: Dict[str, Dict[str, List]] = {
     "5m": {
-        "rsi_period": [10, 14, 18],
-        "trend_strength_threshold": [0.0012, 0.0018, 0.0025],
-        "efficiency_trend_threshold": [0.26, 0.32, 0.38],
-        "min_confidence": [0.40, 0.45, 0.50],
-        "anchor_slope_threshold": [0.0010, 0.0015, 0.0022],
+        "regime__trend_strength_threshold": [0.0008, 0.0014, 0.0020],
+        "regime__efficiency_trend_threshold": [0.10, 0.18, 0.26],
+        "min_confidence": [0.35, 0.45, 0.55],
+        "regime__anchor_slope_threshold": [0.0006, 0.0010, 0.0015],
     },
     "15m": {
-        "rsi_period": [8, 10, 14],
-        "trend_strength_threshold": [0.0008, 0.0012, 0.0018],
-        "efficiency_trend_threshold": [0.24, 0.30, 0.36],
-        "min_confidence": [0.40, 0.48, 0.55],
-        "anchor_slope_threshold": [0.0006, 0.0010, 0.0015],
+        "regime__trend_strength_threshold": [0.0006, 0.0010, 0.0016],
+        "regime__efficiency_trend_threshold": [0.10, 0.18, 0.28],
+        "min_confidence": [0.35, 0.45, 0.55],
+        "regime__anchor_slope_threshold": [0.0004, 0.0008, 0.0012],
     },
     "1h": {
-        "rsi_period": [6, 8, 12],
-        "trend_strength_threshold": [0.0005, 0.0008, 0.0012],
-        "efficiency_trend_threshold": [0.20, 0.26, 0.32],
-        "min_confidence": [0.45, 0.52, 0.60],
-        "anchor_slope_threshold": [0.0004, 0.0008, 0.0012],
+        "regime__trend_strength_threshold": [0.0004, 0.0008, 0.0012],
+        "regime__efficiency_trend_threshold": [0.10, 0.18, 0.26],
+        "min_confidence": [0.40, 0.50, 0.60],
+        "regime__anchor_slope_threshold": [0.0003, 0.0006, 0.0010],
     },
 }
 
@@ -273,13 +270,21 @@ def _coerce(value):
 def calibrate(inst_id: str, days: int, timeframes: List[str],
               config_path: str, out_path: Optional[str],
               walk_forward: bool, n_splits: int, min_trades: int,
-              force_refresh: bool, dry_run: bool) -> Dict:
+              force_refresh: bool, dry_run: bool,
+              csv_path: Optional[str] = None) -> Dict:
     """Main calibration entry point."""
-    creds, base_strategy_cfg, cfg_inst = _load_exchange_credentials(config_path)
-    if inst_id == "auto":
-        inst_id = cfg_inst
-
-    df_5m = _fetch_base_data(inst_id, days, creds, force_refresh)
+    if csv_path:
+        # Use local CSV instead of fetching from API
+        print(f"Loading data from {csv_path}...")
+        df_5m = pd.read_csv(csv_path, parse_dates=["timestamp"])
+        if inst_id == "auto":
+            inst_id = "BTC-USDT"
+        base_strategy_cfg = {}
+    else:
+        creds, base_strategy_cfg, cfg_inst = _load_exchange_credentials(config_path)
+        if inst_id == "auto":
+            inst_id = cfg_inst
+        df_5m = _fetch_base_data(inst_id, days, creds, force_refresh)
     if df_5m.empty:
         raise RuntimeError("No 5m data fetched — check API credentials "
                            "and network")
@@ -396,6 +401,8 @@ def main():
                         help="Ignore cached data, fetch fresh")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print output instead of writing to disk")
+    parser.add_argument("--csv", default=None,
+                        help="Path to local 5m CSV file (skip API fetch)")
     args = parser.parse_args()
 
     try:
@@ -410,6 +417,7 @@ def main():
             min_trades=args.min_trades,
             force_refresh=args.force_refresh,
             dry_run=args.dry_run,
+            csv_path=args.csv,
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
