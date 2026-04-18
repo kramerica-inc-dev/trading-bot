@@ -306,6 +306,13 @@ def create_strategy(strategy_name: str, config: Dict) -> TradingStrategy:
         except ImportError:
             raise ValueError("Robust strategy module not found")
 
+    if strategy_name.lower() == "meanrev":
+        try:
+            from mean_reversion_strategy import MeanReversionStrategy
+            return MeanReversionStrategy(config)
+        except ImportError:
+            raise ValueError("Mean-reversion strategy module not found")
+
     strategies = {
         "rsi": RSIMeanReversion,
         "trend": TrendFollowing,
