@@ -5,8 +5,11 @@ Reads bot state files from memory/ and serves them as JSON.
 Serves a static HTML dashboard on port 8080.
 """
 
+import csv
 import json
+import math
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -14,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -25,6 +28,26 @@ BOT_DIR = Path(os.environ.get("BOT_DIR", "/opt/trading-bot"))
 MEMORY_DIR = BOT_DIR / "memory"
 CONFIG_PATH = BOT_DIR / "config.json"
 DASHBOARD_HTML = Path(__file__).parent / "dashboard.html"
+
+# Plan E paths
+STATE_DIR = BOT_DIR / "state"
+PLAN_E_STATE = STATE_DIR / "plan_e_portfolio.json"
+PLAN_E_TRADES = STATE_DIR / "plan_e_trades.log"
+PLAN_E_CONFIG = BOT_DIR / "config.plan-e.json"
+RUNNER_CACHE = STATE_DIR / "runner_cache"
+
+# Service names the dashboard is allowed to control
+CONTROLLABLE_SERVICES = {"plan-e-runner"}
+
+# Simple CSRF/auth token — generated once per process start, embedded in the
+# served HTML, required on POST /api/control. Tailscale-private network so
+# this is defence-in-depth, not primary auth.
+DASHBOARD_TOKEN = secrets.token_urlsafe(24)
+
+# Throttle control actions: reject if another action fired <N seconds ago
+CONTROL_COOLDOWN_S = 3.0
+_last_control_ts = 0.0
+_control_lock = threading.Lock()
 
 # Cache: re-read files at most every N seconds
 CACHE_TTL = 3.0
@@ -307,6 +330,268 @@ def build_api_response() -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Plan E readers
+# ---------------------------------------------------------------------------
+
+def _read_csv_last_close(path: Path) -> Optional[float]:
+    """Return the last `close` value from a CSV, or None if not readable."""
+    try:
+        if not path.exists():
+            return None
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+            if not rows:
+                return None
+            val = rows[-1].get("close")
+            return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def _plan_e_signals(universe: List[str], lookback_h: int, sign: int) -> Dict[str, Any]:
+    """Compute per-asset sign-adjusted log-return signal from the runner cache.
+
+    Mirrors the runner's compute_signal(). Read-only; never writes state.
+    Returns {symbol: {signal, last_price, past_price}}.
+    """
+    out: Dict[str, Any] = {}
+    for sym in universe:
+        path = RUNNER_CACHE / f"{sym}_1H.csv"
+        if not path.exists():
+            continue
+        try:
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+            if len(rows) <= lookback_h:
+                continue
+            latest = float(rows[-1]["close"])
+            past = float(rows[-1 - lookback_h]["close"])
+            if latest > 0 and past > 0 and math.isfinite(latest) and math.isfinite(past):
+                signal = sign * math.log(latest / past)
+                out[sym] = {
+                    "signal": signal,
+                    "last_price": latest,
+                    "past_price": past,
+                    "bar_ts": rows[-1].get("timestamp"),
+                }
+        except Exception:
+            continue
+    return out
+
+
+def _next_rebalance_ts(rebalance_hour_utc: int) -> str:
+    """ISO timestamp of the next UTC rebalance hour after now."""
+    now = datetime.now(timezone.utc)
+    candidate = now.replace(hour=rebalance_hour_utc, minute=0, second=0, microsecond=0)
+    if candidate <= now:
+        # advance to tomorrow
+        from datetime import timedelta
+        candidate = candidate + timedelta(days=1)
+    return candidate.isoformat()
+
+
+def _service_status(unit: str) -> Dict[str, Any]:
+    """systemctl is-active + ActiveEnterTimestamp for a unit."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", unit],
+            capture_output=True, text=True, timeout=5)
+        active = r.stdout.strip() or r.stderr.strip() or "unknown"
+    except Exception:
+        active = "unknown"
+    uptime = ""
+    try:
+        r = subprocess.run(
+            ["systemctl", "show", unit, "--property=ActiveEnterTimestamp"],
+            capture_output=True, text=True, timeout=5)
+        ts_str = r.stdout.strip().split("=", 1)[-1].strip()
+        if ts_str and ts_str != "0":
+            started = datetime.strptime(ts_str, "%a %Y-%m-%d %H:%M:%S %Z")
+            started = started.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - started
+            h = int(delta.total_seconds() // 3600)
+            m = int((delta.total_seconds() % 3600) // 60)
+            uptime = f"{h}h {m}m"
+    except Exception:
+        pass
+    return {"status": active, "uptime": uptime}
+
+
+def build_plan_e_response() -> Dict:
+    """Full Plan E dashboard payload."""
+    state = _read_json_file(PLAN_E_STATE, {})
+    cfg = _read_json_file(PLAN_E_CONFIG, {})
+    universe = cfg.get("universe") or []
+    lookback_h = int(cfg.get("lookback_hours", 72))
+    k_exit = int(cfg.get("k_exit", 6))
+    sign = int(cfg.get("signal_sign", -1))
+    rebal_hour = int(cfg.get("rebalance_hour_utc", 0))
+    initial_balance = float(cfg.get("initial_balance", 5000.0))
+
+    # Signals + mark-to-market positions
+    sig_map = _plan_e_signals(universe, lookback_h, sign)
+
+    # Build ranked list (same order as runner): desc by signal
+    ranked = sorted(
+        sig_map.items(), key=lambda kv: kv[1]["signal"], reverse=True,
+    )
+    rank_order = [s for s, _ in ranked]
+    long_band = set(rank_order[:k_exit])
+    short_band = set(rank_order[-k_exit:]) if k_exit else set()
+    target_long_n = int(cfg.get("long_n", 3))
+    target_short_n = int(cfg.get("short_n", 3))
+    # Target longs/shorts for display (fresh, no hysteresis context)
+    target_longs_fresh = rank_order[:target_long_n]
+    target_shorts_fresh = rank_order[-target_short_n:][::-1] if target_short_n else []
+
+    # Mark equity with current cache prices (cash + unrealized P&L)
+    positions_raw = state.get("positions", {}) or {}
+    cash = float(state.get("cash", initial_balance))
+    live_equity = cash
+    positions_view = []
+    for sym, pos in positions_raw.items():
+        last_price = sig_map.get(sym, {}).get("last_price")
+        if last_price is None:
+            last_price = _read_csv_last_close(RUNNER_CACHE / f"{sym}_1H.csv")
+        entry = float(pos.get("entry_price", 0.0) or 0.0)
+        notional = float(pos.get("notional", 0.0) or 0.0)
+        side = pos.get("side", "long")
+        qty = (notional / entry) if entry > 0 else 0.0
+        if last_price is None or entry <= 0:
+            upnl = 0.0
+        elif side == "long":
+            upnl = qty * (last_price - entry)
+        else:
+            upnl = qty * (entry - last_price)
+        upnl_pct = (upnl / notional * 100.0) if notional > 0 else 0.0
+        live_equity += upnl
+        positions_view.append({
+            "symbol": sym,
+            "side": side,
+            "entry_price": entry,
+            "last_price": last_price,
+            "notional": notional,
+            "unrealized_pnl": upnl,
+            "unrealized_pnl_pct": upnl_pct,
+            "entered_ts": pos.get("entered_ts"),
+            "in_keep_band": (
+                sym in long_band if side == "long" else sym in short_band
+            ),
+        })
+    # Stable display order: longs by rank, then shorts
+    positions_view.sort(key=lambda p: (
+        0 if p["side"] == "long" else 1,
+        rank_order.index(p["symbol"]) if p["symbol"] in rank_order else 99,
+    ))
+
+    # Trade log + equity curve
+    trades = _read_jsonl_file(PLAN_E_TRADES, 500)
+    equity_curve = [
+        {"ts": t.get("ts"), "equity": t.get("equity_after"),
+         "cash": t.get("cash_after"), "fees": t.get("fees_paid", 0.0)}
+        for t in trades if t.get("action") == "rebalance"
+    ]
+    total_fees = sum(t.get("fees_paid", 0.0) for t in trades
+                     if t.get("action") == "rebalance")
+
+    # Ranked signal rows for UI (includes band membership + whether held)
+    held = {p["symbol"]: p["side"] for p in positions_view}
+    ranked_view = []
+    for sym, s in ranked:
+        ranked_view.append({
+            "symbol": sym,
+            "signal": s["signal"],
+            "last_price": s["last_price"],
+            "in_long_band": sym in long_band,
+            "in_short_band": sym in short_band,
+            "held": held.get(sym),  # "long" | "short" | None
+        })
+
+    service = _service_status("plan-e-runner")
+    started_ts = state.get("started_ts")
+
+    # Total P&L since started
+    pnl_total = live_equity - initial_balance
+    pnl_pct = (pnl_total / initial_balance * 100.0) if initial_balance else 0.0
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "service": {
+            "name": "plan-e-runner",
+            "status": service["status"],   # "active" | "inactive" | ...
+            "uptime": service["uptime"],
+            "mode": "paper",
+        },
+        "config": {
+            "universe_size": len(universe),
+            "lookback_hours": lookback_h,
+            "k_exit": k_exit,
+            "signal_sign": sign,
+            "signal_label": "REV" if sign < 0 else "MOM",
+            "long_n": target_long_n,
+            "short_n": target_short_n,
+            "leg_notional_pct": cfg.get("leg_notional_pct"),
+            "fee_rate": cfg.get("fee_rate"),
+            "slippage_rate": cfg.get("slippage_rate"),
+            "rebalance_hour_utc": rebal_hour,
+            "initial_balance": initial_balance,
+        },
+        "account": {
+            "cash": cash,
+            "equity_persisted": state.get("equity"),
+            "equity_live": live_equity,
+            "pnl_total": pnl_total,
+            "pnl_pct": pnl_pct,
+            "rebalances_total": state.get("rebalances_total", 0),
+            "last_rebalance_ts": state.get("last_rebalance_ts"),
+            "next_rebalance_ts": _next_rebalance_ts(rebal_hour),
+            "started_ts": started_ts,
+            "total_fees_paid": total_fees,
+        },
+        "positions": positions_view,
+        "ranked_signals": ranked_view,
+        "equity_curve": equity_curve,
+        "trades": trades[-30:],  # last 30 rebalance events, newest last
+    }
+
+
+# ---------------------------------------------------------------------------
+# Service control (start/stop Plan E runner)
+# ---------------------------------------------------------------------------
+
+def _do_service_control(unit: str, action: str) -> Dict[str, Any]:
+    """Run `systemctl <action> <unit>` via sudo. Returns {ok, stdout, stderr}."""
+    global _last_control_ts
+    if unit not in CONTROLLABLE_SERVICES:
+        return {"ok": False, "error": f"unit not allowed: {unit}"}
+    if action not in ("start", "stop", "restart"):
+        return {"ok": False, "error": f"action not allowed: {action}"}
+
+    with _control_lock:
+        now = time.time()
+        if now - _last_control_ts < CONTROL_COOLDOWN_S:
+            wait = CONTROL_COOLDOWN_S - (now - _last_control_ts)
+            return {"ok": False, "error": f"cooldown: wait {wait:.1f}s"}
+        _last_control_ts = now
+
+    try:
+        r = subprocess.run(
+            ["sudo", "-n", "systemctl", action, unit],
+            capture_output=True, text=True, timeout=15,
+        )
+        return {
+            "ok": r.returncode == 0,
+            "returncode": r.returncode,
+            "stdout": r.stdout.strip(),
+            "stderr": r.stderr.strip(),
+            "action": action,
+            "unit": unit,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # HTTP Server
 # ---------------------------------------------------------------------------
 
@@ -333,6 +618,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         except FileNotFoundError:
             self.send_error(404, "Dashboard HTML not found")
             return
+        # Inject the session token into the served HTML so the JS can attach
+        # it to POST /api/control. Placeholder: {{DASHBOARD_TOKEN}}
+        try:
+            body = body.replace(b"{{DASHBOARD_TOKEN}}", DASHBOARD_TOKEN.encode())
+        except Exception:
+            pass
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -356,6 +647,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             trades = _read_jsonl_file(MEMORY_DIR / "performance.jsonl", 500)
             self._send_json(trades)
 
+        elif self.path == "/api/plan-e/status":
+            try:
+                self._send_json(build_plan_e_response())
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif self.path == "/api/plan-e/trades":
+            trades = _read_jsonl_file(PLAN_E_TRADES, 500)
+            self._send_json(trades)
+
         elif self.path == "/api/health":
             self._send_json({"ok": True, "ts": datetime.now(timezone.utc).isoformat()})
 
@@ -365,11 +666,36 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_POST(self):
+        if self.path != "/api/control":
+            self.send_error(404)
+            return
+
+        # Token check
+        token = self.headers.get("X-Dashboard-Token", "")
+        if not secrets.compare_digest(token, DASHBOARD_TOKEN):
+            self._send_json({"ok": False, "error": "invalid token"}, 403)
+            return
+
+        # Body
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except Exception as e:
+            self._send_json({"ok": False, "error": f"bad json: {e}"}, 400)
+            return
+
+        unit = payload.get("unit", "plan-e-runner")
+        action = payload.get("action", "")
+        result = _do_service_control(unit, action)
+        self._send_json(result, 200 if result.get("ok") else 400)
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Dashboard-Token")
         self.end_headers()
 
 
