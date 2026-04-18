@@ -45,5 +45,8 @@ backtest/data/*.csv
 backtest/results/regime_diagnostics.csv
 backtest/results/archive/
 
+# Plan E runner operational state (portfolio, trade log, runner cache)
+state/
+
 # Archive (oude configs met credentials)
 archive/

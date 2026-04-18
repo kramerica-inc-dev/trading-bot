@@ -1,0 +1,18 @@
+{
+  "universe": [
+    "BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT",
+    "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "DOT-USDT", "LINK-USDT"
+  ],
+  "lookback_hours": 72,
+  "rebalance_hour_utc": 0,
+  "long_n": 3,
+  "short_n": 3,
+  "leg_notional_pct": 0.10,
+  "k_exit": 6,
+  "signal_sign": -1,
+  "initial_balance": 5000.0,
+  "min_assets_with_data": 6,
+  "fee_rate": 0.0006,
+  "slippage_rate": 0.0005,
+  "data_staleness_hours": 2
+}
