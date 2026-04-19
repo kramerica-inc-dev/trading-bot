@@ -142,7 +142,13 @@
     </button>
   </div>
   <div class="header-right">
-    <span style="color:var(--text-dim)">Next rebalance</span>
+    <span style="color:var(--text-dim)">Instance</span>
+    <select id="instanceSelect" onchange="switchInstance(this.value)"
+      style="background:var(--surface-alt);color:var(--text);border:1px solid var(--border);
+             padding:3px 8px;border-radius:4px;font-family:var(--font);font-size:11px">
+      <option value="plan-e-base">plan-e-base</option>
+    </select>
+    <span style="color:var(--text-dim)">· Next</span>
     <span id="headerNextValue" style="color:var(--text);font-weight:600">—</span>
     <span style="color:var(--text-dim)">· Uptime</span>
     <span id="headerUptime" style="color:var(--text)">—</span>
@@ -156,6 +162,7 @@
   <button class="tab" data-tab="strategy">Strategy</button>
   <button class="tab" data-tab="risk">Risk &amp; Config</button>
   <button class="tab" data-tab="logs">Logs</button>
+  <button class="tab" data-tab="compare">Compare</button>
 </div>
 
 <div class="content">
@@ -298,9 +305,25 @@
   <div class="tab-content" id="tab-logs">
     <div class="card">
       <div class="label">Rebalance Event Log
-        <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — derived from state/plan_e_trades.log</span>
+        <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — derived from state/&lt;instance&gt;/trades.log</span>
       </div>
       <div style="margin-top:8px;max-height:640px;overflow-y:auto" id="pe-log-feed"></div>
+    </div>
+  </div>
+
+  <!-- ═══ COMPARE ═══ -->
+  <div class="tab-content" id="tab-compare">
+    <div class="card">
+      <div class="label">Instance comparison
+        <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — parallel paper instances, shared market</span>
+      </div>
+      <div id="pe-compare-table" style="margin-top:8px;overflow-x:auto"></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <div class="label">Equity curves (normalized to start = 100)</div>
+      <svg id="pe-compare-chart" viewBox="0 0 1200 360" preserveAspectRatio="none"
+           style="width:100%;height:360px;margin-top:8px;background:var(--surface-alt);border-radius:4px"></svg>
+      <div id="pe-compare-legend" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:12px;font-family:var(--font);font-size:11px"></div>
     </div>
   </div>
 
@@ -311,6 +334,36 @@
 const API_BASE = window.location.origin;
 const REFRESH_MS = 5000;
 const DASHBOARD_TOKEN = (document.querySelector('meta[name="dashboard-token"]') || {}).content || '';
+let _currentInstance = localStorage.getItem('plan-e-instance') || 'plan-e-base';
+let _instances = [];
+
+function currentUnit() {
+  // plan-e-base -> legacy unit ; plan-e-<suffix> -> templated unit
+  if (_currentInstance === 'plan-e-base') return 'plan-e-runner';
+  const suffix = _currentInstance.replace(/^plan-e-/, '');
+  return 'plan-e@' + suffix;
+}
+
+async function loadInstances() {
+  try {
+    const r = await fetch('/api/plan-e/instances');
+    const d = await r.json();
+    _instances = (d.instances || []).map(x => x.instance);
+    const sel = document.getElementById('instanceSelect');
+    if (sel && _instances.length) {
+      sel.innerHTML = _instances.map(i =>
+        `<option value="${i}"${i===_currentInstance?' selected':''}>${i}</option>`
+      ).join('');
+    }
+  } catch (e) { /* keep default */ }
+}
+
+function switchInstance(name) {
+  _currentInstance = name;
+  localStorage.setItem('plan-e-instance', name);
+  // Refresh all views for the new instance
+  fetchPlanE();
+}
 
 function fmt(n, d=2) { return typeof n==='number' ? n.toFixed(d) : '—'; }
 function fmtUsd(n) {
@@ -712,16 +765,17 @@ async function toggleLive() {
   const action = btn.dataset.nextAction;
   if (!action) return;
   const verb = action === 'start' ? 'Start' : 'Stop';
+  const unit = currentUnit();
   const body = action === 'start'
-    ? 'Start the Plan E paper-trade runner? This only resumes paper simulation — no real capital is touched.'
-    : 'Stop the Plan E paper-trade runner? Scheduled rebalances will not fire until it is restarted.';
-  confirmDialog(`${verb} plan-e-runner?`, body, verb, action === 'start' ? 'start' : '', async () => {
+    ? `Start ${unit}? This only resumes paper simulation — no real capital is touched.`
+    : `Stop ${unit}? Scheduled rebalances will not fire until it is restarted.`;
+  confirmDialog(`${verb} ${unit}?`, body, verb, action === 'start' ? 'start' : '', async () => {
     btn.disabled = true;
     try {
       const resp = await fetch('/api/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Dashboard-Token': DASHBOARD_TOKEN },
-        body: JSON.stringify({ unit: 'plan-e-runner', action: action }),
+        body: JSON.stringify({ unit: unit, action: action }),
       });
       const data = await resp.json();
       if (data.ok) {
@@ -740,7 +794,7 @@ async function toggleLive() {
 
 async function fetchPlanE() {
   try {
-    const resp = await fetch('/api/plan-e/status');
+    const resp = await fetch('/api/plan-e/status?instance=' + encodeURIComponent(_currentInstance));
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
     if (data.error) throw new Error(data.error);
@@ -753,8 +807,110 @@ async function fetchPlanE() {
   }
 }
 
+async function fetchCompare() {
+  try {
+    const [iResp, eResp] = await Promise.all([
+      fetch('/api/plan-e/instances'),
+      fetch('/api/plan-e/equity_curves'),
+    ]);
+    const instData = await iResp.json();
+    const eqData = await eResp.json();
+    renderCompare(instData.instances || [], eqData || {});
+  } catch (e) { /* silent */ }
+}
+
+function renderCompare(instances, curves) {
+  // Table
+  const tbl = document.getElementById('pe-compare-table');
+  if (tbl) {
+    let html = '<table style="width:100%;border-collapse:collapse;font-family:var(--font);font-size:11px">';
+    html += '<thead><tr style="color:var(--text-dim);text-align:left">' +
+      ['Instance','Service','Interval','Flags','Rebalances','Skips','Equity','Started']
+        .map(h => `<th style="padding:6px 10px;border-bottom:1px solid var(--border)">${h}</th>`).join('') +
+      '</tr></thead><tbody>';
+    for (const i of instances) {
+      const fl = Object.entries(i.flags || {}).filter(([,v]) => v).map(([k]) => k).join(', ') || '—';
+      const svcColor = i.service && i.service.status === 'active' ? 'var(--green)' : 'var(--text-dim)';
+      html += '<tr>' +
+        `<td style="padding:6px 10px;color:var(--text)">${i.instance}</td>` +
+        `<td style="padding:6px 10px;color:${svcColor}">${i.service ? i.service.status : '—'}</td>` +
+        `<td style="padding:6px 10px">${i.rebalance_interval_hours}h</td>` +
+        `<td style="padding:6px 10px;color:var(--text-muted)">${fl}</td>` +
+        `<td style="padding:6px 10px">${i.rebalances_total || 0}</td>` +
+        `<td style="padding:6px 10px">${i.skips_total || 0}</td>` +
+        `<td style="padding:6px 10px">${typeof i.equity === 'number' ? fmtUsd(i.equity) : '—'}</td>` +
+        `<td style="padding:6px 10px;color:var(--text-dim)">${i.started_ts ? i.started_ts.slice(0,16).replace('T',' ') : '—'}</td>` +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    tbl.innerHTML = html;
+  }
+
+  // Chart — normalized equity curves
+  const svg = document.getElementById('pe-compare-chart');
+  const legend = document.getElementById('pe-compare-legend');
+  if (!svg || !legend) return;
+  const palette = ['#22d3ee','#10b981','#ef4444','#f59e0b','#a78bfa','#3b82f6','#ec4899'];
+  const W = 1200, H = 360, padL = 40, padR = 10, padT = 10, padB = 24;
+  const series = [];
+  let tMin = Infinity, tMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+  for (const [inst, pts] of Object.entries(curves)) {
+    if (!pts || !pts.length) continue;
+    const p0 = pts[0].equity || 0;
+    if (p0 <= 0) continue;
+    const norm = pts.map(p => ({
+      t: new Date(p.ts).getTime() / 1000,
+      v: (p.equity / p0) * 100,
+    })).filter(x => isFinite(x.t) && isFinite(x.v));
+    if (!norm.length) continue;
+    for (const n of norm) {
+      if (n.t < tMin) tMin = n.t;
+      if (n.t > tMax) tMax = n.t;
+      if (n.v < yMin) yMin = n.v;
+      if (n.v > yMax) yMax = n.v;
+    }
+    series.push({ inst, pts: norm });
+  }
+  if (!series.length) {
+    svg.innerHTML = '<text x="600" y="180" fill="#64748b" text-anchor="middle" font-family="monospace" font-size="12">Waiting for first rebalance per instance…</text>';
+    legend.innerHTML = '';
+    return;
+  }
+  if (tMax === tMin) tMax = tMin + 1;
+  const yPad = Math.max(0.5, (yMax - yMin) * 0.05);
+  yMin -= yPad; yMax += yPad;
+  const sx = t => padL + ((t - tMin) / (tMax - tMin)) * (W - padL - padR);
+  const sy = v => padT + (1 - (v - yMin) / (yMax - yMin)) * (H - padT - padB);
+
+  const gridLines = [];
+  for (let i = 0; i <= 4; i++) {
+    const v = yMin + (yMax - yMin) * i / 4;
+    const y = sy(v);
+    gridLines.push(`<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" stroke="#1e2a3a" stroke-width="1"/>`);
+    gridLines.push(`<text x="${padL-6}" y="${y+3}" fill="#64748b" text-anchor="end" font-family="monospace" font-size="10">${v.toFixed(1)}</text>`);
+  }
+  const base100 = `<line x1="${padL}" y1="${sy(100)}" x2="${W-padR}" y2="${sy(100)}" stroke="#475569" stroke-dasharray="3,3" stroke-width="1"/>`;
+
+  const paths = series.map((s, idx) => {
+    const color = palette[idx % palette.length];
+    const d = s.pts.map((p, i) => (i===0?'M':'L') + sx(p.t).toFixed(1) + ' ' + sy(p.v).toFixed(1)).join(' ');
+    return `<path d="${d}" stroke="${color}" stroke-width="1.5" fill="none"/>`;
+  }).join('');
+
+  svg.innerHTML = gridLines.join('') + base100 + paths;
+  legend.innerHTML = series.map((s, idx) => {
+    const color = palette[idx % palette.length];
+    const last = s.pts[s.pts.length-1].v.toFixed(2);
+    return `<span><span style="display:inline-block;width:10px;height:10px;background:${color};vertical-align:middle;margin-right:6px"></span>${s.inst} <span style="color:var(--text-dim)">${last}</span></span>`;
+  }).join('');
+}
+
+loadInstances();
 fetchPlanE();
+fetchCompare();
 setInterval(fetchPlanE, REFRESH_MS);
+setInterval(fetchCompare, REFRESH_MS * 3);
+setInterval(loadInstances, REFRESH_MS * 6);
 setInterval(() => {
   const el = document.getElementById('pe-countdown');
   if (el && _nextRebalanceIso) el.textContent = countdownText(_nextRebalanceIso);

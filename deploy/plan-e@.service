@@ -1,0 +1,30 @@
+[Unit]
+Description=Plan E paper-trade runner (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/trading-bot
+Environment=BLOFIN_API_KEY=public
+Environment=BLOFIN_API_SECRET=public
+Environment=BLOFIN_PASSPHRASE=public
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m scripts.plan_e_runner --mode paper --loop --config /opt/trading-bot/configs/plan-e-%i.json
+Restart=always
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=plan-e-%i
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot
+
+[Install]
+WantedBy=multi-user.target

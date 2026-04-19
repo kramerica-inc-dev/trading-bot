@@ -29,15 +29,25 @@ MEMORY_DIR = BOT_DIR / "memory"
 CONFIG_PATH = BOT_DIR / "config.json"
 DASHBOARD_HTML = Path(__file__).parent / "dashboard.html"
 
-# Plan E paths
+# Plan E paths (multi-instance layout)
 STATE_DIR = BOT_DIR / "state"
-PLAN_E_STATE = STATE_DIR / "plan_e_portfolio.json"
-PLAN_E_TRADES = STATE_DIR / "plan_e_trades.log"
-PLAN_E_CONFIG = BOT_DIR / "config.plan-e.json"
-RUNNER_CACHE = STATE_DIR / "runner_cache"
+CONFIGS_DIR = BOT_DIR / "configs"
+SHARED_CACHE = STATE_DIR / "shared_cache"
+# Legacy single-instance paths, kept as fallbacks when multi-instance state
+# has not yet been created.
+LEGACY_PLAN_E_STATE = STATE_DIR / "plan_e_portfolio.json"
+LEGACY_PLAN_E_TRADES = STATE_DIR / "plan_e_trades.log"
+LEGACY_PLAN_E_CONFIG = BOT_DIR / "config.plan-e.json"
+LEGACY_RUNNER_CACHE = STATE_DIR / "runner_cache"
 
-# Service names the dashboard is allowed to control
+DEFAULT_INSTANCE = "plan-e-base"
+
+# Service control: allow the legacy unit plus any templated plan-e@<instance>
+# where <instance> matches a simple allow-listed charset.
 CONTROLLABLE_SERVICES = {"plan-e-runner"}
+INSTANCE_NAME_RE = None  # compiled below
+import re  # noqa: E402
+INSTANCE_NAME_RE = re.compile(r"^plan-e-[a-z0-9]{1,16}$")
 
 # Simple CSRF/auth token — generated once per process start, embedded in the
 # served HTML, required on POST /api/control. Tailscale-private network so
@@ -348,37 +358,6 @@ def _read_csv_last_close(path: Path) -> Optional[float]:
         return None
 
 
-def _plan_e_signals(universe: List[str], lookback_h: int, sign: int) -> Dict[str, Any]:
-    """Compute per-asset sign-adjusted log-return signal from the runner cache.
-
-    Mirrors the runner's compute_signal(). Read-only; never writes state.
-    Returns {symbol: {signal, last_price, past_price}}.
-    """
-    out: Dict[str, Any] = {}
-    for sym in universe:
-        path = RUNNER_CACHE / f"{sym}_1H.csv"
-        if not path.exists():
-            continue
-        try:
-            with open(path, newline="") as f:
-                rows = list(csv.DictReader(f))
-            if len(rows) <= lookback_h:
-                continue
-            latest = float(rows[-1]["close"])
-            past = float(rows[-1 - lookback_h]["close"])
-            if latest > 0 and past > 0 and math.isfinite(latest) and math.isfinite(past):
-                signal = sign * math.log(latest / past)
-                out[sym] = {
-                    "signal": signal,
-                    "last_price": latest,
-                    "past_price": past,
-                    "bar_ts": rows[-1].get("timestamp"),
-                }
-        except Exception:
-            continue
-    return out
-
-
 def _next_rebalance_ts(rebalance_hour_utc: int) -> str:
     """ISO timestamp of the next UTC rebalance hour after now."""
     now = datetime.now(timezone.utc)
@@ -417,10 +396,105 @@ def _service_status(unit: str) -> Dict[str, Any]:
     return {"status": active, "uptime": uptime}
 
 
-def build_plan_e_response() -> Dict:
-    """Full Plan E dashboard payload."""
-    state = _read_json_file(PLAN_E_STATE, {})
-    cfg = _read_json_file(PLAN_E_CONFIG, {})
+def _list_instances() -> List[str]:
+    """Enumerate available instances from configs/ directory.
+
+    Falls back to [DEFAULT_INSTANCE] when no configs exist yet (legacy deploy).
+    """
+    out: List[str] = []
+    if CONFIGS_DIR.exists():
+        for p in sorted(CONFIGS_DIR.glob("plan-e-*.json")):
+            name = p.stem  # e.g. "plan-e-base"
+            if INSTANCE_NAME_RE and INSTANCE_NAME_RE.match(name):
+                out.append(name)
+    if not out:
+        out = [DEFAULT_INSTANCE]
+    return out
+
+
+def _instance_paths(instance: str) -> Dict[str, Path]:
+    """Resolve per-instance state/config/trades paths.
+
+    Falls back to legacy single-instance paths when the instance name matches
+    the default and the new layout does not yet exist.
+    """
+    inst_dir = STATE_DIR / instance
+    state_path = inst_dir / "portfolio.json"
+    trades_path = inst_dir / "trades.log"
+    cfg_path = CONFIGS_DIR / f"{instance}.json"
+
+    # Fallback to legacy paths if instance == default and multi-instance
+    # state hasn't been created yet.
+    if instance == DEFAULT_INSTANCE:
+        if not state_path.exists() and LEGACY_PLAN_E_STATE.exists():
+            state_path = LEGACY_PLAN_E_STATE
+        if not trades_path.exists() and LEGACY_PLAN_E_TRADES.exists():
+            trades_path = LEGACY_PLAN_E_TRADES
+        if not cfg_path.exists() and LEGACY_PLAN_E_CONFIG.exists():
+            cfg_path = LEGACY_PLAN_E_CONFIG
+
+    # Cache is shared across instances (new layout) but may still live at the
+    # legacy runner_cache/ path on older deployments.
+    cache_dir = SHARED_CACHE if SHARED_CACHE.exists() else LEGACY_RUNNER_CACHE
+
+    return {
+        "state": state_path,
+        "trades": trades_path,
+        "config": cfg_path,
+        "cache": cache_dir,
+    }
+
+
+def _instance_service_name(instance: str) -> str:
+    """Resolve the systemd unit name for an instance.
+
+    New layout uses templated units: plan-e@base, plan-e@c, etc.
+    Legacy single-instance deploy uses plan-e-runner.
+    """
+    if instance == DEFAULT_INSTANCE:
+        # Prefer new template unit if present; otherwise legacy.
+        return "plan-e-runner"  # clients can override via explicit list
+    # plan-e-c -> plan-e@c ; plan-e-cg -> plan-e@cg ; plan-e-12h -> plan-e@12h
+    suffix = instance.removeprefix("plan-e-")
+    return f"plan-e@{suffix}"
+
+
+def _plan_e_signals_from_cache(
+    cache_dir: Path, universe: List[str], lookback_h: int, sign: int,
+) -> Dict[str, Any]:
+    """Compute signals from an arbitrary cache directory."""
+    out: Dict[str, Any] = {}
+    for sym in universe:
+        path = cache_dir / f"{sym}_1H.csv"
+        if not path.exists():
+            continue
+        try:
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+            if len(rows) <= lookback_h:
+                continue
+            latest = float(rows[-1]["close"])
+            past = float(rows[-1 - lookback_h]["close"])
+            if latest > 0 and past > 0 and math.isfinite(latest) and math.isfinite(past):
+                signal = sign * math.log(latest / past)
+                out[sym] = {
+                    "signal": signal,
+                    "last_price": latest,
+                    "past_price": past,
+                    "bar_ts": rows[-1].get("timestamp"),
+                }
+        except Exception:
+            continue
+    return out
+
+
+def build_plan_e_response(instance: str = DEFAULT_INSTANCE) -> Dict:
+    """Full Plan E dashboard payload for a single instance."""
+    if INSTANCE_NAME_RE and not INSTANCE_NAME_RE.match(instance):
+        raise ValueError(f"invalid instance name: {instance}")
+    paths = _instance_paths(instance)
+    state = _read_json_file(paths["state"], {})
+    cfg = _read_json_file(paths["config"], {})
     universe = cfg.get("universe") or []
     lookback_h = int(cfg.get("lookback_hours", 72))
     k_exit = int(cfg.get("k_exit", 6))
@@ -429,7 +503,7 @@ def build_plan_e_response() -> Dict:
     initial_balance = float(cfg.get("initial_balance", 5000.0))
 
     # Signals + mark-to-market positions
-    sig_map = _plan_e_signals(universe, lookback_h, sign)
+    sig_map = _plan_e_signals_from_cache(paths["cache"], universe, lookback_h, sign)
 
     # Build ranked list (same order as runner): desc by signal
     ranked = sorted(
@@ -452,7 +526,7 @@ def build_plan_e_response() -> Dict:
     for sym, pos in positions_raw.items():
         last_price = sig_map.get(sym, {}).get("last_price")
         if last_price is None:
-            last_price = _read_csv_last_close(RUNNER_CACHE / f"{sym}_1H.csv")
+            last_price = _read_csv_last_close(paths["cache"] / f"{sym}_1H.csv")
         entry = float(pos.get("entry_price", 0.0) or 0.0)
         notional = float(pos.get("notional", 0.0) or 0.0)
         side = pos.get("side", "long")
@@ -485,7 +559,7 @@ def build_plan_e_response() -> Dict:
     ))
 
     # Trade log + equity curve
-    trades = _read_jsonl_file(PLAN_E_TRADES, 500)
+    trades = _read_jsonl_file(paths["trades"], 500)
     equity_curve = [
         {"ts": t.get("ts"), "equity": t.get("equity_after"),
          "cash": t.get("cash_after"), "fees": t.get("fees_paid", 0.0)}
@@ -493,6 +567,7 @@ def build_plan_e_response() -> Dict:
     ]
     total_fees = sum(t.get("fees_paid", 0.0) for t in trades
                      if t.get("action") == "rebalance")
+    skips = [t for t in trades if t.get("action") == "skip"]
 
     # Ranked signal rows for UI (includes band membership + whether held)
     held = {p["symbol"]: p["side"] for p in positions_view}
@@ -507,7 +582,15 @@ def build_plan_e_response() -> Dict:
             "held": held.get(sym),  # "long" | "short" | None
         })
 
-    service = _service_status("plan-e-runner")
+    svc_name = _instance_service_name(instance)
+    service = _service_status(svc_name)
+    # If the preferred unit is missing (e.g. new templated unit not installed),
+    # fall back to the legacy unit so the UI still reports something.
+    if service["status"] in ("unknown", "inactive") and instance == DEFAULT_INSTANCE:
+        legacy = _service_status("plan-e-runner")
+        if legacy["status"] not in ("unknown", "inactive"):
+            service = legacy
+            svc_name = "plan-e-runner"
     started_ts = state.get("started_ts")
 
     # Total P&L since started
@@ -516,8 +599,9 @@ def build_plan_e_response() -> Dict:
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "instance": instance,
         "service": {
-            "name": "plan-e-runner",
+            "name": svc_name,
             "status": service["status"],   # "active" | "inactive" | ...
             "uptime": service["uptime"],
             "mode": "paper",
@@ -534,7 +618,11 @@ def build_plan_e_response() -> Dict:
             "fee_rate": cfg.get("fee_rate"),
             "slippage_rate": cfg.get("slippage_rate"),
             "rebalance_hour_utc": rebal_hour,
+            "rebalance_interval_hours": int(cfg.get("rebalance_interval_hours", 24)),
             "initial_balance": initial_balance,
+            "vol_halt": cfg.get("vol_halt", {"enabled": False}),
+            "breadth_skip": cfg.get("breadth_skip", {"enabled": False}),
+            "outlier_exclude": cfg.get("outlier_exclude", {"enabled": False}),
         },
         "account": {
             "cash": cash,
@@ -543,6 +631,7 @@ def build_plan_e_response() -> Dict:
             "pnl_total": pnl_total,
             "pnl_pct": pnl_pct,
             "rebalances_total": state.get("rebalances_total", 0),
+            "skips_total": state.get("skips_total", 0),
             "last_rebalance_ts": state.get("last_rebalance_ts"),
             "next_rebalance_ts": _next_rebalance_ts(rebal_hour),
             "started_ts": started_ts,
@@ -552,6 +641,7 @@ def build_plan_e_response() -> Dict:
         "ranked_signals": ranked_view,
         "equity_curve": equity_curve,
         "trades": trades[-30:],  # last 30 rebalance events, newest last
+        "skips": skips[-10:],
     }
 
 
@@ -559,10 +649,19 @@ def build_plan_e_response() -> Dict:
 # Service control (start/stop Plan E runner)
 # ---------------------------------------------------------------------------
 
+_TEMPLATE_UNIT_RE = re.compile(r"^plan-e@[a-z0-9]{1,16}$")
+
+
+def _unit_allowed(unit: str) -> bool:
+    if unit in CONTROLLABLE_SERVICES:
+        return True
+    return bool(_TEMPLATE_UNIT_RE.match(unit))
+
+
 def _do_service_control(unit: str, action: str) -> Dict[str, Any]:
     """Run `systemctl <action> <unit>` via sudo. Returns {ok, stdout, stderr}."""
     global _last_control_ts
-    if unit not in CONTROLLABLE_SERVICES:
+    if not _unit_allowed(unit):
         return {"ok": False, "error": f"unit not allowed: {unit}"}
     if action not in ("start", "stop", "restart"):
         return {"ok": False, "error": f"action not allowed: {action}"}
@@ -631,36 +730,104 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
+    def _parse_path(self) -> Tuple[str, Dict[str, str]]:
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        return u.path, q
+
+    def _instance_from_query(self, q: Dict[str, str]) -> str:
+        inst = q.get("instance", DEFAULT_INSTANCE)
+        if INSTANCE_NAME_RE and not INSTANCE_NAME_RE.match(inst):
+            raise ValueError(f"invalid instance: {inst}")
+        return inst
+
     def do_GET(self):
-        if self.path == "/api/status":
+        path, q = self._parse_path()
+
+        if path == "/api/status":
             try:
                 data = build_api_response()
                 self._send_json(data)
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
-        elif self.path == "/api/logs":
+        elif path == "/api/logs":
             logs = _read_jsonl_file(MEMORY_DIR / "trading-log.jsonl", 200)
             self._send_json(logs)
 
-        elif self.path == "/api/trades":
+        elif path == "/api/trades":
             trades = _read_jsonl_file(MEMORY_DIR / "performance.jsonl", 500)
             self._send_json(trades)
 
-        elif self.path == "/api/plan-e/status":
+        elif path == "/api/plan-e/instances":
             try:
-                self._send_json(build_plan_e_response())
+                instances = _list_instances()
+                summaries = []
+                for inst in instances:
+                    paths = _instance_paths(inst)
+                    state = _read_json_file(paths["state"], {})
+                    cfg = _read_json_file(paths["config"], {})
+                    svc = _service_status(_instance_service_name(inst))
+                    summaries.append({
+                        "instance": inst,
+                        "service": svc,
+                        "equity": state.get("equity"),
+                        "rebalances_total": state.get("rebalances_total", 0),
+                        "skips_total": state.get("skips_total", 0),
+                        "started_ts": state.get("started_ts"),
+                        "last_rebalance_ts": state.get("last_rebalance_ts"),
+                        "rebalance_interval_hours":
+                            int(cfg.get("rebalance_interval_hours", 24)),
+                        "flags": {
+                            "vol_halt": bool(
+                                (cfg.get("vol_halt") or {}).get("enabled")),
+                            "breadth_skip": bool(
+                                (cfg.get("breadth_skip") or {}).get("enabled")),
+                            "outlier_exclude": bool(
+                                (cfg.get("outlier_exclude") or {}).get("enabled")),
+                        },
+                    })
+                self._send_json({"instances": summaries})
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
-        elif self.path == "/api/plan-e/trades":
-            trades = _read_jsonl_file(PLAN_E_TRADES, 500)
-            self._send_json(trades)
+        elif path == "/api/plan-e/status":
+            try:
+                inst = self._instance_from_query(q)
+                self._send_json(build_plan_e_response(inst))
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
 
-        elif self.path == "/api/health":
+        elif path == "/api/plan-e/trades":
+            try:
+                inst = self._instance_from_query(q)
+                paths = _instance_paths(inst)
+                self._send_json(_read_jsonl_file(paths["trades"], 500))
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+
+        elif path == "/api/plan-e/equity_curves":
+            # Cross-instance equity curves for comparison chart.
+            try:
+                out = {}
+                for inst in _list_instances():
+                    paths = _instance_paths(inst)
+                    trades = _read_jsonl_file(paths["trades"], 1000)
+                    out[inst] = [
+                        {"ts": t.get("ts"), "equity": t.get("equity_after")}
+                        for t in trades if t.get("action") == "rebalance"
+                    ]
+                self._send_json(out)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/health":
             self._send_json({"ok": True, "ts": datetime.now(timezone.utc).isoformat()})
 
-        elif self.path == "/" or self.path == "/dashboard":
+        elif path == "/" or path == "/dashboard":
             self._send_html(DASHBOARD_HTML)
 
         else:
