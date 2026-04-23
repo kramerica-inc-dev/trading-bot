@@ -451,10 +451,7 @@ def _instance_service_name(instance: str) -> str:
     New layout uses templated units: plan-e@base, plan-e@c, etc.
     Legacy single-instance deploy uses plan-e-runner.
     """
-    if instance == DEFAULT_INSTANCE:
-        # Prefer new template unit if present; otherwise legacy.
-        return "plan-e-runner"  # clients can override via explicit list
-    # plan-e-c -> plan-e@c ; plan-e-cg -> plan-e@cg ; plan-e-12h -> plan-e@12h
+    # plan-e-base -> plan-e@base ; plan-e-c -> plan-e@c ; etc.
     suffix = instance.removeprefix("plan-e-")
     return f"plan-e@{suffix}"
 
@@ -584,11 +581,11 @@ def build_plan_e_response(instance: str = DEFAULT_INSTANCE) -> Dict:
 
     svc_name = _instance_service_name(instance)
     service = _service_status(svc_name)
-    # If the preferred unit is missing (e.g. new templated unit not installed),
-    # fall back to the legacy unit so the UI still reports something.
-    if service["status"] in ("unknown", "inactive") and instance == DEFAULT_INSTANCE:
+    # If the templated unit is missing (legacy deploy), fall back to
+    # plan-e-runner so the UI still reports something.
+    if service["status"] in ("unknown",) and instance == DEFAULT_INSTANCE:
         legacy = _service_status("plan-e-runner")
-        if legacy["status"] not in ("unknown", "inactive"):
+        if legacy["status"] not in ("unknown",):
             service = legacy
             svc_name = "plan-e-runner"
     started_ts = state.get("started_ts")

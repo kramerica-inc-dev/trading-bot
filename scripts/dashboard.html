@@ -338,8 +338,7 @@ let _currentInstance = localStorage.getItem('plan-e-instance') || 'plan-e-base';
 let _instances = [];
 
 function currentUnit() {
-  // plan-e-base -> legacy unit ; plan-e-<suffix> -> templated unit
-  if (_currentInstance === 'plan-e-base') return 'plan-e-runner';
+  // plan-e-base -> plan-e@base ; plan-e-c -> plan-e@c ; etc.
   const suffix = _currentInstance.replace(/^plan-e-/, '');
   return 'plan-e@' + suffix;
 }
