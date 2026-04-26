@@ -633,6 +633,19 @@ def build_plan_e_response(instance: str = DEFAULT_INSTANCE) -> Dict:
             "next_rebalance_ts": _next_rebalance_ts(rebal_hour),
             "started_ts": started_ts,
             "total_fees_paid": total_fees,
+            "circuit_breaker": {
+                "state": state.get("cb_state", "normal"),
+                "peak_equity": state.get("peak_equity"),
+                "peak_equity_ts": state.get("peak_equity_ts"),
+                "dd_pct": (
+                    (state.get("peak_equity") - live_equity) / state.get("peak_equity")
+                    if state.get("peak_equity") else 0.0
+                ),
+                "tripped_ts": state.get("cb_tripped_ts"),
+                "tripped_equity": state.get("cb_tripped_equity"),
+                "tripped_peak": state.get("cb_tripped_peak"),
+                "halts_total": state.get("cb_halts_total", 0),
+            },
         },
         "positions": positions_view,
         "ranked_signals": ranked_view,

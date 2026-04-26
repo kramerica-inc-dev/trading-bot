@@ -87,6 +87,27 @@ class StopLossConfig:
     check_interval_sec: int = 300        # min seconds between stop-check fetches
 
 
+@dataclass
+class CircuitBreakerConfig:
+    """Equity-drawdown circuit breaker. Sticky once tripped.
+
+    Two thresholds based on drawdown from peak equity (since started_ts):
+      - halve_dd_pct: scale next-rebalance leg notional by `halved_scale`.
+        Existing positions untouched (cutting reverters fights the thesis).
+      - halt_dd_pct: skip new rebalances entirely. Existing positions stay
+        open — operator decides whether to close manually.
+
+    Both states are sticky: once tripped, only a manual reset (clear
+    `cb_state` and `cb_tripped_*` fields in portfolio.json + restart) lifts
+    the breaker. This prevents oscillation when equity bounces back across
+    the threshold.
+    """
+    enabled: bool = True
+    halve_dd_pct: float = 0.10           # 10% from peak → halve next-rebalance sizing
+    halt_dd_pct: float = 0.20            # 20% from peak → halt new rebalances
+    halved_scale: float = 0.5            # leg_notional multiplier when halved
+
+
 # =========================  Main config  =========================
 
 @dataclass
@@ -116,6 +137,7 @@ class PlanEConfig:
     breadth_skip: BreadthSkipConfig = field(default_factory=BreadthSkipConfig)
     outlier_exclude: OutlierExcludeConfig = field(default_factory=OutlierExcludeConfig)
     stop_loss: StopLossConfig = field(default_factory=StopLossConfig)
+    circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
 
 
 def load_config(path: Optional[str]) -> PlanEConfig:
@@ -128,8 +150,10 @@ def load_config(path: Optional[str]) -> PlanEConfig:
     bs = BreadthSkipConfig(**data.pop("breadth_skip", {}))
     oe = OutlierExcludeConfig(**data.pop("outlier_exclude", {}))
     sl = StopLossConfig(**data.pop("stop_loss", {}))
+    cb = CircuitBreakerConfig(**data.pop("circuit_breaker", {}))
     return PlanEConfig(
-        vol_halt=vh, breadth_skip=bs, outlier_exclude=oe, stop_loss=sl, **data,
+        vol_halt=vh, breadth_skip=bs, outlier_exclude=oe, stop_loss=sl,
+        circuit_breaker=cb, **data,
     )
 
 
@@ -160,6 +184,17 @@ class PortfolioState:
     skips_total: int = 0
     stop_losses_total: int = 0
     started_ts: Optional[str] = None
+    # Circuit-breaker state. peak_equity tracks the running equity high
+    # since started_ts (initialized to initial_balance on first cycle).
+    # cb_state ∈ {"normal","halved","halted"}; sticky once tripped — only a
+    # manual reset (clear these fields + restart) lifts the breaker.
+    peak_equity: Optional[float] = None
+    peak_equity_ts: Optional[str] = None
+    cb_state: str = "normal"
+    cb_tripped_ts: Optional[str] = None
+    cb_tripped_equity: Optional[float] = None
+    cb_tripped_peak: Optional[float] = None
+    cb_halts_total: int = 0
 
     def to_json(self) -> dict:
         return {
@@ -171,6 +206,13 @@ class PortfolioState:
             "skips_total": self.skips_total,
             "stop_losses_total": self.stop_losses_total,
             "started_ts": self.started_ts,
+            "peak_equity": self.peak_equity,
+            "peak_equity_ts": self.peak_equity_ts,
+            "cb_state": self.cb_state,
+            "cb_tripped_ts": self.cb_tripped_ts,
+            "cb_tripped_equity": self.cb_tripped_equity,
+            "cb_tripped_peak": self.cb_tripped_peak,
+            "cb_halts_total": self.cb_halts_total,
         }
 
     @classmethod
@@ -185,6 +227,13 @@ class PortfolioState:
             skips_total=data.get("skips_total", 0),
             stop_losses_total=data.get("stop_losses_total", 0),
             started_ts=data.get("started_ts"),
+            peak_equity=data.get("peak_equity"),
+            peak_equity_ts=data.get("peak_equity_ts"),
+            cb_state=data.get("cb_state", "normal"),
+            cb_tripped_ts=data.get("cb_tripped_ts"),
+            cb_tripped_equity=data.get("cb_tripped_equity"),
+            cb_tripped_peak=data.get("cb_tripped_peak"),
+            cb_halts_total=data.get("cb_halts_total", 0),
         )
 
 
@@ -338,6 +387,7 @@ def paper_execute_rebalance(
     last_prices: Dict[str, float],
     cfg: PlanEConfig,
     now_iso: str,
+    notional_scale: float = 1.0,
 ) -> dict:
     cost_per_side = cfg.fee_rate + cfg.slippage_rate
     changes: List[dict] = []
@@ -369,7 +419,7 @@ def paper_execute_rebalance(
         del state.positions[sym]
 
     eq_after_closes = mark_equity(state, last_prices)
-    leg_size = eq_after_closes * cfg.leg_notional_pct
+    leg_size = eq_after_closes * cfg.leg_notional_pct * notional_scale
 
     def open_leg(sym: str, side: str) -> None:
         nonlocal fees_paid
@@ -407,7 +457,86 @@ def paper_execute_rebalance(
         "fees_paid": fees_paid,
         "cash_after": state.cash,
         "equity_after": state.equity,
+        "notional_scale": notional_scale,
     }
+
+
+# =========================  Circuit breaker  =========================
+
+def evaluate_circuit_breaker(
+    state: PortfolioState, cfg: CircuitBreakerConfig, now_iso: str,
+    initial_balance: float,
+) -> dict:
+    """Update peak equity and decide circuit-breaker state.
+
+    Mutates state.peak_equity / cb_state / cb_tripped_* in place.
+    Returns a diagnostics dict suitable for logging or trade-log entries.
+
+    State transitions are sticky (only escalate, never recover automatically):
+      normal  → halved  when DD ≥ halve_dd_pct
+      normal  → halted  when DD ≥ halt_dd_pct (skips halved)
+      halved  → halted  when DD ≥ halt_dd_pct
+      halted  → halted  (terminal)
+
+    To reset: clear cb_state and cb_tripped_* fields in portfolio.json
+    manually and restart the service.
+    """
+    # Initialize peak from first observation. Use max(equity, initial_balance)
+    # so a brief startup dip doesn't anchor the peak below the deploy capital.
+    if state.peak_equity is None or state.peak_equity <= 0:
+        state.peak_equity = max(state.equity, initial_balance)
+        state.peak_equity_ts = now_iso
+
+    if state.equity > state.peak_equity:
+        state.peak_equity = state.equity
+        state.peak_equity_ts = now_iso
+
+    dd = (state.peak_equity - state.equity) / state.peak_equity if state.peak_equity > 0 else 0.0
+
+    diag = {
+        "enabled": cfg.enabled,
+        "state_before": state.cb_state,
+        "peak_equity": state.peak_equity,
+        "current_equity": state.equity,
+        "dd_pct": dd,
+        "halve_dd_pct": cfg.halve_dd_pct,
+        "halt_dd_pct": cfg.halt_dd_pct,
+    }
+
+    if not cfg.enabled:
+        diag["state_after"] = state.cb_state
+        diag["transition"] = None
+        return diag
+
+    transition: Optional[str] = None
+
+    if state.cb_state != "halted" and dd >= cfg.halt_dd_pct:
+        transition = f"{state.cb_state}->halted"
+        state.cb_state = "halted"
+        state.cb_tripped_ts = now_iso
+        state.cb_tripped_equity = state.equity
+        state.cb_tripped_peak = state.peak_equity
+        state.cb_halts_total += 1
+    elif state.cb_state == "normal" and dd >= cfg.halve_dd_pct:
+        transition = "normal->halved"
+        state.cb_state = "halved"
+        state.cb_tripped_ts = now_iso
+        state.cb_tripped_equity = state.equity
+        state.cb_tripped_peak = state.peak_equity
+
+    diag["state_after"] = state.cb_state
+    diag["transition"] = transition
+    return diag
+
+
+def notional_scale_for_state(cb_state: str, cfg: CircuitBreakerConfig) -> float:
+    """Map cb_state → notional multiplier. halted stops execution upstream
+    so its scale here is purely defensive (0.0)."""
+    if cb_state == "halved":
+        return cfg.halved_scale
+    if cb_state == "halted":
+        return 0.0
+    return 1.0
 
 
 # =========================  Runner  =========================
@@ -517,6 +646,46 @@ class PlanERunner:
 
         state.equity = mark_equity(state, last_prices)
 
+        # Circuit breaker: update peak, check DD thresholds. Sticky once tripped.
+        cb_diag = evaluate_circuit_breaker(
+            state, self.cfg.circuit_breaker, now_iso, self.cfg.initial_balance,
+        )
+        if cb_diag["transition"]:
+            logging.warning(
+                "CIRCUIT-BREAKER [%s]: %s | dd=%.2f%% peak=$%.2f equity=$%.2f",
+                self.cfg.instance_name, cb_diag["transition"],
+                cb_diag["dd_pct"] * 100.0, cb_diag["peak_equity"], state.equity,
+            )
+        else:
+            logging.info(
+                "CB [%s]: state=%s dd=%.2f%% peak=$%.2f",
+                self.cfg.instance_name, state.cb_state,
+                cb_diag["dd_pct"] * 100.0, cb_diag["peak_equity"],
+            )
+
+        if state.cb_state == "halted" and not dry_run:
+            state.skips_total += 1
+            state.last_rebalance_ts = now_iso  # advance cadence so we don't busy-loop
+            halt_entry = {
+                "ts": now_iso,
+                "action": "circuit_breaker_halt",
+                "instance": self.cfg.instance_name,
+                "circuit_breaker": cb_diag,
+                "cash_after": state.cash,
+                "equity_after": state.equity,
+                "skips_total": state.skips_total,
+                "open_positions": len(state.positions),
+            }
+            self.save_state(state)
+            self.append_log(halt_entry)
+            logging.error(
+                "HALTED [%s]: equity=$%.2f peak=$%.2f dd=%.2f%% — "
+                "no new orders. Manual reset required.",
+                self.cfg.instance_name, state.equity,
+                cb_diag["peak_equity"], cb_diag["dd_pct"] * 100.0,
+            )
+            return {"status": "halted", **halt_entry}
+
         # Feature gates: vol-halt and breadth-skip may abort the rebalance.
         halt_reasons: List[str] = []
         gate_diag: Dict[str, Any] = {}
@@ -543,6 +712,7 @@ class PlanERunner:
                 "action": "skip",
                 "reasons": halt_reasons,
                 "gates": gate_diag,
+                "circuit_breaker": cb_diag,
                 "cash_after": state.cash,
                 "equity_after": state.equity,
                 "skips_total": state.skips_total,
@@ -578,6 +748,7 @@ class PlanERunner:
                 "ranked": ranked,
                 "excluded": sorted(excluded),
                 "gates": gate_diag,
+                "circuit_breaker": cb_diag,
                 "target_longs": new_longs,
                 "target_shorts": new_shorts,
                 "current_longs": cur_longs,
@@ -586,10 +757,13 @@ class PlanERunner:
                 "marked_equity": state.equity,
             }
 
+        scale = notional_scale_for_state(state.cb_state, self.cfg.circuit_breaker)
         trade = paper_execute_rebalance(
             state, new_longs, new_shorts, last_prices, self.cfg, now_iso,
+            notional_scale=scale,
         )
         trade["gates"] = gate_diag
+        trade["circuit_breaker"] = cb_diag
         trade["excluded"] = sorted(excluded)
         state.last_rebalance_ts = now_iso
         state.rebalances_total += 1
