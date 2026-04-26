@@ -41,6 +41,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from blofin_api import BlofinAPI  # noqa: E402
 from backtest.data_collector import DataCollector  # noqa: E402
+from plan_e_reconcile import (  # noqa: E402
+    ReconcileResult, reconcile_self,
+)
 
 
 # =========================  Feature-flag configs  =========================
@@ -209,6 +212,11 @@ class PortfolioState:
     last_funding_ts: Optional[str] = None
     # Defensive counter: legs we declined to open due to min-notional check.
     skipped_min_notional_total: int = 0
+    # Last reconciliation outcome — mirrored here so the dashboard can
+    # surface it without scanning trades.log.
+    last_reconcile_ts: Optional[str] = None
+    last_reconcile_ok: bool = True
+    last_reconcile_errors_count: int = 0
 
     def to_json(self) -> dict:
         return {
@@ -230,6 +238,9 @@ class PortfolioState:
             "funding_paid_total": self.funding_paid_total,
             "last_funding_ts": self.last_funding_ts,
             "skipped_min_notional_total": self.skipped_min_notional_total,
+            "last_reconcile_ts": self.last_reconcile_ts,
+            "last_reconcile_ok": self.last_reconcile_ok,
+            "last_reconcile_errors_count": self.last_reconcile_errors_count,
         }
 
     @classmethod
@@ -254,6 +265,9 @@ class PortfolioState:
             funding_paid_total=data.get("funding_paid_total", 0.0),
             last_funding_ts=data.get("last_funding_ts"),
             skipped_min_notional_total=data.get("skipped_min_notional_total", 0),
+            last_reconcile_ts=data.get("last_reconcile_ts"),
+            last_reconcile_ok=data.get("last_reconcile_ok", True),
+            last_reconcile_errors_count=data.get("last_reconcile_errors_count", 0),
         )
 
 
@@ -710,6 +724,45 @@ class PlanERunner:
         with open(self.log_path, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
 
+    def reconcile(self, state: PortfolioState, *, source: str = "cycle",
+                  log_event: bool = True) -> ReconcileResult:
+        """Run paper-mode self-consistency check, persist outcome, optionally
+        append a reconcile event to trades.log."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        result = reconcile_self(state, self.cfg, now_iso=now_iso)
+        state.last_reconcile_ts = now_iso
+        state.last_reconcile_ok = result.ok
+        state.last_reconcile_errors_count = len(result.errors)
+        if log_event:
+            entry = {
+                "ts": now_iso,
+                "action": "reconcile",
+                "source": source,
+                "instance": self.cfg.instance_name,
+                "result": result.to_json(),
+            }
+            try:
+                self.append_log(entry)
+            except Exception as e:
+                logging.warning("reconcile log append failed: %s", e)
+        if not result.ok:
+            logging.error(
+                "RECONCILE [%s] %s: %d error(s) — %s",
+                self.cfg.instance_name, source, len(result.errors),
+                "; ".join(result.errors[:3]) + ("…" if len(result.errors) > 3 else ""),
+            )
+        elif result.warnings:
+            logging.warning(
+                "RECONCILE [%s] %s: ok with %d warning(s)",
+                self.cfg.instance_name, source, len(result.warnings),
+            )
+        else:
+            logging.info(
+                "RECONCILE [%s] %s: ok (%d rules)",
+                self.cfg.instance_name, source, result.rules_evaluated,
+            )
+        return result
+
     def fetch_closes(self) -> Tuple[Dict[str, pd.Series], Dict[str, float]]:
         closes: Dict[str, pd.Series] = {}
         last_prices: Dict[str, float] = {}
@@ -769,6 +822,11 @@ class PlanERunner:
 
         state.equity = mark_equity(state, last_prices)
 
+        # Reconcile self-consistency on the just-marked state. Pure local
+        # check, no network. Persisted outcome flows into portfolio.json
+        # via reconcile() side effects on state.last_reconcile_*.
+        recon_result = self.reconcile(state, source="cycle_pre")
+
         # Funding cost: charge accumulated perp funding for ticks since the
         # last accounting boundary, while positions are still in the book.
         # Runs BEFORE rebalance closes/opens so all surviving legs from the
@@ -817,6 +875,7 @@ class PlanERunner:
                 "instance": self.cfg.instance_name,
                 "circuit_breaker": cb_diag,
                 "funding": funding_diag,
+                "reconcile": recon_result.to_json(),
                 "cash_after": state.cash,
                 "equity_after": state.equity,
                 "skips_total": state.skips_total,
@@ -860,6 +919,7 @@ class PlanERunner:
                 "gates": gate_diag,
                 "circuit_breaker": cb_diag,
                 "funding": funding_diag,
+                "reconcile": recon_result.to_json(),
                 "cash_after": state.cash,
                 "equity_after": state.equity,
                 "skips_total": state.skips_total,
@@ -897,6 +957,7 @@ class PlanERunner:
                 "gates": gate_diag,
                 "circuit_breaker": cb_diag,
                 "funding": funding_diag,
+                "reconcile": recon_result.to_json(),
                 "target_longs": new_longs,
                 "target_shorts": new_shorts,
                 "current_longs": cur_longs,
@@ -913,6 +974,7 @@ class PlanERunner:
         trade["gates"] = gate_diag
         trade["circuit_breaker"] = cb_diag
         trade["funding"] = funding_diag
+        trade["reconcile"] = recon_result.to_json()
         trade["excluded"] = sorted(excluded)
         state.last_rebalance_ts = now_iso
         state.rebalances_total += 1
@@ -1097,14 +1159,26 @@ class PlanERunner:
         # Require ~interval_h elapsed (with small tolerance so a late-by-1-min loop still fires).
         return elapsed_h >= interval_h - 0.5
 
-    def run_loop(self, check_interval_sec: int = 60) -> None:
+    def run_loop(self, check_interval_sec: int = 60,
+                 reconcile_strict: bool = False) -> None:
         cfg = self.cfg
         logging.info(
-            "Loop mode [%s]; interval=%dh anchor=UTC %02d:00 vol_halt=%s breadth=%s outlier=%s stop_loss=%s",
+            "Loop mode [%s]; interval=%dh anchor=UTC %02d:00 vol_halt=%s breadth=%s outlier=%s stop_loss=%s reconcile_strict=%s",
             cfg.instance_name, cfg.rebalance_interval_hours, cfg.rebalance_hour_utc,
             cfg.vol_halt.enabled, cfg.breadth_skip.enabled, cfg.outlier_exclude.enabled,
-            cfg.stop_loss.enabled,
+            cfg.stop_loss.enabled, reconcile_strict,
         )
+        # Startup reconciliation: pure local check, runs before any cycle.
+        startup_state = self.load_state()
+        startup_result = self.reconcile(startup_state, source="startup")
+        self.save_state(startup_state)
+        if not startup_result.ok and reconcile_strict:
+            logging.error(
+                "STRICT RECONCILE FAIL [%s]: aborting startup. "
+                "Investigate portfolio.json before re-enabling.",
+                cfg.instance_name,
+            )
+            sys.exit(2)
         last_stop_check: Optional[datetime] = None
         while True:
             now = datetime.now(timezone.utc)
@@ -1142,6 +1216,8 @@ def main() -> int:
     ap.add_argument("--config", default=None,
                     help="JSON config; defaults if omitted")
     ap.add_argument("--log-level", default="INFO")
+    ap.add_argument("--reconcile-strict", action="store_true",
+                    help="abort startup if self-consistency check fails")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -1153,8 +1229,17 @@ def main() -> int:
     runner = PlanERunner(cfg, mode=args.mode)
 
     if args.loop:
-        runner.run_loop()
+        runner.run_loop(reconcile_strict=args.reconcile_strict)
         return 0
+
+    # One-shot or dry-run: still run a startup reconcile if --reconcile-strict.
+    if args.reconcile_strict:
+        startup_state = runner.load_state()
+        result = runner.reconcile(startup_state, source="startup")
+        runner.save_state(startup_state)
+        if not result.ok:
+            logging.error("STRICT RECONCILE FAIL: aborting")
+            return 2
 
     result = runner.do_rebalance_cycle(dry_run=args.dry_run)
     print(json.dumps(result, indent=2, default=str))

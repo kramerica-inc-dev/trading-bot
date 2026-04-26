@@ -636,6 +636,11 @@ def build_plan_e_response(instance: str = DEFAULT_INSTANCE) -> Dict:
             "funding_paid_total": state.get("funding_paid_total", 0.0),
             "last_funding_ts": state.get("last_funding_ts"),
             "skipped_min_notional_total": state.get("skipped_min_notional_total", 0),
+            "reconcile": {
+                "last_ts": state.get("last_reconcile_ts"),
+                "last_ok": state.get("last_reconcile_ok", True),
+                "last_errors_count": state.get("last_reconcile_errors_count", 0),
+            },
             "circuit_breaker": {
                 "state": state.get("cb_state", "normal"),
                 "peak_equity": state.get("peak_equity"),
@@ -805,6 +810,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         "cb_halts_total": state.get("cb_halts_total", 0),
                         "funding_paid_total": state.get("funding_paid_total", 0.0),
                         "skipped_min_notional_total": state.get("skipped_min_notional_total", 0),
+                        "last_reconcile_ok": state.get("last_reconcile_ok", True),
+                        "last_reconcile_errors_count": state.get("last_reconcile_errors_count", 0),
                         "flags": {
                             "vol_halt": bool(
                                 (cfg.get("vol_halt") or {}).get("enabled")),

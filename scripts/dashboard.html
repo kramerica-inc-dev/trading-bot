@@ -300,12 +300,18 @@
       </div>
     </div>
 
-    <div class="grid grid-1" style="margin-top:12px">
+    <div class="grid grid-2" style="margin-top:12px">
       <div class="card">
         <div class="label">Circuit Breaker
           <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — sticky equity-DD protection (10% halve, 20% halt)</span>
         </div>
         <div id="pe-cfg-cb" style="margin-top:8px"></div>
+      </div>
+      <div class="card">
+        <div class="label">Reconciliation
+          <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — self-consistency check, P7 fail-closed scaffold</span>
+        </div>
+        <div id="pe-cfg-reconcile" style="margin-top:8px"></div>
       </div>
     </div>
   </div>
@@ -662,6 +668,19 @@ function renderRiskTab(d) {
     cbEl.innerHTML = cbHtml;
   }
 
+  // Reconciliation section
+  const rec = acc.reconcile || {};
+  const recEl = document.getElementById('pe-cfg-reconcile');
+  if (recEl) {
+    let recHtml = '';
+    const okColor = rec.last_ok ? 'var(--green)' : 'var(--red)';
+    recHtml += configRow('Status', rec.last_ok ? 'OK' : 'FAIL', okColor);
+    recHtml += configRow('Last check', rec.last_ts ? fmtTime(rec.last_ts) : '—');
+    recHtml += configRow('Errors', rec.last_errors_count || 0,
+      (rec.last_errors_count || 0) > 0 ? 'var(--red)' : 'var(--text)');
+    recEl.innerHTML = recHtml;
+  }
+
   let sig = '';
   sig += configRow('Lookback', cfg.lookback_hours != null ? cfg.lookback_hours + 'h' : '—');
   sig += configRow('Sign', `${cfg.signal_sign} (${cfg.signal_label||'—'})`,
@@ -883,8 +902,11 @@ function renderCompare(instances, curves) {
       const ddColor = (i.cb_dd_pct >= 0.10) ? 'var(--amber)'
                      : (i.cb_dd_pct >= 0.05) ? 'var(--text)'
                      : 'var(--green)';
+      const reconBadge = i.last_reconcile_ok === false
+        ? `<span title="${i.last_reconcile_errors_count} reconcile error(s)" style="color:var(--red);margin-right:4px">⚠</span>`
+        : '';
       html += '<tr>' +
-        `<td style="padding:6px 10px;color:var(--text)">${i.instance}</td>` +
+        `<td style="padding:6px 10px;color:var(--text)">${reconBadge}${i.instance}</td>` +
         `<td style="padding:6px 10px;color:${svcColor}">${i.service ? i.service.status : '—'}</td>` +
         `<td style="padding:6px 10px">${i.rebalance_interval_hours}h</td>` +
         `<td style="padding:6px 10px">${legPct}</td>` +
