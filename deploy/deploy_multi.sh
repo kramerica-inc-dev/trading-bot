@@ -88,7 +88,7 @@ EOF
 
 # 5. Enable + start instances
 BASE_INSTANCES=(base c)
-FULL_INSTANCES=(g cg i 12h 48h trail)
+FULL_INSTANCES=(g cg i 12h 48h trail size17)
 
 enable_instance() {
   local inst="$1"
