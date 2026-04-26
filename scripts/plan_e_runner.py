@@ -132,6 +132,13 @@ class PlanEConfig:
     fee_rate: float = 0.0006
     slippage_rate: float = 0.0005
     data_staleness_hours: int = 2
+    # Min leg notional in USD — protects against silent micro-orders if
+    # equity falls hard. For paper this is mostly defensive; for live
+    # this should be loaded from /api/v1/market/instruments per symbol.
+    min_leg_notional_usd: float = 5.0
+    # Track perp funding cost. Default on for visibility; can be disabled
+    # via funding_tracking_enabled=false in JSON config.
+    funding_tracking_enabled: bool = True
     # Feature flags
     vol_halt: VolHaltConfig = field(default_factory=VolHaltConfig)
     breadth_skip: BreadthSkipConfig = field(default_factory=BreadthSkipConfig)
@@ -195,6 +202,13 @@ class PortfolioState:
     cb_tripped_equity: Optional[float] = None
     cb_tripped_peak: Optional[float] = None
     cb_halts_total: int = 0
+    # Funding-cost tracker. funding_paid_total is cumulative net OUTflow
+    # (positive = we paid, negative = we received). last_funding_ts marks
+    # the upper bound of the period already accounted for.
+    funding_paid_total: float = 0.0
+    last_funding_ts: Optional[str] = None
+    # Defensive counter: legs we declined to open due to min-notional check.
+    skipped_min_notional_total: int = 0
 
     def to_json(self) -> dict:
         return {
@@ -213,6 +227,9 @@ class PortfolioState:
             "cb_tripped_equity": self.cb_tripped_equity,
             "cb_tripped_peak": self.cb_tripped_peak,
             "cb_halts_total": self.cb_halts_total,
+            "funding_paid_total": self.funding_paid_total,
+            "last_funding_ts": self.last_funding_ts,
+            "skipped_min_notional_total": self.skipped_min_notional_total,
         }
 
     @classmethod
@@ -234,6 +251,9 @@ class PortfolioState:
             cb_tripped_equity=data.get("cb_tripped_equity"),
             cb_tripped_peak=data.get("cb_tripped_peak"),
             cb_halts_total=data.get("cb_halts_total", 0),
+            funding_paid_total=data.get("funding_paid_total", 0.0),
+            last_funding_ts=data.get("last_funding_ts"),
+            skipped_min_notional_total=data.get("skipped_min_notional_total", 0),
         )
 
 
@@ -420,14 +440,26 @@ def paper_execute_rebalance(
 
     eq_after_closes = mark_equity(state, last_prices)
     leg_size = eq_after_closes * cfg.leg_notional_pct * notional_scale
+    skipped_min_notional = 0
 
     def open_leg(sym: str, side: str) -> None:
-        nonlocal fees_paid
+        nonlocal fees_paid, skipped_min_notional
         if sym in state.positions:
             return
         px = last_prices.get(sym)
         if px is None:
             logging.warning("Cannot open %s (%s): no price", sym, side)
+            return
+        if leg_size < cfg.min_leg_notional_usd:
+            logging.warning(
+                "Skipping %s (%s): leg_size $%.4f < min $%.2f",
+                sym, side, leg_size, cfg.min_leg_notional_usd,
+            )
+            changes.append({
+                "action": "skip_min_notional", "symbol": sym, "side": side,
+                "leg_size": leg_size, "min_required": cfg.min_leg_notional_usd,
+            })
+            skipped_min_notional += 1
             return
         fee = leg_size * cost_per_side
         fees_paid += fee
@@ -447,6 +479,8 @@ def paper_execute_rebalance(
         open_leg(sym, "short")
 
     state.equity = mark_equity(state, last_prices)
+    if skipped_min_notional:
+        state.skipped_min_notional_total += skipped_min_notional
 
     return {
         "ts": now_iso,
@@ -458,6 +492,7 @@ def paper_execute_rebalance(
         "cash_after": state.cash,
         "equity_after": state.equity,
         "notional_scale": notional_scale,
+        "min_notional_skipped": skipped_min_notional,
     }
 
 
@@ -537,6 +572,94 @@ def notional_scale_for_state(cb_state: str, cfg: CircuitBreakerConfig) -> float:
     if cb_state == "halted":
         return 0.0
     return 1.0
+
+
+# =========================  Funding cost  =========================
+
+def _ts_to_ms(ts_str: Optional[str]) -> Optional[int]:
+    """ISO-8601 (with optional tz) → milliseconds since epoch."""
+    if not ts_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts_str)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def apply_funding_charges(
+    state: PortfolioState, api: Any, now: datetime,
+) -> dict:
+    """Charge perp-funding for ticks since state.last_funding_ts.
+
+    For each open position, fetches funding-rate history since the later of
+    (last_funding_ts, position.entered_ts) and applies each historical tick.
+
+    Convention:
+      - Long pays when rate > 0; short receives. (Reverse for rate < 0.)
+      - state.cash receives the net (positive = inflow, negative = outflow).
+      - state.funding_paid_total accumulates net OUTflow (positive = paid).
+    """
+    diag: Dict[str, Any] = {
+        "ticks_applied": 0,
+        "charge_total_usd": 0.0,
+        "per_symbol": {},
+        "errors": [],
+    }
+    if not state.positions:
+        state.last_funding_ts = now.isoformat()
+        return diag
+
+    floor_global_ms = _ts_to_ms(state.last_funding_ts) or _ts_to_ms(state.started_ts) or 0
+    now_ms = int(now.timestamp() * 1000)
+
+    total_charge = 0.0
+    total_ticks = 0
+    for sym, pos in state.positions.items():
+        pos_ms = _ts_to_ms(pos.entered_ts) or floor_global_ms
+        floor_ms = max(floor_global_ms, pos_ms)
+        if floor_ms >= now_ms:
+            continue
+
+        try:
+            resp = api.get_funding_rate_history(inst_id=sym, after=str(now_ms), limit=100)
+            ticks = resp.get("data", []) if isinstance(resp, dict) else []
+        except Exception as e:
+            diag["errors"].append({"symbol": sym, "error": str(e)})
+            continue
+
+        side_sign = -1.0 if pos.side == "long" else 1.0
+        sym_charge = 0.0
+        sym_count = 0
+        for t in ticks:
+            try:
+                t_ms = int(t.get("fundingTime", 0))
+                rate = float(t.get("fundingRate", 0))
+            except (TypeError, ValueError):
+                continue
+            if t_ms <= floor_ms or t_ms > now_ms:
+                continue
+            charge = side_sign * pos.notional * rate
+            sym_charge += charge
+            sym_count += 1
+
+        if sym_count:
+            diag["per_symbol"][sym] = {
+                "ticks": sym_count, "charge_usd": sym_charge,
+                "side": pos.side, "notional": pos.notional,
+            }
+            total_charge += sym_charge
+            total_ticks += sym_count
+
+    state.cash += total_charge
+    state.funding_paid_total += -total_charge
+    state.last_funding_ts = now.isoformat()
+
+    diag["ticks_applied"] = total_ticks
+    diag["charge_total_usd"] = total_charge
+    return diag
 
 
 # =========================  Runner  =========================
@@ -646,6 +769,28 @@ class PlanERunner:
 
         state.equity = mark_equity(state, last_prices)
 
+        # Funding cost: charge accumulated perp funding for ticks since the
+        # last accounting boundary, while positions are still in the book.
+        # Runs BEFORE rebalance closes/opens so all surviving legs from the
+        # prior cycle get fully credited/debited for the period they held.
+        funding_diag = {"ticks_applied": 0, "charge_total_usd": 0.0,
+                        "per_symbol": {}, "errors": []}
+        if self.cfg.funding_tracking_enabled and not dry_run:
+            try:
+                funding_diag = apply_funding_charges(state, self.api, now)
+                state.equity = mark_equity(state, last_prices)
+                if funding_diag["ticks_applied"]:
+                    logging.info(
+                        "FUNDING [%s]: %d tick(s), net %s$%.4f, total paid $%.2f",
+                        self.cfg.instance_name, funding_diag["ticks_applied"],
+                        "+" if funding_diag["charge_total_usd"] >= 0 else "-",
+                        abs(funding_diag["charge_total_usd"]),
+                        state.funding_paid_total,
+                    )
+            except Exception as e:
+                logging.exception("Funding tracker crashed: %s", e)
+                funding_diag["errors"].append({"global": str(e)})
+
         # Circuit breaker: update peak, check DD thresholds. Sticky once tripped.
         cb_diag = evaluate_circuit_breaker(
             state, self.cfg.circuit_breaker, now_iso, self.cfg.initial_balance,
@@ -671,6 +816,7 @@ class PlanERunner:
                 "action": "circuit_breaker_halt",
                 "instance": self.cfg.instance_name,
                 "circuit_breaker": cb_diag,
+                "funding": funding_diag,
                 "cash_after": state.cash,
                 "equity_after": state.equity,
                 "skips_total": state.skips_total,
@@ -713,6 +859,7 @@ class PlanERunner:
                 "reasons": halt_reasons,
                 "gates": gate_diag,
                 "circuit_breaker": cb_diag,
+                "funding": funding_diag,
                 "cash_after": state.cash,
                 "equity_after": state.equity,
                 "skips_total": state.skips_total,
@@ -749,6 +896,7 @@ class PlanERunner:
                 "excluded": sorted(excluded),
                 "gates": gate_diag,
                 "circuit_breaker": cb_diag,
+                "funding": funding_diag,
                 "target_longs": new_longs,
                 "target_shorts": new_shorts,
                 "current_longs": cur_longs,
@@ -764,6 +912,7 @@ class PlanERunner:
         )
         trade["gates"] = gate_diag
         trade["circuit_breaker"] = cb_diag
+        trade["funding"] = funding_diag
         trade["excluded"] = sorted(excluded)
         state.last_rebalance_ts = now_iso
         state.rebalances_total += 1

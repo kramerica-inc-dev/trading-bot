@@ -679,6 +679,17 @@ function renderRiskTab(d) {
   fees += configRow('Round-trip cost', (cfg.fee_rate != null && cfg.slippage_rate != null)
     ? ((cfg.fee_rate + cfg.slippage_rate)*2*10000).toFixed(1) + ' bps' : '—',
     'var(--amber)');
+  // funding_paid_total convention: positive = we paid out. Display
+  // negated so "+" means net inflow (received), "−" means net outflow.
+  fees += configRow('Funding (cum.)', acc.funding_paid_total != null
+    ? fmtSignedUsd(-acc.funding_paid_total) : '—',
+    (acc.funding_paid_total || 0) > 0 ? 'var(--red)' : 'var(--green)');
+  if (acc.last_funding_ts) {
+    fees += configRow('Last funding accrual', fmtTime(acc.last_funding_ts));
+  }
+  if ((acc.skipped_min_notional_total || 0) > 0) {
+    fees += configRow('Min-notional skips', acc.skipped_min_notional_total, 'var(--amber)');
+  }
   document.getElementById('pe-cfg-fees').innerHTML = fees;
 
   let sz = '';

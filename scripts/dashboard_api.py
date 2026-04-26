@@ -633,6 +633,9 @@ def build_plan_e_response(instance: str = DEFAULT_INSTANCE) -> Dict:
             "next_rebalance_ts": _next_rebalance_ts(rebal_hour),
             "started_ts": started_ts,
             "total_fees_paid": total_fees,
+            "funding_paid_total": state.get("funding_paid_total", 0.0),
+            "last_funding_ts": state.get("last_funding_ts"),
+            "skipped_min_notional_total": state.get("skipped_min_notional_total", 0),
             "circuit_breaker": {
                 "state": state.get("cb_state", "normal"),
                 "peak_equity": state.get("peak_equity"),
@@ -800,6 +803,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         "cb_state": state.get("cb_state", "normal"),
                         "cb_dd_pct": dd_pct,
                         "cb_halts_total": state.get("cb_halts_total", 0),
+                        "funding_paid_total": state.get("funding_paid_total", 0.0),
+                        "skipped_min_notional_total": state.get("skipped_min_notional_total", 0),
                         "flags": {
                             "vol_halt": bool(
                                 (cfg.get("vol_halt") or {}).get("enabled")),
