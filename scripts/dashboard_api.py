@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -865,7 +865,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("DASHBOARD_PORT", API_PORT))
-    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
+    server.daemon_threads = True
     print(f"Dashboard API running on http://0.0.0.0:{port}")
     print(f"  Bot dir:   {BOT_DIR}")
     print(f"  Memory:    {MEMORY_DIR}")
