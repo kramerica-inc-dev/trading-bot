@@ -50,3 +50,7 @@ state/
 
 # Archive (oude configs met credentials)
 archive/
+
+# Trained model artifacts (data-derived, reproducible from code)
+scripts/models/
+*.joblib
