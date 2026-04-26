@@ -299,6 +299,15 @@
         <div id="pe-cfg-sizing" style="margin-top:8px"></div>
       </div>
     </div>
+
+    <div class="grid grid-1" style="margin-top:12px">
+      <div class="card">
+        <div class="label">Circuit Breaker
+          <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — sticky equity-DD protection (10% halve, 20% halt)</span>
+        </div>
+        <div id="pe-cfg-cb" style="margin-top:8px"></div>
+      </div>
+    </div>
   </div>
 
   <!-- ═══ LOGS ═══ -->
@@ -625,11 +634,33 @@ function renderStrategyTab(d) {
 
 function renderRiskTab(d) {
   const cfg = d.config || {};
+  const acc = d.account || {};
   document.getElementById('pe-risk-universe').textContent = cfg.universe_size != null ? cfg.universe_size : '—';
   document.getElementById('pe-risk-legs').textContent = (cfg.long_n!=null && cfg.short_n!=null)
     ? `${cfg.long_n} / ${cfg.short_n}` : '—';
   document.getElementById('pe-risk-notional').textContent = cfg.leg_notional_pct != null
     ? ((cfg.leg_notional_pct)*100).toFixed(1) + '%' : '—';
+
+  // Circuit breaker section
+  const cb = acc.circuit_breaker || {};
+  const cbEl = document.getElementById('pe-cfg-cb');
+  if (cbEl) {
+    const stateColors = {normal: 'var(--green)', halved: 'var(--amber)', halted: 'var(--red)'};
+    const stateColor = stateColors[cb.state] || 'var(--text)';
+    let cbHtml = '';
+    cbHtml += configRow('State', (cb.state || 'normal').toUpperCase(), stateColor);
+    cbHtml += configRow('Peak equity', cb.peak_equity != null ? fmtUsd(cb.peak_equity) : '—');
+    cbHtml += configRow('Current DD', (cb.dd_pct != null)
+      ? (cb.dd_pct * 100).toFixed(2) + '%'
+      : '—',
+      (cb.dd_pct >= 0.10) ? 'var(--amber)' : (cb.dd_pct >= 0.05 ? 'var(--text)' : 'var(--green)'));
+    cbHtml += configRow('Halts total', cb.halts_total || 0,
+      (cb.halts_total || 0) > 0 ? 'var(--red)' : 'var(--text)');
+    if (cb.tripped_ts) {
+      cbHtml += configRow('Last trip', fmtTime(cb.tripped_ts) + ' @ ' + fmtUsd(cb.tripped_equity));
+    }
+    cbEl.innerHTML = cbHtml;
+  }
 
   let sig = '';
   sig += configRow('Lookback', cfg.lookback_hours != null ? cfg.lookback_hours + 'h' : '—');
@@ -824,19 +855,34 @@ function renderCompare(instances, curves) {
   if (tbl) {
     let html = '<table style="width:100%;border-collapse:collapse;font-family:var(--font);font-size:11px">';
     html += '<thead><tr style="color:var(--text-dim);text-align:left">' +
-      ['Instance','Service','Interval','Flags','Rebalances','Skips','Equity','Started']
+      ['Instance','Service','Interval','Leg %','Cost bps','Flags','Rebal.','Skips','CB','DD','Equity','Started']
         .map(h => `<th style="padding:6px 10px;border-bottom:1px solid var(--border)">${h}</th>`).join('') +
       '</tr></thead><tbody>';
+    const cbColors = {normal: 'var(--green)', halved: 'var(--amber)', halted: 'var(--red)'};
     for (const i of instances) {
       const fl = Object.entries(i.flags || {}).filter(([,v]) => v).map(([k]) => k).join(', ') || '—';
       const svcColor = i.service && i.service.status === 'active' ? 'var(--green)' : 'var(--text-dim)';
+      const legPct = i.leg_notional_pct != null ? (i.leg_notional_pct * 100).toFixed(1) + '%' : '—';
+      const costBps = (i.fee_rate != null && i.slippage_rate != null)
+        ? ((i.fee_rate + i.slippage_rate) * 2 * 10000).toFixed(1)
+        : '—';
+      const cbState = (i.cb_state || 'normal');
+      const cbColor = cbColors[cbState] || 'var(--text)';
+      const dd = (i.cb_dd_pct != null) ? (i.cb_dd_pct * 100).toFixed(2) + '%' : '—';
+      const ddColor = (i.cb_dd_pct >= 0.10) ? 'var(--amber)'
+                     : (i.cb_dd_pct >= 0.05) ? 'var(--text)'
+                     : 'var(--green)';
       html += '<tr>' +
         `<td style="padding:6px 10px;color:var(--text)">${i.instance}</td>` +
         `<td style="padding:6px 10px;color:${svcColor}">${i.service ? i.service.status : '—'}</td>` +
         `<td style="padding:6px 10px">${i.rebalance_interval_hours}h</td>` +
+        `<td style="padding:6px 10px">${legPct}</td>` +
+        `<td style="padding:6px 10px;color:var(--amber)">${costBps}</td>` +
         `<td style="padding:6px 10px;color:var(--text-muted)">${fl}</td>` +
         `<td style="padding:6px 10px">${i.rebalances_total || 0}</td>` +
         `<td style="padding:6px 10px">${i.skips_total || 0}</td>` +
+        `<td style="padding:6px 10px;color:${cbColor};font-weight:600">${cbState.toUpperCase()}</td>` +
+        `<td style="padding:6px 10px;color:${ddColor}">${dd}</td>` +
         `<td style="padding:6px 10px">${typeof i.equity === 'number' ? fmtUsd(i.equity) : '—'}</td>` +
         `<td style="padding:6px 10px;color:var(--text-dim)">${i.started_ts ? i.started_ts.slice(0,16).replace('T',' ') : '—'}</td>` +
         '</tr>';

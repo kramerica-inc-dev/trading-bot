@@ -779,6 +779,11 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     state = _read_json_file(paths["state"], {})
                     cfg = _read_json_file(paths["config"], {})
                     svc = _service_status(_instance_service_name(inst))
+                    peak = state.get("peak_equity")
+                    eq_now = state.get("equity") or 0.0
+                    dd_pct = (
+                        (peak - eq_now) / peak if peak and peak > 0 else 0.0
+                    )
                     summaries.append({
                         "instance": inst,
                         "service": svc,
@@ -789,6 +794,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         "last_rebalance_ts": state.get("last_rebalance_ts"),
                         "rebalance_interval_hours":
                             int(cfg.get("rebalance_interval_hours", 24)),
+                        "leg_notional_pct": cfg.get("leg_notional_pct"),
+                        "fee_rate": cfg.get("fee_rate"),
+                        "slippage_rate": cfg.get("slippage_rate"),
+                        "cb_state": state.get("cb_state", "normal"),
+                        "cb_dd_pct": dd_pct,
+                        "cb_halts_total": state.get("cb_halts_total", 0),
                         "flags": {
                             "vol_halt": bool(
                                 (cfg.get("vol_halt") or {}).get("enabled")),
@@ -796,6 +807,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                                 (cfg.get("breadth_skip") or {}).get("enabled")),
                             "outlier_exclude": bool(
                                 (cfg.get("outlier_exclude") or {}).get("enabled")),
+                            "stop_loss": bool(
+                                (cfg.get("stop_loss") or {}).get("enabled")),
                         },
                     })
                 self._send_json({"instances": summaries})
