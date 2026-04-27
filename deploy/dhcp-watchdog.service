@@ -1,0 +1,6 @@
+[Unit]
+Description=DHCP watchdog (renew lease if eth0 has no IPv4)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dhcp-watchdog.sh

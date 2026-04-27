@@ -314,6 +314,13 @@
         <div id="pe-cfg-reconcile" style="margin-top:8px"></div>
       </div>
     </div>
+
+    <div class="card" style="margin-top:12px">
+      <div class="label">DHCP Watchdog
+        <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — LXC eth0 lease auto-recovery (60s timer)</span>
+      </div>
+      <div id="pe-cfg-dhcp" style="margin-top:8px"></div>
+    </div>
   </div>
 
   <!-- ═══ LOGS ═══ -->
@@ -679,6 +686,46 @@ function renderRiskTab(d) {
     recHtml += configRow('Errors', rec.last_errors_count || 0,
       (rec.last_errors_count || 0) > 0 ? 'var(--red)' : 'var(--text)');
     recEl.innerHTML = recHtml;
+  }
+
+  // DHCP watchdog section — fetched separately from /api/system/dhcp since
+  // the watchdog state is LXC-wide, not per-instance.
+  const dhcpEl = document.getElementById('pe-cfg-dhcp');
+  if (dhcpEl) {
+    fetch('/api/system/dhcp').then(r => r.json()).then(dhcp => {
+      if (!dhcp.installed) {
+        dhcpEl.innerHTML = configRow('Status', 'not installed', 'var(--text-dim)');
+        return;
+      }
+      const todayN = dhcp.events_today || 0;
+      const lastEv = dhcp.last_event || null;
+      const lastFail = dhcp.last_failure || null;
+      let stateText = 'OK';
+      let stateColor = 'var(--green)';
+      if (lastEv && lastEv.event === 'failed') {
+        stateText = 'LAST FAILED';
+        stateColor = 'var(--red)';
+      } else if (todayN > 0) {
+        stateText = 'RECOVERED';
+        stateColor = 'var(--amber)';
+      }
+      let html = '';
+      html += configRow('Status', stateText, stateColor);
+      html += configRow('Recoveries today', todayN,
+        todayN > 0 ? 'var(--amber)' : 'var(--text)');
+      html += configRow('Recoveries total', dhcp.events_total || 0);
+      if (lastEv) {
+        const ts = fmtTime(lastEv.ts);
+        const ip = lastEv.ip ? ' → ' + lastEv.ip : '';
+        html += configRow('Last event', `${lastEv.event}${ip} @ ${ts}`);
+      }
+      if (lastFail) {
+        html += configRow('Last failure', fmtTime(lastFail.ts), 'var(--red)');
+      }
+      dhcpEl.innerHTML = html;
+    }).catch(() => {
+      dhcpEl.innerHTML = configRow('Status', 'fetch failed', 'var(--text-dim)');
+    });
   }
 
   let sig = '';

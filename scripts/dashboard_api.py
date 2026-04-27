@@ -42,6 +42,11 @@ LEGACY_RUNNER_CACHE = STATE_DIR / "runner_cache"
 
 DEFAULT_INSTANCE = "plan-e-base"
 
+# DHCP watchdog event log (written by /usr/local/bin/dhcp-watchdog.sh on the
+# LXC). Read-only; fail-open if missing so deployments without the watchdog
+# still serve a meaningful payload.
+DHCP_EVENTS_LOG = Path("/var/log/dhcp-watchdog.events.jsonl")
+
 # Service control: allow the legacy unit plus any templated plan-e@<instance>
 # where <instance> matches a simple allow-listed charset.
 CONTROLLABLE_SERVICES = {"plan-e-runner"}
@@ -158,6 +163,42 @@ def _compute_trade_stats(trades: List[Dict]) -> Dict:
         "total_pnl": round(total_win + total_loss, 2),
         "best": round(max((t.get("pnl", 0) for t in trades), default=0), 2),
         "worst": round(min((t.get("pnl", 0) for t in trades), default=0), 2),
+    }
+
+
+def _read_dhcp_status() -> Dict[str, Any]:
+    """Summarize /var/log/dhcp-watchdog.events.jsonl for the dashboard.
+
+    Returns {"installed": False} when the watchdog hasn't been deployed yet.
+    Otherwise returns counts (today / total), last event, and last failure.
+    Fails open: parse errors on individual lines are skipped silently.
+    """
+    if not DHCP_EVENTS_LOG.exists():
+        return {"installed": False}
+    today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    events: List[Dict[str, Any]] = []
+    try:
+        with open(DHCP_EVENTS_LOG) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as e:
+        return {"installed": True, "error": str(e)}
+    today = [e for e in events if (e.get("ts") or "").startswith(today_prefix)]
+    last_failure = next(
+        (e for e in reversed(events) if e.get("event") == "failed"), None,
+    )
+    return {
+        "installed": True,
+        "events_today": len(today),
+        "events_total": len(events),
+        "last_event": events[-1] if events else None,
+        "last_failure": last_failure,
     }
 
 
@@ -858,6 +899,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._send_json(out)
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/system/dhcp":
+            self._send_json(_read_dhcp_status())
 
         elif path == "/api/health":
             self._send_json({"ok": True, "ts": datetime.now(timezone.utc).isoformat()})
