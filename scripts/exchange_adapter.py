@@ -176,24 +176,28 @@ class ExchangeAdapter(ABC):
 
 def create_exchange_adapter(exchange_name: str, config: Dict) -> ExchangeAdapter:
     """Factory function to create the appropriate exchange adapter
-    
+
     Args:
-        exchange_name: "blofin" or "coinbase"
+        exchange_name: "blofin", "okx", or "coinbase"
         config: Exchange-specific configuration
-    
+
     Returns:
         ExchangeAdapter instance
     """
     exchange_name = exchange_name.lower()
-    
+
     if exchange_name == "blofin":
         from blofin_adapter import BlofinAdapter
         return BlofinAdapter(config)
-    
+
+    elif exchange_name == "okx":
+        from okx_adapter import OkxAdapter
+        return OkxAdapter(config)
+
     elif exchange_name == "coinbase":
         from coinbase_adapter import CoinbaseAdapter
         return CoinbaseAdapter(config)
-    
+
     else:
         raise ValueError(f"Unsupported exchange: {exchange_name}. "
-                        f"Supported: blofin, coinbase")
+                        f"Supported: blofin, okx, coinbase")
