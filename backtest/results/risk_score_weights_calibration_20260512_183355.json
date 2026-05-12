@@ -1,0 +1,407 @@
+{
+  "generated_at": "2026-05-12T16:33:55.483682+00:00",
+  "phase": "Fase 5 \u2014 walk-forward calibration of continuous-risk-score component weights",
+  "data": {
+    "csv": "backtest/data/BTC-USDT_5m.csv",
+    "config": "config.json",
+    "strategy_params": {
+      "rsi_period": 14,
+      "rsi_oversold": 30,
+      "rsi_overbought": 70,
+      "stop_loss_pct": 3.0,
+      "take_profit_pct": 2.0,
+      "macd_fast": 12,
+      "macd_slow": 26,
+      "macd_signal": 9,
+      "bb_period": 20,
+      "bb_std": 2.0,
+      "volume_period": 20,
+      "volume_threshold": 1.2,
+      "atr_period": 14,
+      "stop_loss_atr_mult": 2.0,
+      "take_profit_atr_mult": 3.0,
+      "min_confidence": 0.45,
+      "stop_loss_floor_pct": 1.0,
+      "take_profit_floor_pct": 1.5,
+      "min_votes": 3
+    },
+    "n_total_bars": 30000,
+    "search_bars": 24000,
+    "holdout_bars": 6000,
+    "search_period": [
+      "2026-01-03 18:30:00+00:00",
+      "2026-03-28 02:25:00+00:00"
+    ],
+    "holdout_period": [
+      "2026-03-28 02:30:00+00:00",
+      "2026-04-17 22:25:00+00:00"
+    ]
+  },
+  "grid": {
+    "values": [
+      0.0,
+      1.0,
+      2.0
+    ],
+    "component_keys": [
+      "confidence",
+      "quality_score",
+      "regime_confidence",
+      "mtf_alignment"
+    ],
+    "n_trials": 80,
+    "quick": false
+  },
+  "walk_forward": {
+    "n_splits": 3,
+    "train_pct": 0.7,
+    "min_trades": 5
+  },
+  "sizing": {
+    "risk_per_trade_pct": 1.0,
+    "leverage": 1.0,
+    "max_position_notional_pct": 100.0
+  },
+  "grid_degenerate": false,
+  "objective_flat": false,
+  "objective": "max Calmar ratio on train portion",
+  "option_b_done": false,
+  "option_b_note": "Option B (Ridge/Lasso) intentionally NOT done \u2014 per the plan it is only warranted if A doesn't converge; with a flat/near-flat objective (Fase 4 experience) escalating to B would just overfit. Equal weights retained.",
+  "splits": [
+    {
+      "split": 1,
+      "winner_weights": {
+        "confidence": 1.0,
+        "quality_score": 0.0,
+        "regime_confidence": 0.0,
+        "mtf_alignment": 0.0
+      },
+      "train": {
+        "calmar": -13.819801968359887,
+        "sharpe_bars": -15.957770597130454,
+        "sharpe_trades": -24.908145413162877,
+        "max_dd_pct": 3.602153526687525,
+        "total_return_pct": -3.6021535266875286,
+        "alpha_vs_bh_pct": -3.249811232303717,
+        "win_rate": 0.06666666666666667,
+        "trades": 15,
+        "avg_trade_size": 106.91333333333334,
+        "cagr": -0.49781048398450767
+      },
+      "test": {
+        "calmar": -34.94970997987986,
+        "sharpe_bars": -9.95439194241386,
+        "sharpe_trades": -27.1677544582045,
+        "max_dd_pct": 0.6982572072372568,
+        "total_return_pct": -0.6364335909269044,
+        "alpha_vs_bh_pct": 7.138197368939109,
+        "win_rate": 0.0,
+        "trades": 4,
+        "avg_trade_size": 113.4,
+        "cagr": -0.24403886884302994
+      },
+      "equal_weights_train": {
+        "calmar": -13.996214241546063,
+        "sharpe_bars": -16.158071446786263,
+        "sharpe_trades": -24.908145413162877,
+        "max_dd_pct": 3.4461517529038246,
+        "total_return_pct": -3.4461517529038415,
+        "alpha_vs_bh_pct": -3.0938094585200298,
+        "win_rate": 0.06666666666666667,
+        "trades": 15,
+        "avg_trade_size": 104.83999999999999,
+        "cagr": -0.48233078242521443
+      },
+      "equal_weights_test": {
+        "calmar": -34.94970997987986,
+        "sharpe_bars": -9.95439194241386,
+        "sharpe_trades": -27.1677544582045,
+        "max_dd_pct": 0.6982572072372568,
+        "total_return_pct": -0.6364335909269044,
+        "alpha_vs_bh_pct": 7.138197368939109,
+        "win_rate": 0.0,
+        "trades": 4,
+        "avg_trade_size": 113.4,
+        "cagr": -0.24403886884302994
+      }
+    },
+    {
+      "split": 3,
+      "winner_weights": {
+        "confidence": 1.0,
+        "quality_score": 0.0,
+        "regime_confidence": 0.0,
+        "mtf_alignment": 0.0
+      },
+      "train": {
+        "calmar": -15.793276407636107,
+        "sharpe_bars": -9.253807973127763,
+        "sharpe_trades": -11.654073642832442,
+        "max_dd_pct": 1.9792862521283496,
+        "total_return_pct": -1.97665960026564,
+        "alpha_vs_bh_pct": -10.946260566973997,
+        "win_rate": 0.125,
+        "trades": 8,
+        "avg_trade_size": 134.22500000000002,
+        "cagr": -0.31259414869697155
+      },
+      "test": {
+        "calmar": -36.75836018440382,
+        "sharpe_bars": -15.170080717919761,
+        "sharpe_trades": -30.30316555857276,
+        "max_dd_pct": 0.8438155351440219,
+        "total_return_pct": -0.8438155351440219,
+        "alpha_vs_bh_pct": 4.3312382579514965,
+        "win_rate": 0.0,
+        "trades": 3,
+        "avg_trade_size": 141.4,
+        "cagr": -0.31017275370019415
+      },
+      "equal_weights_train": {
+        "calmar": -16.079479002567737,
+        "sharpe_bars": -10.062395194554528,
+        "sharpe_trades": -11.654073642832442,
+        "max_dd_pct": 1.765936920995737,
+        "total_return_pct": -1.7633045424211087,
+        "alpha_vs_bh_pct": -10.732905509129466,
+        "win_rate": 0.125,
+        "trades": 8,
+        "avg_trade_size": 121.20000000000002,
+        "cagr": -0.2839534564101007
+      },
+      "equal_weights_test": {
+        "calmar": -36.75836018440382,
+        "sharpe_bars": -15.170080717919761,
+        "sharpe_trades": -30.30316555857276,
+        "max_dd_pct": 0.8438155351440219,
+        "total_return_pct": -0.8438155351440219,
+        "alpha_vs_bh_pct": 4.3312382579514965,
+        "win_rate": 0.0,
+        "trades": 3,
+        "avg_trade_size": 141.4,
+        "cagr": -0.31017275370019415
+      }
+    }
+  ],
+  "overall_winner": {
+    "weights_unnormalized": {
+      "confidence": 1.0,
+      "quality_score": 0.0,
+      "regime_confidence": 0.0,
+      "mtf_alignment": 0.0
+    },
+    "weights_normalized": {
+      "confidence": 1.0,
+      "quality_score": 0.0,
+      "regime_confidence": 0.0,
+      "mtf_alignment": 0.0
+    },
+    "mean_train_calmar": -13.993774282586118,
+    "train_calmar_per_split": [
+      -13.819801968359887,
+      -12.368244471762361,
+      -15.793276407636107
+    ],
+    "train_calmar_mu": -13.993774282586118,
+    "train_calmar_sigma": 1.4036644221528847,
+    "z_vs_field_calmar": 1.3579136570446964,
+    "search_data_metrics": {
+      "calmar": -3.715546470414202,
+      "sharpe_bars": -12.16891659712677,
+      "sharpe_trades": -18.08890554642222,
+      "max_dd_pct": 9.699701813473276,
+      "total_return_pct": -9.699701813473268,
+      "alpha_vs_bh_pct": 17.086075846006814,
+      "win_rate": 0.075,
+      "trades": 40,
+      "avg_trade_size": 118.285,
+      "cagr": -0.3603969283712086
+    },
+    "deflated_sharpe": 7.666889345614436e-11,
+    "sharpe_non_annualized": -0.03753265082215862,
+    "n_obs": 23800
+  },
+  "field_spread": {
+    "calmar_mean": -14.177843419260858,
+    "calmar_sigma": 0.13555290185043134,
+    "calmar_min": -14.72486691409683,
+    "calmar_max": -13.993774282586118,
+    "sharpe_mean": -10.878964039301264,
+    "sharpe_sigma": 0.1447211901744641,
+    "per_combo_mean_train_calmar": {
+      "0,0,0,1": -14.354566761505959,
+      "0,0,0,2": -14.354566761505959,
+      "0,0,1,0": -14.72486691409683,
+      "0,0,1,1": -14.506948408505307,
+      "0,0,1,2": -14.439811674727034,
+      "0,0,2,0": -14.72486691409683,
+      "0,0,2,1": -14.576431535268929,
+      "0,0,2,2": -14.506948408505307,
+      "0,1,0,0": -14.086447461748895,
+      "0,1,0,1": -14.159157771361699,
+      "0,1,0,2": -14.186155824505702,
+      "0,1,1,0": -14.203209004448839,
+      "0,1,1,1": -14.213035825018915,
+      "0,1,1,2": -14.217910422458823,
+      "0,1,2,0": -14.295178127351344,
+      "0,1,2,1": -14.299877906935444,
+      "0,1,2,2": -14.302803796048117,
+      "0,2,0,0": -14.086447461748895,
+      "0,2,0,1": -14.136143655826805,
+      "0,2,0,2": -14.159157771361699,
+      "0,2,1,0": -14.217909520993196,
+      "0,2,1,1": -14.22153229341523,
+      "0,2,1,2": -14.223647628621086,
+      "0,2,2,0": -14.203209004448839,
+      "0,2,2,1": -14.209268082742364,
+      "0,2,2,2": -14.213035825018915,
+      "1,0,0,0": -13.993774282586118,
+      "1,0,0,1": -14.0933610897341,
+      "1,0,0,2": -14.139012976638211,
+      "1,0,1,0": -14.05728017921115,
+      "1,0,1,1": -14.115269726984854,
+      "1,0,1,2": -14.143983437908242,
+      "1,0,2,0": -14.091035438768118,
+      "1,0,2,1": -14.12607784285595,
+      "1,0,2,2": -14.14694525110567,
+      "1,1,0,0": -14.10052612640063,
+      "1,1,0,1": -14.144221359049665,
+      "1,1,0,2": -14.166128137003676,
+      "1,1,1,0": -14.120195235072478,
+      "1,1,1,1": -14.147979238625387,
+      "1,1,1,2": -14.164757986246272,
+      "1,1,2,0": -14.129984641387123,
+      "1,1,2,1": -14.150084920378754,
+      "1,1,2,2": -14.16378835350877,
+      "1,2,0,0": -14.149385557745854,
+      "1,2,0,1": -14.16987871242916,
+      "1,2,0,2": -14.182423071876343,
+      "1,2,1,0": -14.151919029478625,
+      "1,2,1,1": -14.167674173296808,
+      "1,2,1,2": -14.178589357602116,
+      "1,2,2,0": -14.153324788375627,
+      "1,2,2,1": -14.166141391634511,
+      "1,2,2,2": -14.175661605408903,
+      "2,0,0,0": -13.993774282586118,
+      "2,0,0,1": -14.047379672721606,
+      "2,0,0,2": -14.0933610897341,
+      "2,0,1,0": -14.029944171276897,
+      "2,0,1,1": -14.075196916679582,
+      "2,0,1,2": -14.106223184034382,
+      "2,0,2,0": -14.05728017921115,
+      "2,0,2,1": -14.091894787401904,
+      "2,0,2,2": -14.115269726984854,
+      "2,1,0,0": -14.052405981534642,
+      "2,1,0,1": -14.096854888202115,
+      "2,1,0,2": -14.12387992054562,
+      "2,1,1,0": -14.078828548105866,
+      "2,1,1,1": -14.109351057204151,
+      "2,1,1,2": -14.129776707569576,
+      "2,1,2,0": -14.094954594986712,
+      "2,1,2,1": -14.117662002237282,
+      "2,1,2,2": -14.134101828070618,
+      "2,2,0,0": -14.10052612640063,
+      "2,2,0,1": -14.127017397704423,
+      "2,2,0,2": -14.144221359049665,
+      "2,2,1,0": -14.112238372853446,
+      "2,2,1,1": -14.132314128641577,
+      "2,2,1,2": -14.146167178073739,
+      "2,2,2,0": -14.120195235072478,
+      "2,2,2,1": -14.136136291780117,
+      "2,2,2,2": -14.147979238625387
+    }
+  },
+  "equal_weights": {
+    "confidence": 0.25,
+    "quality_score": 0.25,
+    "regime_confidence": 0.25,
+    "mtf_alignment": 0.25
+  },
+  "equal_weights_search_metrics": {
+    "calmar": -3.752368395538595,
+    "sharpe_bars": -12.570327621972119,
+    "sharpe_trades": -18.088905546422218,
+    "max_dd_pct": 9.11990953970684,
+    "total_return_pct": -9.119909539706859,
+    "alpha_vs_bh_pct": 17.665868119773222,
+    "win_rate": 0.075,
+    "trades": 40,
+    "avg_trade_size": 113.6425,
+    "cagr": -0.34221260326966885
+  },
+  "binary_gates_search_metrics": {
+    "calmar": -3.7133368108418097,
+    "sharpe_bars": -12.132022758322492,
+    "sharpe_trades": -18.08890554642222,
+    "max_dd_pct": 9.734674300621464,
+    "total_return_pct": -9.734674300621467,
+    "alpha_vs_bh_pct": 17.051103358858615,
+    "win_rate": 0.075,
+    "trades": 40,
+    "avg_trade_size": 118.5575,
+    "cagr": -0.3614812442205343
+  },
+  "holdout": {
+    "winner_metrics": {
+      "calmar": -12.915811998117064,
+      "sharpe_bars": -9.736607399616997,
+      "sharpe_trades": -15.19372382972342,
+      "max_dd_pct": 2.0717612732379527,
+      "total_return_pct": -1.7614468819344702,
+      "alpha_vs_bh_pct": -18.995896077055942,
+      "win_rate": 0.125,
+      "trades": 8,
+      "avg_trade_size": 143.675,
+      "cagr": -0.26758479110121036
+    },
+    "equal_weights_metrics": {
+      "calmar": -13.088489796673777,
+      "sharpe_bars": -9.965405236234858,
+      "sharpe_trades": -15.193723829723423,
+      "max_dd_pct": 2.048374650950172,
+      "total_return_pct": -1.7654018811760774,
+      "alpha_vs_bh_pct": -18.99985107629755,
+      "win_rate": 0.125,
+      "trades": 8,
+      "avg_trade_size": 141.825,
+      "cagr": -0.2681013071872653
+    },
+    "binary_gates_metrics": {
+      "calmar": -12.915811998117064,
+      "sharpe_bars": -9.736607399616997,
+      "sharpe_trades": -15.19372382972342,
+      "max_dd_pct": 2.0717612732379527,
+      "total_return_pct": -1.7614468819344702,
+      "alpha_vs_bh_pct": -18.995896077055942,
+      "win_rate": 0.125,
+      "trades": 8,
+      "avg_trade_size": 143.675,
+      "cagr": -0.26758479110121036
+    },
+    "winner_within_1sigma_of_train": true,
+    "winner_beats_equal_weights": true
+  },
+  "recommendation": {
+    "use_calibrated_weights": true,
+    "recommended_weights": {
+      "confidence": 1.0,
+      "quality_score": 0.0,
+      "regime_confidence": 0.0,
+      "mtf_alignment": 0.0
+    },
+    "reason": "calibrated winner survives the holdout/noise gate and beats equal weights",
+    "recommended_config_section": {
+      "risk_scoring": {
+        "enabled": false,
+        "weights": {
+          "confidence": 1.0,
+          "quality_score": 0.0,
+          "regime_confidence": 0.0,
+          "mtf_alignment": 0.0
+        },
+        "size_slope": 2.0,
+        "size_intercept": -0.5
+      }
+    }
+  }
+}

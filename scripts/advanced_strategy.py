@@ -9,6 +9,8 @@ import pandas as pd
 
 from trading_strategy import Signal, TradingStrategy
 
+from risk_scoring import build_risk_score_record
+
 
 @dataclass
 class AdvancedSignal(Signal):
@@ -24,6 +26,10 @@ class AdvancedSignal(Signal):
     risk_multiplier: float = 1.0
     quality_score: float = 0.0
     max_hold_bars: Optional[int] = None
+    # Fase 5 — populated only when risk_scoring.enabled; the scalar continuous
+    # risk score plus a {component: normalized_value} dict for post-hoc analysis.
+    risk_score: Optional[float] = None
+    risk_score_components: Dict[str, float] = field(default_factory=dict)
 
 
 class MultiIndicatorConfluence(TradingStrategy):
@@ -176,6 +182,18 @@ class MultiIndicatorConfluence(TradingStrategy):
         self.min_regime_confidence_for_entry = float(quality_cfg.get('min_regime_confidence', 0.40))
         self.max_trend_extension_atr = float(quality_cfg.get('max_trend_extension_atr', 1.0))
         self.range_midzone_block = bool(quality_cfg.get('block_midzone_range_entries', True))
+
+        # Fase 5 — continuous weighted risk score.  Disabled by default: when
+        # enabled, the binary entry gates (min_regime_confidence / quality gate /
+        # risk_multiplier<=0) become non-fatal — instead of rejecting, the
+        # signal's effective risk_multiplier is scaled by a score->size mapping
+        # (a score that maps to 0x is effectively still "no trade", preserving
+        # the spirit of the old hard floors).  The old gate code is kept behind
+        # the flag for at least one release (see docs/risk-scoring.md and
+        # scripts/risk_scoring.py).
+        rs_cfg = config.get('risk_scoring', {}) or {}
+        self.risk_scoring_enabled = bool(rs_cfg.get('enabled', False))
+        self.risk_scoring_config = dict(rs_cfg)
 
         time_exit_cfg = config.get('time_exit', {})
         self.time_exit_enabled = bool(time_exit_cfg.get('enabled', True))
@@ -1375,36 +1393,64 @@ class MultiIndicatorConfluence(TradingStrategy):
             quality_score, quality_details = self._evaluate_trade_quality(signal, current_price, indicators, regime_confidence)
             indicators.update({f'quality_{k}': float(v) for k, v in quality_details.items() if isinstance(v, (int, float))})
             signal = self._enrich_signal(signal, regime_scores, regime_confidence, quality_score)
-            if regime_confidence < self.min_regime_confidence_for_entry:
-                self._record_rejection('low_regime_confidence')
-                return self._make_hold(
-                    f'{regime} signal filtered by low regime confidence ({regime_confidence:.2f})',
-                    indicators,
-                    atr,
-                    regime,
-                    regime_metrics,
-                    getattr(signal, 'active_strategy', 'low_regime_confidence'),
-                )
-            if self.trade_quality_enabled and quality_score < self.min_trade_quality_score:
-                self._record_rejection('quality_gate')
-                return self._make_hold(
-                    f'{regime} signal filtered by quality gate ({quality_score:.2f})',
-                    indicators,
-                    atr,
-                    regime,
-                    regime_metrics,
-                    getattr(signal, 'active_strategy', 'quality_filter'),
-                )
-            if signal.risk_multiplier <= 0.0:
-                self._record_rejection('risk_allocation_zero')
-                return self._make_hold(
-                    f'{regime} signal filtered because dynamic risk allocation is zero',
-                    indicators,
-                    atr,
-                    regime,
-                    regime_metrics,
-                    getattr(signal, 'active_strategy', 'risk_filter'),
-                )
+            if not self.risk_scoring_enabled:
+                # --- Legacy binary gates (kept behind risk_scoring.enabled for
+                #     at least one release; default path, byte-for-byte unchanged) ---
+                if regime_confidence < self.min_regime_confidence_for_entry:
+                    self._record_rejection('low_regime_confidence')
+                    return self._make_hold(
+                        f'{regime} signal filtered by low regime confidence ({regime_confidence:.2f})',
+                        indicators,
+                        atr,
+                        regime,
+                        regime_metrics,
+                        getattr(signal, 'active_strategy', 'low_regime_confidence'),
+                    )
+                if self.trade_quality_enabled and quality_score < self.min_trade_quality_score:
+                    self._record_rejection('quality_gate')
+                    return self._make_hold(
+                        f'{regime} signal filtered by quality gate ({quality_score:.2f})',
+                        indicators,
+                        atr,
+                        regime,
+                        regime_metrics,
+                        getattr(signal, 'active_strategy', 'quality_filter'),
+                    )
+                if signal.risk_multiplier <= 0.0:
+                    self._record_rejection('risk_allocation_zero')
+                    return self._make_hold(
+                        f'{regime} signal filtered because dynamic risk allocation is zero',
+                        indicators,
+                        atr,
+                        regime,
+                        regime_metrics,
+                        getattr(signal, 'active_strategy', 'risk_filter'),
+                    )
+            else:
+                # --- Fase 5 continuous risk score: the binary gates above become
+                #     non-fatal — scale risk_multiplier by the score->size mapping
+                #     instead of rejecting.  A size multiplier of 0 (score <= the
+                #     curve's intercept break, by default 0.25) is effectively
+                #     still "no trade", preserving the old hard floors at the low
+                #     end.  chop / unclear regimes still hard-block (risk_multiplier
+                #     was set to 0 by _resolve_risk_multiplier).
+                rs_record = build_risk_score_record(signal, indicators, self.risk_scoring_config)
+                signal.risk_score = float(rs_record['score'])
+                signal.risk_score_components = dict(rs_record['components'])
+                indicators['risk_score'] = signal.risk_score
+                indicators.update({f'risk_score_{k}': float(v) for k, v in rs_record['components'].items()})
+                size_mult = float(rs_record['size_multiplier'])
+                signal.risk_multiplier = signal.risk_multiplier * size_mult
+                if signal.risk_multiplier <= 0.0:
+                    self._record_rejection('risk_score_zero')
+                    return self._make_hold(
+                        f'{regime} signal filtered: risk score {signal.risk_score:.2f} maps to 0x size',
+                        indicators,
+                        atr,
+                        regime,
+                        regime_metrics,
+                        getattr(signal, 'active_strategy', 'risk_score_filter'),
+                    )
             if not self._entry_spacing_allows(regime):
                 self._record_rejection('trade_spacing')
                 return self._make_hold(

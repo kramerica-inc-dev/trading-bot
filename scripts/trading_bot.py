@@ -2030,6 +2030,11 @@ class TradingBot:
         rm_cfg = self.config.get("regime_multipliers")
         if rm_cfg is not None and "regime_multipliers" not in cfg:
             cfg["regime_multipliers"] = rm_cfg
+        # Fase 5: surface the top-level risk_scoring section to the strategy.
+        # No-op for behavior unless risk_scoring.enabled=true.
+        rs_cfg = self.config.get("risk_scoring")
+        if rs_cfg is not None and "risk_scoring" not in cfg:
+            cfg["risk_scoring"] = rs_cfg
         selector_cfg = dict(self.parameter_selector_cfg)
         profile_path = selector_cfg.get("live_profile_path")
         if selector_cfg.get("enabled") and profile_path:

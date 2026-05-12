@@ -402,6 +402,11 @@ class BacktestTrade:
     indicators: Dict[str, float] = field(default_factory=dict)
     regime: str = 'unknown'
     bars_held: int = 0
+    # Fase 5 — populated only when the strategy ran with risk_scoring.enabled.
+    # The scalar continuous risk score plus a {component: normalized_value} dict
+    # so post-hoc analysis can ask whether high-score trades fared better.
+    risk_score: Optional[float] = None
+    risk_score_components: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -916,6 +921,9 @@ class Backtester:
                                     'atr': atr,
                                     'peak_progress': 0.0,
                                     'regime': regime,
+                                    'risk_score': getattr(signal, 'risk_score', None),
+                                    'risk_score_components': dict(
+                                        getattr(signal, 'risk_score_components', {}) or {}),
                                 }
 
             # 3. Track equity
@@ -1027,6 +1035,8 @@ class Backtester:
             indicators=position.get('indicators', {}),
             regime=position.get('regime', 'unknown'),
             bars_held=position.get('bars_held', 0),
+            risk_score=position.get('risk_score'),
+            risk_score_components=dict(position.get('risk_score_components', {}) or {}),
         )
 
     def _calculate_pnl(self, position: dict, exit_price: float) -> float:
