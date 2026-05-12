@@ -35,3 +35,23 @@ Note: this concerns only the *single-asset "advanced" strategy*. The live produc
 - `backtest/diag_export.py` — re-runs the baseline and dumps the trades/bars CSVs the analysis used.
 - Per-axis throwaway analysis scripts `backtest/diag_{a,b,c,d,e,g,h}_*.py` and the per-axis write-ups in `docs/edge-diagnosis/`.
 - A template for "is there an edge?" triage: gross-vs-net per-trade expectancy, MFE/MAE capture ratios, IC of every signal component, random-entry bootstrap null, exposure/Brinson decomposition. Reuse this on any future strategy *before* tuning it.
+
+## Axis I — ablations & counterfactuals (consolidated) — added later
+
+Full detail: `docs/edge-diagnosis/I-ablations.md` (script `backtest/diag_i_ablations.py`, plots `backtest/results/diag_i_*.png`).
+
+| Variant | ROI % | Calmar | Max DD % | alpha vs BH | #trades |
+|---|---|---|---|---|---|
+| Baseline `advanced` | **−32.9** | −0.98 | 33.1 | −23.4 | 185 |
+| Strategy entries + passive-hold-to-end ("best possible exit") | −0.27 | — | — | +9.2 | ~185 |
+| Same 185 trades, zero cost | −1.1 | — | — | +8.4 | 185 |
+| Same 185 trades, half cost | −17.0 | — | — | −7.5 | 185 |
+| Best exit tweak (SL×10) | −30.6 | — | — | −21.1 | ~185 |
+| BH passive (benchmark) | −9.5 | −0.18 | 52.4 | 0.0 | 0 |
+| BH + fixed −10% stop | −10.1 | −0.26 | 39.0 | −0.6 | 1 |
+| BH + fixed −20% stop | −20.1 | −0.44 | 45.8 | −10.6 | 1 |
+| **BH + trailing −10% stop** | **+17.7** | **+1.76** | **10.1** | **+27.2** | 1 |
+| Random 185 long entries, hold-time-matched, same friction (×400) | mean −31.6 (5–95%: −36.2…−27.0) | — | — | −22.2 | 185 |
+| Sign-flipped (SHORT the same 185 entries) | −30.7 | — | — | −21.3 | 185 |
+
+Takeaways: (a) no exit retune moves the needle (≤ ~2 pp); no cost cut makes it profitable (zero-cost = break-even); flipping the signal to short just loses differently (−30.7%) — it's noise, not anti-signal. Only *not trading the signal at all* (passive hold) reaches break-even. (b) The strategy's −32.9% sits at the ~32nd percentile of a random-entry-same-turnover-same-friction distribution — statistically ≈ "open 185 random longs and pay the spread each time", slightly worse than the median random run, never better. (c) **A single trailing-stop rule on plain buy-and-hold returns +17.7% / Calmar +1.76 / 10% max-DD over the same period** — the dumbest possible systematic rule beats the "advanced" strategy by ~50 pp of return. That's the clincher for direction (3) — and a hint that a viable strategy here is low-frequency and trend-aware on a higher timeframe, not a 5m confluence fader.
