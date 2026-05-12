@@ -133,5 +133,12 @@
     "weights": {"confidence": 1.0, "quality_score": 1.0, "regime_confidence": 1.0, "mtf_alignment": 1.0},
     "size_slope": 2.0,
     "size_intercept": -0.5
+  },
+  "bear_check": {
+    "_comment": "Fase 6 (option A): deterministic devil's-advocate / bear-check. Disabled by default. When enabled, after the signal + risk_multiplier (+ risk_score if risk_scoring.enabled) are computed, it evaluates the opposing case (bearish for longs, bullish for shorts) and multiplies risk_multiplier by size_multiplier = clip(1 - score*max_penalty, min_floor, 1) (default 1 - score: score 0 -> 1.0x, 0.5 -> 0.5x, 1.0 -> 0x veto, recorded as bear_check_veto). Components (equal weights): mtf_opposition, recent_lower_highs (long) / recent_higher_lows (short), bb_extreme_against, loser_correlation (STUBBED -> 0; funding-extreme omitted, Fase 3 NO-GO). Composable with risk_scoring (both can be on). A/B test on holdout: NOT activated (see docs/bear-check.md). See scripts/bear_check.py.",
+    "enabled": false,
+    "weights": {"mtf_opposition": 1.0, "recent_lower_highs": 1.0, "bb_extreme_against": 1.0, "loser_correlation": 1.0},
+    "max_penalty": 1.0,
+    "min_floor": 0.0
   }
 }

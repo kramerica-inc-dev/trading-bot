@@ -1,0 +1,118 @@
+{
+  "generated_at": "2026-05-12T17:48:02.699651+00:00",
+  "phase": "Fase 6 \u2014 A/B test of the deterministic bear-check (devil's advocate)",
+  "data": {
+    "csv": "backtest/data/BTC-USDT_5m.csv",
+    "config": "config.json",
+    "n_bars": 12000,
+    "period": [
+      "2026-03-07 06:30:00+00:00",
+      "2026-04-17 22:25:00+00:00"
+    ],
+    "strategy_params": {
+      "rsi_period": 14,
+      "rsi_oversold": 30,
+      "rsi_overbought": 70,
+      "stop_loss_pct": 3.0,
+      "take_profit_pct": 2.0,
+      "macd_fast": 12,
+      "macd_slow": 26,
+      "macd_signal": 9,
+      "bb_period": 20,
+      "bb_std": 2.0,
+      "volume_period": 20,
+      "volume_threshold": 1.2,
+      "atr_period": 14,
+      "stop_loss_atr_mult": 2.0,
+      "take_profit_atr_mult": 3.0,
+      "min_confidence": 0.45,
+      "stop_loss_floor_pct": 1.0,
+      "take_profit_floor_pct": 1.5,
+      "min_votes": 3
+    }
+  },
+  "sizing": {
+    "risk_per_trade_pct": 1.0,
+    "leverage": 1.0,
+    "max_position_notional_pct": 100.0
+  },
+  "arm_a_off": {
+    "trades": 15,
+    "avg_trade_size": 137.45333333333335,
+    "sharpe_bars": -12.055606835797422,
+    "sharpe_trades": -17.406027292128034,
+    "calmar": -6.995773798349253,
+    "max_dd_pct": 4.321712950740166,
+    "alpha_vs_bh_pct": -18.049831871376888,
+    "win_rate": 0.06666666666666667,
+    "total_return_pct": -4.026175095113862,
+    "cagr": -0.30233726224774693
+  },
+  "arm_b_on": {
+    "trades": 15,
+    "avg_trade_size": 136.35333333333332,
+    "sharpe_bars": -11.946104711228836,
+    "sharpe_trades": -17.406027292128034,
+    "calmar": -7.007947135463725,
+    "max_dd_pct": 4.2340621192469365,
+    "alpha_vs_bh_pct": -17.96195317723479,
+    "win_rate": 0.06666666666666667,
+    "total_return_pct": -3.9382964009717614,
+    "cagr": -0.2967208349995204
+  },
+  "deltas": {
+    "trades": 0,
+    "calmar": -0.012173337114472105,
+    "max_dd_pp": -0.08765083149322983,
+    "win_rate_pp": 0.0,
+    "alpha_vs_bh_pp": 0.08787869414209837
+  },
+  "bear_check_score_vs_outcome": {
+    "n_trades_with_bear_check": 15,
+    "score_mean": 0.1055165434860395,
+    "score_std": 0.1026217285441104,
+    "score_min": 0.0,
+    "score_max": 0.25,
+    "pearson_score_vs_pnl": 0.19403421652557976,
+    "spearman_score_vs_pnl": 0.3961876177542016,
+    "pearson_score_vs_pnl_pct": 0.05047087291994374,
+    "spearman_score_vs_pnl_pct": 0.31287713738532746,
+    "terciles": [
+      {
+        "tercile": "low",
+        "n": 5,
+        "score_min": 0.0,
+        "score_max": 0.0,
+        "score_mean": 0.0,
+        "win_rate": 0.0,
+        "mean_pnl": -39.39396398251438,
+        "total_pnl": -196.9698199125719
+      },
+      {
+        "tercile": "mid",
+        "n": 5,
+        "score_min": 0.0,
+        "score_max": 0.12914188615121724,
+        "score_mean": 0.08054090132656351,
+        "win_rate": 0.2,
+        "mean_pnl": -9.620296504838782,
+        "total_pnl": -48.10148252419391
+      },
+      {
+        "tercile": "high",
+        "n": 5,
+        "score_min": 0.19299717843939512,
+        "score_max": 0.25,
+        "score_mean": 0.23600872913155496,
+        "win_rate": 0.0,
+        "mean_pnl": -29.751667532082063,
+        "total_pnl": -148.75833766041032
+      }
+    ],
+    "interpretation": "negative correlation => high-bear-check trades fared worse (bear-check 'works'); near-zero / positive => no relationship => bear-check does not work"
+  },
+  "verdict": {
+    "activate": false,
+    "reason": "bear-check made Calmar worse on the holdout => DO NOT ACTIVATE"
+  }
+}

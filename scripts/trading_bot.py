@@ -2035,6 +2035,11 @@ class TradingBot:
         rs_cfg = self.config.get("risk_scoring")
         if rs_cfg is not None and "risk_scoring" not in cfg:
             cfg["risk_scoring"] = rs_cfg
+        # Fase 6: surface the top-level bear_check section to the strategy.
+        # No-op for behavior unless bear_check.enabled=true.
+        bc_cfg = self.config.get("bear_check")
+        if bc_cfg is not None and "bear_check" not in cfg:
+            cfg["bear_check"] = bc_cfg
         selector_cfg = dict(self.parameter_selector_cfg)
         profile_path = selector_cfg.get("live_profile_path")
         if selector_cfg.get("enabled") and profile_path:

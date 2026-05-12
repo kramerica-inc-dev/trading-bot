@@ -10,6 +10,7 @@ import pandas as pd
 from trading_strategy import Signal, TradingStrategy
 
 from risk_scoring import build_risk_score_record
+from bear_check import build_bear_check_record
 
 
 @dataclass
@@ -30,6 +31,9 @@ class AdvancedSignal(Signal):
     # risk score plus a {component: normalized_value} dict for post-hoc analysis.
     risk_score: Optional[float] = None
     risk_score_components: Dict[str, float] = field(default_factory=dict)
+    # Fase 6 — populated only when bear_check.enabled; the devil's-advocate
+    # counter-argument score in [0, 1] plus a {component: normalized_value} dict.
+    bear_check: Dict[str, float] = field(default_factory=dict)
 
 
 class MultiIndicatorConfluence(TradingStrategy):
@@ -194,6 +198,18 @@ class MultiIndicatorConfluence(TradingStrategy):
         rs_cfg = config.get('risk_scoring', {}) or {}
         self.risk_scoring_enabled = bool(rs_cfg.get('enabled', False))
         self.risk_scoring_config = dict(rs_cfg)
+
+        # Fase 6 — deterministic "devil's advocate" / bear-check.  Disabled by
+        # default: when enabled, after the signal + risk_multiplier (+ risk_score
+        # if risk_scoring.enabled) are computed, the bear-check evaluates the
+        # opposing case and multiplies risk_multiplier by its size_multiplier; a
+        # size_multiplier of 0 (maximal counter-argument, by default) records a
+        # `bear_check_veto` rejection like the other soft gates.  Composable with
+        # Fase 5 (both can be on; bear-check applies after risk-score sizing).
+        # See scripts/bear_check.py and docs/bear-check.md.
+        bc_cfg = config.get('bear_check', {}) or {}
+        self.bear_check_enabled = bool(bc_cfg.get('enabled', False))
+        self.bear_check_config = dict(bc_cfg)
 
         time_exit_cfg = config.get('time_exit', {})
         self.time_exit_enabled = bool(time_exit_cfg.get('enabled', True))
@@ -1450,6 +1466,37 @@ class MultiIndicatorConfluence(TradingStrategy):
                         regime,
                         regime_metrics,
                         getattr(signal, 'active_strategy', 'risk_score_filter'),
+                    )
+            if self.bear_check_enabled:
+                # --- Fase 6 devil's-advocate: evaluate the opposing case and
+                #     scale risk_multiplier by the counter-argument size
+                #     multiplier (after Fase 5 risk-score sizing, if active).
+                #     Not a hard block, but a maximal counter-argument can drive
+                #     the size to 0 — recorded as `bear_check_veto`, like the
+                #     other soft gates.  No look-ahead: close_prices are closed
+                #     bars only (analyze()'s look-ahead contract).
+                bc_record = build_bear_check_record(
+                    signal, indicators,
+                    {'recent_closes': close_prices, 'atr': atr},
+                    self.bear_check_config,
+                )
+                signal.bear_check = {
+                    'score': float(bc_record['score']),
+                    'components': dict(bc_record['components']),
+                }
+                indicators['bear_check_score'] = float(bc_record['score'])
+                indicators.update({f'bear_check_{k}': float(v) for k, v in bc_record['components'].items()})
+                bc_size_mult = float(bc_record['size_multiplier'])
+                signal.risk_multiplier = signal.risk_multiplier * bc_size_mult
+                if signal.risk_multiplier <= 0.0:
+                    self._record_rejection('bear_check_veto')
+                    return self._make_hold(
+                        f"{regime} signal filtered: bear-check {bc_record['score']:.2f} maps to 0x size",
+                        indicators,
+                        atr,
+                        regime,
+                        regime_metrics,
+                        getattr(signal, 'active_strategy', 'bear_check_filter'),
                     )
             if not self._entry_spacing_allows(regime):
                 self._record_rejection('trade_spacing')

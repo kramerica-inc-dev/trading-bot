@@ -407,6 +407,10 @@ class BacktestTrade:
     # so post-hoc analysis can ask whether high-score trades fared better.
     risk_score: Optional[float] = None
     risk_score_components: Dict[str, float] = field(default_factory=dict)
+    # Fase 6 — populated only when the strategy ran with bear_check.enabled.
+    # {"score": float, "components": {component: normalized_value}} so post-hoc
+    # analysis can ask whether high-bear-check trades fared worse.
+    bear_check: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -924,6 +928,8 @@ class Backtester:
                                     'risk_score': getattr(signal, 'risk_score', None),
                                     'risk_score_components': dict(
                                         getattr(signal, 'risk_score_components', {}) or {}),
+                                    'bear_check': dict(
+                                        getattr(signal, 'bear_check', {}) or {}),
                                 }
 
             # 3. Track equity
@@ -1037,6 +1043,7 @@ class Backtester:
             bars_held=position.get('bars_held', 0),
             risk_score=position.get('risk_score'),
             risk_score_components=dict(position.get('risk_score_components', {}) or {}),
+            bear_check=dict(position.get('bear_check', {}) or {}),
         )
 
     def _calculate_pnl(self, position: dict, exit_price: float) -> float:
