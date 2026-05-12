@@ -54,3 +54,6 @@ archive/
 # Trained model artifacts (data-derived, reproducible from code)
 scripts/models/
 *.joblib
+
+# Edge-diagnosis: large regenerable per-bar export (regen via backtest/diag_export.py)
+backtest/results/diag_bars.csv
