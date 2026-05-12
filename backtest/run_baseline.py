@@ -209,6 +209,17 @@ def main():
     output['data_file'] = os.path.basename(csv_path)
     output['data_rows'] = len(df)
     output['timestamp'] = datetime.now().isoformat()
+    # Equity curve (strategy + BTC buy-and-hold benchmark + per-bar regime)
+    # for the dashboard.  Downsample so the JSON stays small but keep the last
+    # point so the curve ends at the true final value.
+    series = result.equity_series()
+    if len(series) > 1500:
+        step = len(series) // 1500 + 1
+        sampled = series[::step]
+        if sampled[-1] is not series[-1]:
+            sampled.append(series[-1])
+        series = sampled
+    output['equity_series'] = series
 
     with open(output_path, 'w') as f:
         json.dump(output, f, indent=2, default=str)

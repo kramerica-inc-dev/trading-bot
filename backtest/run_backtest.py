@@ -95,14 +95,21 @@ def plot_results(result, output_path: str = None):
     equity = result.equity_curve
 
     # Equity curve
-    ax1.plot(timestamps, equity, 'b-', linewidth=1)
+    ax1.plot(timestamps, equity, 'b-', linewidth=1, label='Strategy')
+    # BTC buy-and-hold benchmark over the same period
+    bench_curve = result.benchmark.get('equity_curve', []) if hasattr(result, 'benchmark') else []
+    if bench_curve and len(bench_curve) == len(timestamps):
+        ax1.plot(timestamps, bench_curve, color='orange', linewidth=1,
+                 alpha=0.8, label='BTC Buy & Hold')
     ax1.axhline(y=result.config.initial_balance, color='gray', linestyle='--',
                 alpha=0.5, label='Initial Balance')
     ax1.set_ylabel('Balance ($)')
+    bench_ret = result.benchmark.get('total_return_pct', 0.0) if hasattr(result, 'benchmark') else 0.0
     ax1.set_title(f'Backtest: {result.total_trades} trades, '
                   f'ROI {result.total_roi:+.1f}%, '
-                  f'Win Rate {result.win_rate:.0%}, '
-                  f'Sharpe {result.sharpe_ratio:.2f}')
+                  f'B&H {bench_ret:+.1f}%, '
+                  f'alpha {getattr(result, "alpha_vs_benchmark_pct", 0.0):+.1f}%, '
+                  f'Calmar {getattr(result, "calmar_ratio", 0.0):.2f}')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 

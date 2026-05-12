@@ -290,8 +290,17 @@ class MultiIndicatorConfluence(TradingStrategy):
         return len(self._diagnostics_buffer)
 
     # ------------------------------ indicators ------------------------------
+    #
+    # Look-ahead discipline (see docs/lookahead-audit.md):
+    # All indicator helpers below are pure functions of the price/candle list
+    # passed in. The backtester feeds analyze() a window of *closed* bars only
+    # (candles[i-lookback:i], excluding bar i) plus current_price = close[i],
+    # so candles[-1] inside these helpers is the last closed bar t-1. None of
+    # these functions can see future bars. Comments at each site state which
+    # bars of the supplied list enter the computation.
 
     def calculate_rsi(self, prices: List[float]) -> float:
+        # Wilder RSI over the full supplied closed-bar series [.. : t-1]; no future data.
         if len(prices) < self.rsi_period + 1:
             return 50.0
         deltas = np.diff(prices)
@@ -310,6 +319,7 @@ class MultiIndicatorConfluence(TradingStrategy):
         return 100 - (100 / (1 + rs))
 
     def calculate_macd(self, prices: List[float]) -> Tuple[float, float, float]:
+        # EMA(fast)-EMA(slow) and its signal EMA over closed bars [.. : t-1]; no future data.
         if len(prices) < self.macd_slow + self.macd_signal:
             return 0.0, 0.0, 0.0
         prices_array = np.array(prices, dtype=float)
@@ -323,6 +333,7 @@ class MultiIndicatorConfluence(TradingStrategy):
         return macd_line, signal_line, histogram
 
     def calculate_bollinger_bands(self, prices: List[float]) -> Tuple[float, float, float]:
+        # SMA +/- k*std over the last bb_period closed bars [t-bb_period : t-1]; no future data.
         if len(prices) < self.bb_period:
             price = prices[-1] if prices else 0.0
             return price, price, price
@@ -332,6 +343,7 @@ class MultiIndicatorConfluence(TradingStrategy):
         return middle + (self.bb_std * std), middle, middle - (self.bb_std * std)
 
     def calculate_atr(self, candles: List) -> float:
+        # Mean true range over the last atr_period closed bars [t-atr_period : t-1]; no future data.
         if len(candles) < self.atr_period + 1:
             return 0.0
         true_ranges = []
@@ -345,6 +357,9 @@ class MultiIndicatorConfluence(TradingStrategy):
         return float(np.mean(true_ranges)) if true_ranges else 0.0
 
     def calculate_volume_signal(self, candles: List) -> float:
+        # Ratio of last closed bar's volume to mean over [t-volume_period : t-1].
+        # "current" here means the last *closed* bar t-1 (analyze receives closed bars only);
+        # the live in-progress bar is never in this list. No future data.
         if len(candles) < self.volume_period:
             return 0.0
         volumes = np.array([float(candle[5]) for candle in candles[-self.volume_period :]], dtype=float)
@@ -378,6 +393,7 @@ class MultiIndicatorConfluence(TradingStrategy):
         return result
 
     def _efficiency_ratio(self, prices: np.ndarray, period: int) -> float:
+        # Kaufman efficiency ratio over the last period+1 closed bars [t-period : t-1]; no future data.
         if len(prices) < period + 1:
             return 0.0
         window = prices[-(period + 1) :]
@@ -388,6 +404,7 @@ class MultiIndicatorConfluence(TradingStrategy):
         return float(direction / volatility)
 
     def _slope_pct(self, values: np.ndarray, period: int) -> float:
+        # Percentage change between values[t-period] and values[t-1]; both are closed-bar values. No future data.
         if len(values) < period + 1:
             return 0.0
         start = float(values[-(period + 1)])
@@ -457,6 +474,10 @@ class MultiIndicatorConfluence(TradingStrategy):
         return aggregated
 
     def _trend_state_from_candles(self, candles: List, profile: Dict) -> Tuple[str, Dict[str, float]]:
+        # Regime state for one timeframe from EMAs / efficiency / slope over the supplied
+        # closed-bar series. For HTF timeframes the candles are pre-filtered to closed bars
+        # by HTFCandleSync / set_htf_candles (backtest) or by resampling base closed bars;
+        # only the last closed bar of that TF is the latest one used. No future data.
         if len(candles) < max(profile.get('anchor_ema', 13), profile.get('window', 10)) + max(profile.get('slope_period', 3), 2):
             return 'neutral', {'ready': 0.0}
         closes = np.array([float(c[4]) for c in candles], dtype=float)
@@ -537,6 +558,10 @@ class MultiIndicatorConfluence(TradingStrategy):
     # ------------------------------ regime logic ------------------------------
 
     def detect_market_regime(self, candles: List) -> Tuple[str, Dict[str, float]]:
+        # Primary-TF regime detection. All inputs (EMAs, trend/anchor bias, anchor slope,
+        # efficiency ratio, ATR%, persistence) are computed over the supplied closed-bar
+        # window [.. : t-1]; candles[-1] is the last closed bar. No future data, no current
+        # in-progress bar.
         prices = np.array([float(c[4]) for c in candles], dtype=float)
         if len(prices) < max(self.regime_anchor_ema, self.regime_window) + self.anchor_slope_period:
             return "range", {"regime_code": self._REGIME_CODE['range']}
@@ -748,6 +773,12 @@ class MultiIndicatorConfluence(TradingStrategy):
         return ok, checks
 
     def _trend_long_signal(self, current_price: float, candles: List, prices: List[float], indicators: Dict[str, float], atr: float, regime: str, regime_metrics: Dict[str, float], mtf_context: Dict[str, Dict]) -> AdvancedSignal:
+        # Entry decision on closed bars only: EMAs/RSI/MACD/ATR/volume come from the
+        # closed-bar window (candles[-1] == bar t-1), recent_high uses prices[-breakout_lookback:]
+        # (closed bars), close_strength uses candles[-1] (closed bar t-1). current_price is the
+        # live/last price (bar t close in backtest); the entry then executes at that same
+        # price/close. This is the standard "act on the latest price using closed-bar signals"
+        # convention — no future bar is used. See docs/lookahead-audit.md (boundary note).
         ema_fast = regime_metrics.get('ema_fast', current_price)
         ema_slow = regime_metrics.get('ema_slow', current_price)
         ema_anchor = regime_metrics.get('ema_anchor', current_price)
@@ -807,6 +838,8 @@ class MultiIndicatorConfluence(TradingStrategy):
         return self._make_hold(why, indicators, atr, regime, regime_metrics, 'trend_long')
 
     def _trend_short_signal(self, current_price: float, candles: List, prices: List[float], indicators: Dict[str, float], atr: float, regime: str, regime_metrics: Dict[str, float], mtf_context: Dict[str, Dict]) -> AdvancedSignal:
+        # Mirror of _trend_long_signal: all signal inputs from closed bars (candles[-1] == bar t-1);
+        # current_price is the live/last price the order also executes at. No future bar. See lookahead-audit.md.
         ema_fast = regime_metrics.get('ema_fast', current_price)
         ema_slow = regime_metrics.get('ema_slow', current_price)
         ema_anchor = regime_metrics.get('ema_anchor', current_price)
@@ -866,6 +899,10 @@ class MultiIndicatorConfluence(TradingStrategy):
         return self._make_hold(why, indicators, atr, regime, regime_metrics, 'trend_short')
 
     def _range_signal(self, current_price: float, candles: List, prices: List[float], indicators: Dict[str, float], atr: float, regime: str, regime_metrics: Dict[str, float], mtf_context: Dict[str, Dict]) -> AdvancedSignal:
+        # Bollinger bands from closed-bar prices [.. : t-1]; bb_pos uses current_price (live/last
+        # price = bar t close in backtest, also the execution price); reversal_bar compares
+        # current_price to candles[-2][4] (close of bar t-2 — note candles[-1] is bar t-1, see
+        # boundary note in lookahead-audit.md). No future bar is used.
         trend_ctx = mtf_context.get(self.regime_trend_timeframe, {})
         anchor_ctx = mtf_context.get(self.regime_anchor_timeframe, {})
         trend_state = trend_ctx.get('state', 'neutral')
@@ -941,6 +978,8 @@ class MultiIndicatorConfluence(TradingStrategy):
         return max(0.0, min(float(value), 1.0))
 
     def _compute_regime_scores(self, regime_metrics: Dict[str, float], mtf_context: Dict[str, Dict]) -> Tuple[Dict[str, float], float]:
+        # Derived purely from regime_metrics (built in detect_market_regime over closed bars)
+        # and mtf_context (closed-bar HTF states). No raw candle access, no future data.
         trend_bias = float(regime_metrics.get('trend_bias', 0.0))
         anchor_slope = float(regime_metrics.get('anchor_slope', 0.0))
         efficiency = float(regime_metrics.get('efficiency_ratio', 0.0))
@@ -1010,6 +1049,9 @@ class MultiIndicatorConfluence(TradingStrategy):
         return max(self.min_risk_multiplier, min(multiplier, self.max_risk_multiplier))
 
     def _evaluate_trade_quality(self, signal: AdvancedSignal, current_price: float, indicators: Dict[str, float], regime_confidence: float) -> Tuple[float, Dict[str, float]]:
+        # Quality components: signal confidence, regime confidence, RR (from stop/take vs
+        # current_price = execution price), volume score and atr_pct (closed-bar derived),
+        # bb_pos and trend_extension (vs ema_fast, closed-bar derived). No future data.
         stop = signal.stop_loss
         take = signal.take_profit
         rr_ratio = 0.0
@@ -1225,6 +1267,13 @@ class MultiIndicatorConfluence(TradingStrategy):
     # ------------------------------ public API ------------------------------
 
     def analyze(self, candles: List, current_price: float) -> AdvancedSignal:
+        # LOOK-AHEAD CONTRACT (see docs/lookahead-audit.md):
+        # `candles` must contain only *closed* bars; candles[-1] is the last closed bar (t-1).
+        # `current_price` is the live/last price (in the backtester: close of bar t, the bar
+        # the order also executes at). Every indicator/feature below is computed from `candles`
+        # (closed bars) — none of them ever sees a future bar. The backtester enforces this by
+        # passing window = candles[i-lookback:i] (exclusive of bar i). HTF lookahead is handled
+        # separately by HTFCandleSync / set_htf_candles.
         self._bar_index += 1
         close_prices = [float(candle[4]) for candle in candles]
         min_history = max(

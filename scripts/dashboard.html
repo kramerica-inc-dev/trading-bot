@@ -163,6 +163,7 @@
   <button class="tab" data-tab="risk">Risk &amp; Config</button>
   <button class="tab" data-tab="logs">Logs</button>
   <button class="tab" data-tab="compare">Compare</button>
+  <button class="tab" data-tab="backtest">Backtest</button>
 </div>
 
 <div class="content">
@@ -346,6 +347,28 @@
       <svg id="pe-compare-chart" viewBox="0 0 1200 360" preserveAspectRatio="none"
            style="width:100%;height:360px;margin-top:8px;background:var(--surface-alt);border-radius:4px"></svg>
       <div id="pe-compare-legend" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:12px;font-family:var(--font);font-size:11px"></div>
+    </div>
+  </div>
+
+  <!-- ═══ BACKTEST ═══ -->
+  <div class="tab-content" id="tab-backtest">
+    <div class="card">
+      <div class="label">Latest baseline backtest
+        <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — strategy vs. BTC buy-and-hold (run_baseline.py)</span>
+      </div>
+      <div id="bt-summary" style="margin-top:8px;font-family:var(--font);font-size:12px;color:var(--text-muted)">Loading…</div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <div class="label">Equity curve — strategy vs. BTC buy-and-hold (normalized to start = 100)</div>
+      <svg id="bt-chart" viewBox="0 0 1200 360" preserveAspectRatio="none"
+           style="width:100%;height:360px;margin-top:8px;background:var(--surface-alt);border-radius:4px"></svg>
+      <div id="bt-legend" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:14px;font-family:var(--font);font-size:11px"></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <div class="label">Performance by market regime
+        <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — bull / bear / sideways classified by BTC trailing 30d return (±5%), no lookahead</span>
+      </div>
+      <div id="bt-conditional" style="margin-top:8px;overflow-x:auto"></div>
     </div>
   </div>
 
@@ -1030,11 +1053,114 @@ function renderCompare(instances, curves) {
   }).join('');
 }
 
+// ═══ Backtest (Fase 1: benchmark + risk-adjusted metrics) ═══
+async function fetchBacktest() {
+  let d;
+  try {
+    const r = await fetch('/api/backtest/baseline');
+    if (!r.ok) { renderBacktestEmpty('No baseline backtest available — run `python -m backtest.run_baseline`.'); return; }
+    d = await r.json();
+  } catch (e) { renderBacktestEmpty('Failed to load backtest results.'); return; }
+  if (!d || d.error) { renderBacktestEmpty(d && d.error ? d.error : 'No backtest data.'); return; }
+  renderBacktest(d);
+}
+
+function renderBacktestEmpty(msg) {
+  const s = document.getElementById('bt-summary');
+  if (s) s.textContent = msg;
+  const c = document.getElementById('bt-chart');
+  if (c) c.innerHTML = '<text x="600" y="180" fill="#64748b" text-anchor="middle" font-family="monospace" font-size="12">' + msg + '</text>';
+  const l = document.getElementById('bt-legend'); if (l) l.innerHTML = '';
+  const cm = document.getElementById('bt-conditional'); if (cm) cm.innerHTML = '';
+}
+
+function renderBacktest(d) {
+  const b = d.benchmark || {};
+  const cm = d.conditional_metrics || {};
+  const rc = d.regime_bar_counts || {};
+  // Summary metric rows
+  const rows = [
+    ['Period', (d.period_days ? d.period_days.toFixed(1) + ' days' : '—') + (d.data_rows ? ' · ' + d.data_rows + ' candles' : '') + (d.timestamp ? ' · run ' + fmtTime(d.timestamp) : '')],
+    ['Trades', String(d.total_trades ?? '—')],
+    ['Strategy return', fmtSignedPct(d.total_roi)],
+    ['Buy & Hold return', fmtSignedPct(b.total_return_pct)],
+    ['Alpha vs B&H', fmtSignedPct(d.alpha_vs_benchmark_pct) + (typeof d.alpha_sharpe === 'number' ? ' · Sharpe ' + (d.alpha_sharpe>=0?'+':'') + d.alpha_sharpe.toFixed(2) + ' (per-bar)' : '')],
+    ['Strategy max DD', fmt(d.max_drawdown_pct) + '%'],
+    ['B&H max DD', fmt(b.max_drawdown_pct) + '%'],
+    ['Strategy Calmar', fmt(d.calmar_ratio)],
+    ['B&H Calmar', fmt(b.calmar_ratio)],
+    ['Strategy Sharpe', fmt(d.sharpe_ratio) + ' (per-trade) · ' + fmt(d.sharpe_ratio_bars) + ' (per-bar)'],
+    ['DD duration', (d.dd_duration_bars ?? 0) + ' bars (' + fmt(d.dd_duration_days, 1) + 'd)'],
+    ['Time under water', fmt(d.time_under_water_pct, 1) + '%'],
+    ['Period regime mix', 'bull ' + (rc.bull||0) + ' / bear ' + (rc.bear||0) + ' / sideways ' + (rc.sideways||0) + ' bars'],
+  ];
+  document.getElementById('bt-summary').innerHTML =
+    rows.map(([k,v]) => configRow(k, v)).join('');
+
+  // Conditional metrics table — bear row matters most.
+  let ct = '<table style="width:100%;border-collapse:collapse;font-family:var(--font);font-size:12px">' +
+    '<thead><tr style="color:var(--text-dim);text-align:left">' +
+    '<th style="padding:6px 10px">Regime</th><th style="padding:6px 10px">Bars</th>' +
+    '<th style="padding:6px 10px">Return</th><th style="padding:6px 10px">Sharpe</th>' +
+    '<th style="padding:6px 10px">Max DD</th></tr></thead><tbody>';
+  for (const label of ['bull','bear','sideways']) {
+    const m = cm[label] || {};
+    const hi = label === 'bear' ? 'color:var(--text);font-weight:600' : 'color:var(--text-muted)';
+    ct += '<tr style="' + hi + '">' +
+      '<td style="padding:6px 10px">' + label + (label==='bear'?' &larr; protect here':'') + '</td>' +
+      '<td style="padding:6px 10px">' + (m.bars||0) + '</td>' +
+      '<td style="padding:6px 10px">' + fmtSignedPct(m.total_return_pct) + '</td>' +
+      '<td style="padding:6px 10px">' + (typeof m.sharpe==='number'?(m.sharpe>=0?'+':'')+m.sharpe.toFixed(2):'—') + '</td>' +
+      '<td style="padding:6px 10px">' + fmt(m.max_drawdown_pct) + '%</td></tr>';
+  }
+  ct += '</tbody></table>';
+  document.getElementById('bt-conditional').innerHTML = ct;
+
+  // Equity chart: strategy vs benchmark, normalized to start=100.
+  const svg = document.getElementById('bt-chart');
+  const legend = document.getElementById('bt-legend');
+  const series = d.equity_series || [];
+  if (!series.length) {
+    svg.innerHTML = '<text x="600" y="180" fill="#64748b" text-anchor="middle" font-family="monospace" font-size="12">No equity series in results.</text>';
+    legend.innerHTML = ''; return;
+  }
+  const eq0 = series[0].equity || 0;
+  const bn0 = series[0].benchmark || 0;
+  const lines = [
+    { name: 'Strategy', color: '#22d3ee', pts: series.map(p => ({ t: new Date(p.ts).getTime()/1000, v: eq0>0 ? (p.equity/eq0)*100 : null })) },
+    { name: 'BTC Buy & Hold', color: '#f59e0b', pts: series.map(p => ({ t: new Date(p.ts).getTime()/1000, v: (bn0>0 && p.benchmark!=null) ? (p.benchmark/bn0)*100 : null })) },
+  ].map(s => ({ ...s, pts: s.pts.filter(x => isFinite(x.t) && isFinite(x.v)) })).filter(s => s.pts.length);
+  if (!lines.length) { svg.innerHTML = ''; legend.innerHTML = ''; return; }
+  const W=1200,H=360,padL=44,padR=10,padT=10,padB=24;
+  let tMin=Infinity,tMax=-Infinity,yMin=Infinity,yMax=-Infinity;
+  for (const s of lines) for (const p of s.pts) {
+    if (p.t<tMin)tMin=p.t; if (p.t>tMax)tMax=p.t;
+    if (p.v<yMin)yMin=p.v; if (p.v>yMax)yMax=p.v;
+  }
+  if (tMax===tMin) tMax=tMin+1;
+  const yPad=Math.max(0.5,(yMax-yMin)*0.05); yMin-=yPad; yMax+=yPad;
+  const sx=t=>padL+((t-tMin)/(tMax-tMin))*(W-padL-padR);
+  const sy=v=>padT+(1-(v-yMin)/(yMax-yMin))*(H-padT-padB);
+  let grid='';
+  for (let i=0;i<=4;i++){const v=yMin+(yMax-yMin)*i/4;const y=sy(v);
+    grid+=`<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" stroke="#1e2a3a" stroke-width="1"/>`+
+          `<text x="${padL-6}" y="${y+3}" fill="#64748b" text-anchor="end" font-family="monospace" font-size="10">${v.toFixed(1)}</text>`;}
+  const base100=`<line x1="${padL}" y1="${sy(100)}" x2="${W-padR}" y2="${sy(100)}" stroke="#475569" stroke-dasharray="3,3" stroke-width="1"/>`;
+  const paths=lines.map(s=>{const dd=s.pts.map((p,i)=>(i===0?'M':'L')+sx(p.t).toFixed(1)+' '+sy(p.v).toFixed(1)).join(' ');
+    return `<path d="${dd}" stroke="${s.color}" stroke-width="1.5" fill="none"/>`;}).join('');
+  svg.innerHTML=grid+base100+paths;
+  legend.innerHTML=lines.map(s=>{const last=s.pts[s.pts.length-1].v.toFixed(2);
+    return `<span><span style="display:inline-block;width:10px;height:10px;background:${s.color};vertical-align:middle;margin-right:6px"></span>${s.name} <span style="color:var(--text-dim)">${last}</span></span>`;}).join('') +
+    `<span style="color:var(--text-dim)">bull/bear/sideways: ${rc.bull||0}/${rc.bear||0}/${rc.sideways||0} bars</span>`;
+}
+
 loadInstances();
 fetchPlanE();
 fetchCompare();
+fetchBacktest();
 setInterval(fetchPlanE, REFRESH_MS);
 setInterval(fetchCompare, REFRESH_MS * 3);
+setInterval(fetchBacktest, REFRESH_MS * 12);
 setInterval(loadInstances, REFRESH_MS * 6);
 setInterval(() => {
   const el = document.getElementById('pe-countdown');

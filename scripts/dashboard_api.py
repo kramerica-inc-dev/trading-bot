@@ -42,6 +42,15 @@ LEGACY_RUNNER_CACHE = STATE_DIR / "runner_cache"
 
 DEFAULT_INSTANCE = "plan-e-base"
 
+# Backtest results (Fase 1: benchmark + risk-adjusted metrics).  Prefer the
+# deployed location under BOT_DIR; fall back to the repo layout next to this
+# file so the dashboard works in a checkout too.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+BACKTEST_BASELINE_CANDIDATES = [
+    BOT_DIR / "backtest" / "results" / "baseline_latest.json",
+    _REPO_ROOT / "backtest" / "results" / "baseline_latest.json",
+]
+
 # DHCP watchdog event log (written by /usr/local/bin/dhcp-watchdog.sh on the
 # LXC). Read-only; fail-open if missing so deployments without the watchdog
 # still serve a meaningful payload.
@@ -897,6 +906,23 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         for t in trades if t.get("action") == "rebalance"
                     ]
                 self._send_json(out)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/backtest/baseline":
+            # Latest baseline backtest: strategy + BTC buy-and-hold benchmark,
+            # risk-adjusted metrics and conditional (bull/bear/sideways) stats.
+            try:
+                payload = None
+                for cand in BACKTEST_BASELINE_CANDIDATES:
+                    if cand.exists():
+                        payload = _read_json_file(cand, None)
+                        if payload is not None:
+                            break
+                if payload is None:
+                    self._send_json({"error": "no baseline backtest available"}, 404)
+                else:
+                    self._send_json(payload)
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 

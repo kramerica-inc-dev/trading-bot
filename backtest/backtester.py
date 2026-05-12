@@ -119,6 +119,273 @@ class HTFCandleSync:
         return candles[start:pos + 1]
 
 
+# ---------------------------------------------------------------------------
+# Benchmark + risk-adjusted metric helpers (Fase 1 — pure measurement)
+# ---------------------------------------------------------------------------
+
+# Default bull/bear classification: trailing 30-day return on the underlying
+# (BTC) price; > +5% -> bull, < -5% -> bear, else sideways.  Computed over a
+# rolling window that ends at bar t (uses only closes <= t — no lookahead).
+DEFAULT_REGIME_WINDOW_DAYS = 30.0
+DEFAULT_REGIME_THRESHOLD_PCT = 5.0
+
+
+def _infer_bar_seconds(timestamps: List) -> float:
+    """Infer the candle interval in seconds from a list of timestamps.
+
+    Uses the median of consecutive diffs so a few gaps don't skew it.
+    Falls back to 300s (5m) if it cannot be determined.
+    """
+    if not timestamps or len(timestamps) < 2:
+        return 300.0
+    diffs = []
+    for a, b in zip(timestamps[:-1], timestamps[1:]):
+        try:
+            d = (b - a).total_seconds()
+        except AttributeError:
+            d = float(b) - float(a)
+            # Heuristic: if values look like ms epochs, scale down.
+            if d > 1e6:
+                d = d / 1000.0
+        if d > 0:
+            diffs.append(d)
+    if not diffs:
+        return 300.0
+    return float(np.median(diffs))
+
+
+def _drawdown_stats(equity) -> Dict[str, float]:
+    """Compute max drawdown, drawdown duration and time-under-water.
+
+    Args:
+        equity: 1-D sequence of equity / price values.
+
+    Returns dict with:
+        max_drawdown_pct:        worst peak-to-trough decline, in percent
+        max_drawdown_abs:        worst peak-to-trough decline, absolute
+        max_dd_duration_bars:    longest underwater stretch, in bars
+        time_under_water_pct:    fraction of bars spent below a prior peak (%)
+    """
+    arr = np.asarray(equity, dtype=float)
+    n = len(arr)
+    if n == 0:
+        return {
+            'max_drawdown_pct': 0.0,
+            'max_drawdown_abs': 0.0,
+            'max_dd_duration_bars': 0,
+            'time_under_water_pct': 0.0,
+        }
+    peak = np.maximum.accumulate(arr)
+    # Guard against zero/negative peaks (shouldn't happen for equity/price).
+    safe_peak = np.where(peak == 0, 1.0, peak)
+    dd = (peak - arr) / safe_peak
+    max_dd_pct = float(np.max(dd)) * 100.0 if n > 0 else 0.0
+    max_dd_abs = float(np.max(peak - arr)) if n > 0 else 0.0
+
+    underwater = arr < peak
+    time_under_water_pct = float(np.mean(underwater)) * 100.0
+
+    # Longest consecutive underwater run.
+    longest = 0
+    cur = 0
+    for uw in underwater:
+        if uw:
+            cur += 1
+            longest = max(longest, cur)
+        else:
+            cur = 0
+    return {
+        'max_drawdown_pct': max_dd_pct,
+        'max_drawdown_abs': max_dd_abs,
+        'max_dd_duration_bars': int(longest),
+        'time_under_water_pct': time_under_water_pct,
+    }
+
+
+def _cagr(equity, span_days: float) -> float:
+    """Compound annual growth rate from an equity curve over span_days."""
+    arr = np.asarray(equity, dtype=float)
+    if len(arr) < 2 or arr[0] <= 0 or span_days <= 0:
+        return 0.0
+    years = span_days / 365.0
+    if years <= 0:
+        return 0.0
+    ratio = arr[-1] / arr[0]
+    if ratio <= 0:
+        return -1.0
+    return float(ratio ** (1.0 / years) - 1.0)
+
+
+def _annualized_sharpe(returns, periods_per_year: float) -> float:
+    """Annualized Sharpe of a per-period return series (risk-free = 0)."""
+    arr = np.asarray(returns, dtype=float)
+    if len(arr) < 2:
+        return 0.0
+    sd = np.std(arr)
+    if sd <= 0:
+        return 0.0
+    return float(np.mean(arr) / sd * np.sqrt(periods_per_year))
+
+
+def compute_benchmark(closes, timestamps, initial_balance: float = 1.0) -> Dict:
+    """BTC buy-and-hold benchmark over the same period as the strategy.
+
+    The benchmark equity at bar t reflects holding 1 unit bought at the first
+    close, valued at the close of bar t — i.e. it only ever uses closes <= t,
+    so there is no lookahead.
+
+    Args:
+        closes: sequence of close prices (the BTC-USDT candle series).
+        timestamps: matching list of timestamps (datetime).
+        initial_balance: scale the equity curve to this starting value.
+
+    Returns a dict with total_return_pct, the (scaled) equity_curve, CAGR and
+    drawdown stats.  For < 2 closes everything collapses to zero / flat.
+    """
+    closes = [float(c) for c in closes]
+    n = len(closes)
+    if n == 0:
+        return {
+            'total_return_pct': 0.0,
+            'equity_curve': [],
+            'cagr': 0.0,
+            'max_drawdown_pct': 0.0,
+            'max_drawdown_abs': 0.0,
+            'max_dd_duration_bars': 0,
+            'time_under_water_pct': 0.0,
+            'final_balance': initial_balance,
+        }
+    first = closes[0]
+    if first <= 0:
+        equity = [initial_balance] * n
+    else:
+        equity = [initial_balance * (c / first) for c in closes]
+
+    total_return_pct = (equity[-1] / equity[0] - 1.0) * 100.0 if equity[0] else 0.0
+
+    if timestamps and len(timestamps) >= 2:
+        try:
+            span_days = (timestamps[-1] - timestamps[0]).total_seconds() / 86400.0
+        except AttributeError:
+            span_days = (float(timestamps[-1]) - float(timestamps[0])) / 86400.0
+            if span_days > 1e6:
+                span_days = span_days / 1000.0
+    else:
+        span_days = 0.0
+    span_days = max(span_days, 0.0)
+
+    dd = _drawdown_stats(equity)
+    return {
+        'total_return_pct': total_return_pct,
+        'equity_curve': equity,
+        'cagr': _cagr(equity, span_days) if span_days > 0 else 0.0,
+        'max_drawdown_pct': dd['max_drawdown_pct'],
+        'max_drawdown_abs': dd['max_drawdown_abs'],
+        'max_dd_duration_bars': dd['max_dd_duration_bars'],
+        'time_under_water_pct': dd['time_under_water_pct'],
+        'final_balance': equity[-1],
+        'span_days': span_days,
+    }
+
+
+def classify_regimes(closes, timestamps,
+                     window_days: float = DEFAULT_REGIME_WINDOW_DAYS,
+                     threshold_pct: float = DEFAULT_REGIME_THRESHOLD_PCT) -> List[str]:
+    """Classify each bar as 'bull' / 'bear' / 'sideways' (no lookahead).
+
+    Rule: trailing return of the close over a rolling window of ~window_days.
+    For bar t we look back W bars where W is the number of bars in window_days
+    (inferred from the timestamp spacing).  If fewer than W bars of history are
+    available the partial window from bar 0..t is used.  The classification of
+    bar t therefore only ever uses closes <= t.
+
+    Returns a list of length len(closes); the very first bar is always
+    'sideways' (no trailing return defined).
+    """
+    closes = [float(c) for c in closes]
+    n = len(closes)
+    if n == 0:
+        return []
+    bar_sec = _infer_bar_seconds(list(timestamps) if timestamps is not None else [])
+    window_bars = max(int(round(window_days * 86400.0 / max(bar_sec, 1.0))), 1)
+    thr = threshold_pct / 100.0
+
+    regimes: List[str] = []
+    for t in range(n):
+        if t == 0:
+            regimes.append('sideways')
+            continue
+        ref_idx = max(0, t - window_bars)
+        ref = closes[ref_idx]
+        if ref <= 0:
+            regimes.append('sideways')
+            continue
+        ret = closes[t] / ref - 1.0
+        if ret > thr:
+            regimes.append('bull')
+        elif ret < -thr:
+            regimes.append('bear')
+        else:
+            regimes.append('sideways')
+    return regimes
+
+
+def conditional_metrics(equity_curve, timestamps, regimes,
+                        bar_seconds: Optional[float] = None) -> Dict[str, Dict]:
+    """Strategy performance split by bull / bear / sideways segments.
+
+    For each regime label we collect the per-bar equity returns of all bars
+    carrying that label, and report:
+        bars:          number of bars in this regime
+        total_return_pct: compounded return over those bars
+        sharpe:        annualized Sharpe of the per-bar returns
+        max_drawdown_pct: max drawdown of the equity *restricted* to those bars
+                          (chained returns; an approximation of "how bad it got
+                          while we were in this regime")
+    "bear" is the segment that matters most — it answers "do we protect capital
+    when BTC falls".
+    """
+    eq = np.asarray(equity_curve, dtype=float)
+    n = len(eq)
+    out: Dict[str, Dict] = {}
+    if n < 2 or not regimes or len(regimes) != n:
+        for r in ('bull', 'bear', 'sideways'):
+            out[r] = {'bars': 0, 'total_return_pct': 0.0, 'sharpe': 0.0,
+                      'max_drawdown_pct': 0.0}
+        return out
+
+    if bar_seconds is None:
+        bar_seconds = _infer_bar_seconds(list(timestamps) if timestamps is not None else [])
+    periods_per_year = 86400.0 * 365.0 / max(bar_seconds, 1.0)
+
+    # Per-bar simple returns; aligned to bar index i (return from i-1 to i),
+    # attributed to the regime label of bar i.
+    bar_ret = np.zeros(n)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        bar_ret[1:] = np.where(eq[:-1] != 0, eq[1:] / eq[:-1] - 1.0, 0.0)
+    bar_ret = np.nan_to_num(bar_ret)
+
+    for label in ('bull', 'bear', 'sideways'):
+        idx = [i for i in range(1, n) if regimes[i] == label]
+        if not idx:
+            out[label] = {'bars': 0, 'total_return_pct': 0.0, 'sharpe': 0.0,
+                          'max_drawdown_pct': 0.0}
+            continue
+        rets = bar_ret[idx]
+        # Compounded return over the regime bars.
+        comp = float(np.prod(1.0 + rets) - 1.0)
+        # Synthetic equity from chaining the regime-bar returns.
+        synth = np.concatenate([[1.0], np.cumprod(1.0 + rets)])
+        dd = _drawdown_stats(synth)
+        out[label] = {
+            'bars': len(idx),
+            'total_return_pct': comp * 100.0,
+            'sharpe': _annualized_sharpe(rets, periods_per_year),
+            'max_drawdown_pct': dd['max_drawdown_pct'],
+        }
+    return out
+
+
 @dataclass
 class BacktestTrade:
     """Record of a single completed trade"""
@@ -157,15 +424,24 @@ class BacktestResult:
     """Complete results from a backtest run"""
 
     def __init__(self, trades: List[BacktestTrade], equity_curve: List[float],
-                 timestamps: List[datetime], config: BacktestConfig):
+                 timestamps: List[datetime], config: BacktestConfig,
+                 closes: Optional[List[float]] = None):
         self.trades = trades
         self.equity_curve = equity_curve
         self.timestamps = timestamps
         self.config = config
+        # BTC close series aligned 1:1 with equity_curve / timestamps.  Used
+        # for the buy-and-hold benchmark and bull/bear regime detection.  No
+        # lookahead — benchmark equity at index i uses only closes[<= i].
+        self.closes = list(closes) if closes is not None else []
         self._compute_metrics()
 
     def _compute_metrics(self):
         self.total_trades = len(self.trades)
+
+        # Benchmark + risk-adjusted metrics depend only on the equity/close
+        # series, so compute them regardless of how many trades there were.
+        self._compute_benchmark_and_risk_metrics()
 
         if self.total_trades == 0:
             self.winning_trades = 0
@@ -184,6 +460,7 @@ class BacktestResult:
             self.short_trades = 0
             self.indicator_accuracy = {}
             self.regime_metrics = {}
+            self._finalize_alpha()
             return
 
         wins = [t for t in self.trades if t.pnl > 0]
@@ -232,6 +509,94 @@ class BacktestResult:
 
         # Per-regime metrics
         self.regime_metrics = self._compute_regime_metrics()
+
+        self._finalize_alpha()
+
+    def _compute_benchmark_and_risk_metrics(self):
+        """Compute the BTC buy-and-hold benchmark, conditional (bull/bear/
+        sideways) metrics and the strategy's risk-adjusted metrics (Calmar,
+        drawdown duration, time-under-water).  Pure measurement — no lookahead.
+        """
+        eq = self.equity_curve or []
+        ts = self.timestamps or []
+        closes = self.closes if self.closes else []
+
+        # Period span (days) for CAGR / annualization.
+        if len(ts) >= 2:
+            try:
+                span_days = (ts[-1] - ts[0]).total_seconds() / 86400.0
+            except AttributeError:
+                span_days = (float(ts[-1]) - float(ts[0])) / 86400.0
+                if span_days > 1e6:
+                    span_days = span_days / 1000.0
+        else:
+            span_days = 0.0
+        self.period_days = max(span_days, 0.0)
+        self._bar_seconds = _infer_bar_seconds(list(ts))
+
+        # --- Strategy risk-adjusted metrics ---
+        strat_dd = _drawdown_stats(eq)
+        self.dd_duration_bars = strat_dd['max_dd_duration_bars']
+        if self._bar_seconds > 0:
+            self.dd_duration_days = (self.dd_duration_bars * self._bar_seconds) / 86400.0
+        else:
+            self.dd_duration_days = 0.0
+        self.time_under_water_pct = strat_dd['time_under_water_pct']
+        self.cagr = _cagr(eq, self.period_days) if self.period_days > 0 else 0.0
+        strat_max_dd = strat_dd['max_drawdown_pct'] / 100.0
+        self.calmar_ratio = (self.cagr / strat_max_dd) if strat_max_dd > 0 else 0.0
+
+        # Per-bar (equity-curve) Sharpe — comparable to the benchmark Sharpe.
+        # Note: this is distinct from `sharpe_ratio`, which is per-trade based.
+        if len(eq) >= 2 and self._bar_seconds > 0:
+            eq_arr = np.asarray(eq, dtype=float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                sr = np.where(eq_arr[:-1] != 0, eq_arr[1:] / eq_arr[:-1] - 1.0, 0.0)
+            sr = np.nan_to_num(sr)
+            ppy = 86400.0 * 365.0 / max(self._bar_seconds, 1.0)
+            self.sharpe_ratio_bars = _annualized_sharpe(sr, ppy)
+        else:
+            self.sharpe_ratio_bars = 0.0
+
+        # --- BTC buy-and-hold benchmark over the same period ---
+        self.benchmark = compute_benchmark(
+            closes, ts, initial_balance=self.config.initial_balance)
+        bench_max_dd = self.benchmark.get('max_drawdown_pct', 0.0) / 100.0
+        bench_cagr = self.benchmark.get('cagr', 0.0)
+        self.benchmark['calmar_ratio'] = (
+            bench_cagr / bench_max_dd) if bench_max_dd > 0 else 0.0
+
+        # --- Bull / bear / sideways classification + conditional metrics ---
+        self.regimes = classify_regimes(closes, ts)
+        self.conditional_metrics = conditional_metrics(
+            eq, ts, self.regimes, bar_seconds=self._bar_seconds)
+        # Convenience counts of how the period itself was classified.
+        self.regime_bar_counts = {
+            r: sum(1 for x in self.regimes if x == r)
+            for r in ('bull', 'bear', 'sideways')
+        }
+
+    def _finalize_alpha(self):
+        """Strategy-vs-benchmark alpha.  Needs sharpe_ratio to already be set."""
+        bench_ret = self.benchmark.get('total_return_pct', 0.0)
+        strat_ret = getattr(self, 'total_roi', 0.0)
+        self.alpha_vs_benchmark_pct = strat_ret - bench_ret
+        # Risk-adjusted alpha: difference in (annualized) Sharpe.  The
+        # benchmark Sharpe uses per-bar returns of the buy-and-hold curve.
+        bench_eq = self.benchmark.get('equity_curve', [])
+        if len(bench_eq) >= 2 and self._bar_seconds > 0:
+            bench_eq_arr = np.asarray(bench_eq, dtype=float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                br = np.where(bench_eq_arr[:-1] != 0,
+                              bench_eq_arr[1:] / bench_eq_arr[:-1] - 1.0, 0.0)
+            br = np.nan_to_num(br)
+            ppy = 86400.0 * 365.0 / max(self._bar_seconds, 1.0)
+            self.benchmark_sharpe = _annualized_sharpe(br, ppy)
+        else:
+            self.benchmark_sharpe = 0.0
+        # Risk-adjusted alpha uses the per-bar (equity) Sharpe on both sides so
+        # the comparison is like-for-like.
+        self.alpha_sharpe = getattr(self, 'sharpe_ratio_bars', 0.0) - self.benchmark_sharpe
 
     def _compute_indicator_accuracy(self) -> Dict[str, Dict]:
         """For each indicator, check if its vote direction matched trade outcome."""
@@ -308,7 +673,42 @@ class BacktestResult:
             "",
             f"Max Drawdown:     {self.max_drawdown_pct:.2f}%",
             f"Sharpe Ratio:     {self.sharpe_ratio:.2f}",
+            f"Sharpe (per-bar): {self.sharpe_ratio_bars:.2f}",
+            f"CAGR:             {self.cagr * 100:+.2f}%",
+            f"Calmar Ratio:     {self.calmar_ratio:.2f}",
+            f"DD Duration:      {self.dd_duration_bars} bars "
+            f"({self.dd_duration_days:.1f}d)",
+            f"Time Under Water: {self.time_under_water_pct:.1f}%",
         ]
+
+        # Benchmark + alpha block
+        b = self.benchmark
+        bull_cnt = self.regime_bar_counts.get('bull', 0)
+        bear_cnt = self.regime_bar_counts.get('bear', 0)
+        side_cnt = self.regime_bar_counts.get('sideways', 0)
+        lines += [
+            "",
+            "BTC Buy-and-Hold Benchmark (same period):",
+            f"  Total Return:   {b.get('total_return_pct', 0.0):+.2f}%",
+            f"  Max Drawdown:   {b.get('max_drawdown_pct', 0.0):.2f}%",
+            f"  DD Duration:    {b.get('max_dd_duration_bars', 0)} bars",
+            f"  Time U/Water:   {b.get('time_under_water_pct', 0.0):.1f}%",
+            f"  Calmar:         {b.get('calmar_ratio', 0.0):.2f}",
+            "",
+            f"Alpha vs B&H:     {self.alpha_vs_benchmark_pct:+.2f}% return  "
+            f"({self.alpha_sharpe:+.2f} Sharpe diff, per-bar)",
+            "",
+            f"Period regime mix: bull {bull_cnt} / bear {bear_cnt} / "
+            f"sideways {side_cnt} bars",
+            "Strategy by market regime:",
+        ]
+        for label in ('bull', 'bear', 'sideways'):
+            cm = self.conditional_metrics.get(label, {})
+            lines.append(
+                f"  {label:9s}  {cm.get('bars', 0):5d} bars  "
+                f"ret {cm.get('total_return_pct', 0.0):+7.2f}%  "
+                f"Sharpe {cm.get('sharpe', 0.0):+6.2f}  "
+                f"maxDD {cm.get('max_drawdown_pct', 0.0):5.2f}%")
 
         if self.regime_metrics:
             lines.append("")
@@ -343,12 +743,58 @@ class BacktestResult:
             'profit_factor': self.profit_factor,
             'total_pnl': self.total_pnl,
             'total_roi': self.total_roi,
+            'total_return_pct': self.total_roi,  # alias, mirrors benchmark.total_return_pct
             'max_drawdown_pct': self.max_drawdown_pct,
             'sharpe_ratio': self.sharpe_ratio,
+            'sharpe_ratio_bars': self.sharpe_ratio_bars,
+            'cagr': self.cagr,
+            'calmar_ratio': self.calmar_ratio,
+            'dd_duration_bars': self.dd_duration_bars,
+            'dd_duration_days': self.dd_duration_days,
+            'time_under_water_pct': self.time_under_water_pct,
+            'period_days': self.period_days,
             'initial_balance': self.config.initial_balance,
             'final_balance': self.equity_curve[-1] if self.equity_curve else self.config.initial_balance,
             'regime_metrics': self.regime_metrics,
+            # Fase 1: BTC buy-and-hold benchmark + alpha + conditional metrics
+            'benchmark': {
+                'total_return_pct': self.benchmark.get('total_return_pct', 0.0),
+                'max_drawdown_pct': self.benchmark.get('max_drawdown_pct', 0.0),
+                'max_dd_duration_bars': self.benchmark.get('max_dd_duration_bars', 0),
+                'time_under_water_pct': self.benchmark.get('time_under_water_pct', 0.0),
+                'cagr': self.benchmark.get('cagr', 0.0),
+                'calmar_ratio': self.benchmark.get('calmar_ratio', 0.0),
+                'final_balance': self.benchmark.get('final_balance',
+                                                    self.config.initial_balance),
+                # Equity curve points: kept out of to_dict() to avoid bloating
+                # serialized output — use equity_series() for charting (it pairs
+                # strategy + benchmark + regime per bar and can be downsampled).
+                'equity_curve_len': len(self.benchmark.get('equity_curve', [])),
+            },
+            'benchmark_sharpe': self.benchmark_sharpe,
+            'alpha_vs_benchmark_pct': self.alpha_vs_benchmark_pct,
+            'alpha_sharpe': self.alpha_sharpe,
+            'regime_bar_counts': self.regime_bar_counts,
+            'conditional_metrics': self.conditional_metrics,
         }
+
+    def equity_series(self) -> List[Dict]:
+        """Equity curve as a list of {ts, equity, benchmark, regime} points.
+
+        Convenience for the dashboard — pairs the strategy equity with the BTC
+        buy-and-hold benchmark and the bull/bear/sideways label per bar.
+        """
+        bench = self.benchmark.get('equity_curve', []) if self.benchmark else []
+        out = []
+        for i, eq in enumerate(self.equity_curve or []):
+            ts = self.timestamps[i] if i < len(self.timestamps) else None
+            out.append({
+                'ts': ts.isoformat() if hasattr(ts, 'isoformat') else ts,
+                'equity': float(eq),
+                'benchmark': float(bench[i]) if i < len(bench) else None,
+                'regime': self.regimes[i] if i < len(self.regimes) else None,
+            })
+        return out
 
 
 class Backtester:
@@ -376,6 +822,11 @@ class Backtester:
         trades = []
         equity_curve = [balance]
         timestamps = [candles_df['timestamp'].iloc[0]]
+        # BTC close aligned to each equity-curve / timestamp point — used by
+        # BacktestResult for the buy-and-hold benchmark and regime detection.
+        # The first point is the first candle's close (matches equity[0] which
+        # is the initial balance at that timestamp).
+        closes = [float(candles[0][4])]
 
         lookback = self.config.lookback_candles
 
@@ -473,6 +924,7 @@ class Backtester:
                 unrealized = self._unrealized_pnl(position, current_price)
             equity_curve.append(balance + unrealized)
             timestamps.append(current_time)
+            closes.append(current_price)
 
         # Close any remaining position at last price
         if position is not None:
@@ -487,7 +939,8 @@ class Backtester:
             balance += trade.pnl
             equity_curve[-1] = balance
 
-        return BacktestResult(trades, equity_curve, timestamps, self.config)
+        return BacktestResult(trades, equity_curve, timestamps, self.config,
+                              closes=closes)
 
     def _check_exit(self, position: dict, candle_high: float,
                     candle_low: float, current_price: float) -> Optional[str]:
