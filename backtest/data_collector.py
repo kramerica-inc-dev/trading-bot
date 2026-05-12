@@ -203,6 +203,97 @@ class DataCollector:
         return result
 
 
+def fetch_funding_history(api: BlofinAPI, inst_id: str = "BTC-USDT",
+                          days: int = 365,
+                          page_limit: int = 100) -> pd.DataFrame:
+    """Fetch historical funding rates from BloFin, paginating backward.
+
+    Mirrors the candle pagination pattern in ``DataCollector.fetch_candles``:
+    the first request has no cursor (returns the most recent page), then the
+    oldest ``fundingTime`` in each page is fed back as the ``after`` cursor
+    (BloFin: ``after=T`` returns records OLDER than timestamp T).  Stops once
+    we run past the requested window or the server returns an empty page.
+
+    Returns a DataFrame with columns:
+        timestamp     -- pandas UTC datetime of the settlement
+        funding_rate  -- float (per-interval rate, e.g. 0.0001 == 1bps)
+        funding_time  -- raw settlement timestamp in ms
+        funding_interval_hours -- inferred spacing between settlements (8h
+                         for BTC-USDT; computed from the median gap)
+    """
+    end_ts_ms = int(time.time() * 1000)
+    min_ts_ms = end_ts_ms - days * 24 * 60 * 60 * 1000
+
+    rows = []
+    after_cursor: Optional[str] = None
+    pages = 0
+    # ~3 settlements/day + slack
+    max_pages = (days * 3) // page_limit + 4
+
+    print(f"Fetching {days} days of funding for {inst_id} "
+          f"(up to {max_pages} pages x {page_limit} records)...")
+
+    while pages < max_pages:
+        resp = api.get_funding_rate_history(
+            inst_id=inst_id, after=after_cursor, limit=page_limit
+        )
+        pages += 1
+
+        if not isinstance(resp, dict) or resp.get("code") not in ("0", 0):
+            msg = resp.get("msg") if isinstance(resp, dict) else str(resp)
+            print(f"  page {pages}: API error: {msg}")
+            break
+
+        data = resp.get("data") or []
+        if not data:
+            print(f"  page {pages}: empty, stopping.")
+            break
+
+        for d in data:
+            ft = d.get("fundingTime") or d.get("fundingRateTime")
+            rate = d.get("fundingRate")
+            if ft is None or rate is None:
+                continue
+            try:
+                rows.append({"funding_time": int(ft),
+                             "funding_rate": float(rate)})
+            except (TypeError, ValueError):
+                continue
+
+        oldest = min(r["funding_time"] for r in rows[-len(data):])
+        print(f"  page {pages}: +{len(data)} rows "
+              f"(oldest: {datetime.utcfromtimestamp(oldest/1000).strftime('%Y-%m-%d %H:%M')})")
+
+        if oldest <= min_ts_ms:
+            break
+        after_cursor = str(oldest)
+        time.sleep(0.15)  # Rate limiting
+
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "funding_rate",
+                                     "funding_time", "funding_interval_hours"])
+
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates(subset="funding_time").sort_values("funding_time")
+    df = df[df["funding_time"] >= min_ts_ms].reset_index(drop=True)
+    df["timestamp"] = pd.to_datetime(df["funding_time"], unit="ms", utc=True)
+
+    # Infer settlement interval from the median gap between consecutive rows.
+    if len(df) > 1:
+        gaps_h = df["funding_time"].diff().dropna() / (1000 * 3600)
+        interval_h = float(round(gaps_h.median(), 2))
+    else:
+        interval_h = 8.0
+    df["funding_interval_hours"] = interval_h
+
+    df = df[["timestamp", "funding_rate", "funding_time",
+             "funding_interval_hours"]]
+    print(f"  Total: {len(df)} funding records "
+          f"({df['timestamp'].min()} to {df['timestamp'].max()}, "
+          f"interval ~{interval_h}h)")
+    return df
+
+
 def generate_synthetic_data(days: int = 90, bar: str = "5m",
                             start_price: float = 70000.0,
                             volatility: float = 0.02) -> pd.DataFrame:

@@ -1,0 +1,329 @@
+{
+  "generated_at": "2026-05-12T13:04:38.592674+00:00",
+  "phase": "Fase 4 \u2014 walk-forward calibration of regime risk-multipliers",
+  "data": {
+    "csv": "backtest/data/BTC-USDT_5m.csv",
+    "config": "config.json",
+    "strategy_params": {
+      "rsi_period": 14,
+      "rsi_oversold": 30,
+      "rsi_overbought": 70,
+      "stop_loss_pct": 3.0,
+      "take_profit_pct": 2.0,
+      "macd_fast": 12,
+      "macd_slow": 26,
+      "macd_signal": 9,
+      "bb_period": 20,
+      "bb_std": 2.0,
+      "volume_period": 20,
+      "volume_threshold": 1.2,
+      "atr_period": 14,
+      "stop_loss_atr_mult": 2.0,
+      "take_profit_atr_mult": 3.0,
+      "min_confidence": 0.45,
+      "stop_loss_floor_pct": 1.0,
+      "take_profit_floor_pct": 1.5,
+      "min_votes": 3
+    },
+    "n_total_bars": 106559,
+    "search_bars": 85247,
+    "holdout_bars": 21312,
+    "search_period": [
+      "2025-04-12 22:35:00+00:00",
+      "2026-02-02 22:25:00+00:00"
+    ],
+    "holdout_period": [
+      "2026-02-02 22:30:00+00:00",
+      "2026-04-17 22:25:00+00:00"
+    ]
+  },
+  "grid": {
+    "values": [
+      0.5,
+      1.0,
+      1.5
+    ],
+    "regime_keys": [
+      "bull_trend",
+      "bear_trend",
+      "range"
+    ],
+    "n_trials": 27,
+    "quick": true
+  },
+  "walk_forward": {
+    "n_splits": 3,
+    "train_pct": 0.7,
+    "min_trades": 5
+  },
+  "sizing": {
+    "risk_per_trade_pct": 1.0,
+    "leverage": 1.0,
+    "max_position_notional_pct": 100.0
+  },
+  "grid_degenerate": false,
+  "objective": "max Calmar ratio on train portion",
+  "splits": [
+    {
+      "split": 1,
+      "winner": {
+        "bull_trend": 0.5,
+        "bear_trend": 0.5,
+        "range": 0.5
+      },
+      "train": {
+        "calmar": -4.189546636046481,
+        "sharpe_bars": -14.688851577494214,
+        "sharpe_trades": -24.996364713338934,
+        "max_dd_pct": 10.897962863300762,
+        "total_return_pct": -10.897962863300787,
+        "alpha_vs_bh_pct": -31.68700347176053,
+        "trades": 47,
+        "cagr": -0.45657523653701193
+      },
+      "test": {
+        "calmar": -8.970704554084897,
+        "sharpe_bars": -17.673353419578827,
+        "sharpe_trades": -31.643326001920205,
+        "max_dd_pct": 5.573797219223179,
+        "total_return_pct": -5.465709322946901,
+        "alpha_vs_bh_pct": -20.457837748292885,
+        "trades": 26,
+        "cagr": -0.500008880980311
+      },
+      "current_baseline_train": {
+        "calmar": -4.189739806967462,
+        "sharpe_bars": -14.668252094196133,
+        "sharpe_trades": -24.996364713338934,
+        "max_dd_pct": 10.895783816937147,
+        "total_return_pct": -10.895783816937168,
+        "alpha_vs_bh_pct": -31.68482442539691,
+        "trades": 47,
+        "cagr": -0.45650499185933446
+      },
+      "current_baseline_test": {
+        "calmar": -8.970704554084897,
+        "sharpe_bars": -17.673353419578827,
+        "sharpe_trades": -31.643326001920205,
+        "max_dd_pct": 5.573797219223179,
+        "total_return_pct": -5.465709322946901,
+        "alpha_vs_bh_pct": -20.457837748292885,
+        "trades": 26,
+        "cagr": -0.500008880980311
+      }
+    },
+    {
+      "split": 2,
+      "winner": {
+        "bull_trend": 0.5,
+        "bear_trend": 0.5,
+        "range": 1.0
+      },
+      "train": {
+        "calmar": -4.1503587804392525,
+        "sharpe_bars": -16.929664299925964,
+        "sharpe_trades": -31.576291275852313,
+        "max_dd_pct": 11.342297471642231,
+        "total_return_pct": -11.342297471642278,
+        "alpha_vs_bh_pct": -3.507567021580156,
+        "trades": 52,
+        "cagr": -0.47074603901784273
+      },
+      "test": {
+        "calmar": -9.748506747786731,
+        "sharpe_bars": -12.78297173293172,
+        "sharpe_trades": -20.98452054354158,
+        "max_dd_pct": 4.167295969453116,
+        "total_return_pct": -4.13899918761516,
+        "alpha_vs_bh_pct": -9.844665876546115,
+        "trades": 22,
+        "cagr": -0.4062491287823815
+      },
+      "current_baseline_train": {
+        "calmar": -4.151124650975518,
+        "sharpe_bars": -16.953095586510315,
+        "sharpe_trades": -31.576291275852313,
+        "max_dd_pct": 11.333569796861665,
+        "total_return_pct": -11.333569796861697,
+        "alpha_vs_bh_pct": -3.498839346799576,
+        "trades": 52,
+        "cagr": -0.47047060967304055
+      },
+      "current_baseline_test": {
+        "calmar": -9.748506747786731,
+        "sharpe_bars": -12.78297173293172,
+        "sharpe_trades": -20.98452054354158,
+        "max_dd_pct": 4.167295969453116,
+        "total_return_pct": -4.13899918761516,
+        "alpha_vs_bh_pct": -9.844665876546115,
+        "trades": 22,
+        "cagr": -0.4062491287823815
+      }
+    },
+    {
+      "split": 3,
+      "winner": {
+        "bull_trend": 0.5,
+        "bear_trend": 0.5,
+        "range": 1.0
+      },
+      "train": {
+        "calmar": -4.485907871090836,
+        "sharpe_bars": -10.156583833353844,
+        "sharpe_trades": -14.339507066549487,
+        "max_dd_pct": 6.8556685492325045,
+        "total_return_pct": -6.717359804077788,
+        "alpha_vs_bh_pct": 14.191830115863297,
+        "trades": 39,
+        "cagr": -0.3075389750659199
+      },
+      "test": {
+        "calmar": -9.522534376796452,
+        "sharpe_bars": -14.543818039969343,
+        "sharpe_trades": -23.784826850018792,
+        "max_dd_pct": 4.644694811178907,
+        "total_return_pct": -4.6250956326024735,
+        "alpha_vs_bh_pct": 9.234562141449496,
+        "trades": 20,
+        "cagr": -0.44229266009179247
+      },
+      "current_baseline_train": {
+        "calmar": -4.48577314184639,
+        "sharpe_bars": -10.217378385209146,
+        "sharpe_trades": -14.339507066549487,
+        "max_dd_pct": 6.857310086579674,
+        "total_return_pct": -6.719001341424937,
+        "alpha_vs_bh_pct": 14.190188578516148,
+        "trades": 39,
+        "cagr": -0.3076033741169144
+      },
+      "current_baseline_test": {
+        "calmar": -9.522534376796452,
+        "sharpe_bars": -14.543818039969343,
+        "sharpe_trades": -23.784826850018792,
+        "max_dd_pct": 4.644694811178907,
+        "total_return_pct": -4.6250956326024735,
+        "alpha_vs_bh_pct": 9.234562141449496,
+        "trades": 20,
+        "cagr": -0.44229266009179247
+      }
+    }
+  ],
+  "overall_winner": {
+    "multipliers": {
+      "bull_trend": 0.5,
+      "bear_trend": 0.5,
+      "range": 1.0
+    },
+    "mean_train_calmar": -4.27533548616585,
+    "train_calmar_per_split": [
+      -4.189739806967462,
+      -4.1503587804392525,
+      -4.485907871090836
+    ],
+    "train_calmar_mu": -4.27533548616585,
+    "train_calmar_sigma": 0.1497626194623816,
+    "z_vs_field_calmar": 0.7071067811856754,
+    "search_data_metrics": {
+      "calmar": -1.1738378269712102,
+      "sharpe_bars": -14.444142579841058,
+      "sharpe_trades": -23.63215764629035,
+      "max_dd_pct": 37.02232537699511,
+      "total_return_pct": -37.02232537699513,
+      "alpha_vs_bh_pct": -29.030790252210792,
+      "trades": 209,
+      "cagr": -0.43458205969953034
+    },
+    "deflated_sharpe": 0.0,
+    "sharpe_non_annualized": -0.044550141793448614,
+    "n_obs": 85047
+  },
+  "field_spread": {
+    "calmar_mean": -4.275575499879782,
+    "calmar_sigma": 0.00033943064939860064,
+    "calmar_min": -4.276055527307647,
+    "calmar_max": -4.27533548616585,
+    "sharpe_mean": -13.941813072229806,
+    "sharpe_sigma": 0.03344096021558027,
+    "per_combo_mean_train_calmar": {
+      "0.5,0.5,0.5": -4.276055527307647,
+      "0.5,0.5,1": -4.27533548616585,
+      "0.5,0.5,1.5": -4.27533548616585,
+      "0.5,1,0.5": -4.276055527307647,
+      "0.5,1,1": -4.27533548616585,
+      "0.5,1,1.5": -4.27533548616585,
+      "0.5,1.5,0.5": -4.276055527307647,
+      "0.5,1.5,1": -4.27533548616585,
+      "0.5,1.5,1.5": -4.27533548616585,
+      "1,0.5,0.5": -4.276055527307647,
+      "1,0.5,1": -4.27533548616585,
+      "1,0.5,1.5": -4.27533548616585,
+      "1,1,0.5": -4.276055527307647,
+      "1,1,1": -4.27533548616585,
+      "1,1,1.5": -4.27533548616585,
+      "1,1.5,0.5": -4.276055527307647,
+      "1,1.5,1": -4.27533548616585,
+      "1,1.5,1.5": -4.27533548616585,
+      "1.5,0.5,0.5": -4.276055527307647,
+      "1.5,0.5,1": -4.27533548616585,
+      "1.5,0.5,1.5": -4.27533548616585,
+      "1.5,1,0.5": -4.276055527307647,
+      "1.5,1,1": -4.27533548616585,
+      "1.5,1,1.5": -4.27533548616585,
+      "1.5,1.5,0.5": -4.276055527307647,
+      "1.5,1.5,1": -4.27533548616585,
+      "1.5,1.5,1.5": -4.27533548616585
+    }
+  },
+  "current_multipliers": {
+    "bull_trend": 1.0,
+    "bear_trend": 0.8,
+    "range": 0.55
+  },
+  "current_search_data_metrics": {
+    "calmar": -1.1738457907472502,
+    "sharpe_bars": -14.464935788912662,
+    "sharpe_trades": -23.63215764629035,
+    "max_dd_pct": 37.017906199264104,
+    "total_return_pct": -37.017906199264125,
+    "alpha_vs_bh_pct": -29.02637107447979,
+    "trades": 209,
+    "cagr": -0.4345331337428271
+  },
+  "holdout": {
+    "winner_metrics": {
+      "calmar": -4.124754269452069,
+      "sharpe_bars": -9.915865074336892,
+      "sharpe_trades": -14.550650654905795,
+      "max_dd_pct": 7.374580426696138,
+      "total_return_pct": -7.088612802323738,
+      "alpha_vs_bh_pct": -5.288514031123806,
+      "trades": 27,
+      "cagr": -0.30418332100432555
+    },
+    "current_metrics": {
+      "calmar": -4.145158744055381,
+      "sharpe_bars": -10.079884533935523,
+      "sharpe_trades": -14.550650654905793,
+      "max_dd_pct": 7.008146710101847,
+      "total_return_pct": -6.721039772484973,
+      "alpha_vs_bh_pct": -4.920941001285041,
+      "trades": 27,
+      "cagr": -0.2904988061500162
+    },
+    "winner_within_1sigma_of_train": false,
+    "winner_beats_current": true
+  },
+  "verdict": {
+    "activate": false,
+    "reason": "gate not satisfied (holdout outside 1\u03c3 of train, and/or does not beat current multipliers, and/or winner indistinguishable from noise field) \u2014 keep current multipliers, regime_multipliers.enabled stays false",
+    "recommended_config_section": {
+      "regime_multipliers": {
+        "enabled": false,
+        "bull_trend": 0.5,
+        "bear_trend": 0.5,
+        "range": 1.0
+      }
+    }
+  }
+}

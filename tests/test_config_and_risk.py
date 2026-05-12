@@ -304,6 +304,41 @@ class AdvancedStrategyTests(unittest.TestCase):
             self.assertAlmostEqual(signal.risk_multiplier, 0.0)
 
 
+class RegimeMultipliersConfigTests(unittest.TestCase):
+    """Fase 4: optional `regime_multipliers` config section (default disabled)."""
+
+    def test_disabled_keeps_defaults(self):
+        from advanced_strategy import MultiIndicatorConfluence
+        # No section at all -> defaults.
+        s = MultiIndicatorConfluence({'min_confidence': 0.5})
+        self.assertAlmostEqual(s.regime_risk_multipliers['bull_trend'], 1.0)
+        self.assertAlmostEqual(s.regime_risk_multipliers['bear_trend'], 0.8)
+        self.assertAlmostEqual(s.regime_risk_multipliers['range'], 0.55)
+        # Present but disabled -> still defaults, values ignored.
+        s2 = MultiIndicatorConfluence({
+            'min_confidence': 0.5,
+            'regime_multipliers': {'enabled': False, 'bull_trend': 0.1,
+                                   'bear_trend': 0.1, 'range': 0.1},
+        })
+        self.assertAlmostEqual(s2.regime_risk_multipliers['bull_trend'], 1.0)
+        self.assertAlmostEqual(s2.regime_risk_multipliers['bear_trend'], 0.8)
+        self.assertAlmostEqual(s2.regime_risk_multipliers['range'], 0.55)
+
+    def test_enabled_overrides_bull_bear_range_only(self):
+        from advanced_strategy import MultiIndicatorConfluence
+        s = MultiIndicatorConfluence({
+            'min_confidence': 0.5,
+            'regime_multipliers': {'enabled': True, 'bull_trend': 1.25,
+                                   'bear_trend': 0.6, 'range': 0.4},
+        })
+        self.assertAlmostEqual(s.regime_risk_multipliers['bull_trend'], 1.25)
+        self.assertAlmostEqual(s.regime_risk_multipliers['bear_trend'], 0.6)
+        self.assertAlmostEqual(s.regime_risk_multipliers['range'], 0.4)
+        # chop / unclear are out of scope of this section -> unchanged.
+        self.assertAlmostEqual(s.regime_risk_multipliers['chop'], 0.0)
+        self.assertAlmostEqual(s.regime_risk_multipliers['unclear'], 0.0)
+
+
 class BatchFixTests(unittest.TestCase):
     """Tests for Batch 2-3 review fixes."""
 

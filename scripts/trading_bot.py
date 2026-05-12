@@ -2025,6 +2025,11 @@ class TradingBot:
 
     def _build_strategy_with_live_profiles(self, strategy_cfg: Dict):
         cfg = dict(strategy_cfg)
+        # Fase 4: surface the top-level regime_multipliers section to the
+        # strategy.  No-op for behavior unless regime_multipliers.enabled=true.
+        rm_cfg = self.config.get("regime_multipliers")
+        if rm_cfg is not None and "regime_multipliers" not in cfg:
+            cfg["regime_multipliers"] = rm_cfg
         selector_cfg = dict(self.parameter_selector_cfg)
         profile_path = selector_cfg.get("live_profile_path")
         if selector_cfg.get("enabled") and profile_path:

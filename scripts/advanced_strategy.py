@@ -155,6 +155,18 @@ class MultiIndicatorConfluence(TradingStrategy):
         self.min_risk_multiplier = float(risk_cfg.get('min_multiplier', 0.0))
         self.max_risk_multiplier = float(risk_cfg.get('max_multiplier', 1.25))
 
+        # Fase 4 — walk-forward-calibrated regime multipliers.  Disabled by
+        # default: when enabled, overrides the bull_trend / bear_trend / range
+        # entries of regime_risk_multipliers.  chop / unclear are out of scope
+        # of this phase and stay at their risk_allocation values.  See
+        # backtest/calibrate_regime_multipliers.py and
+        # docs/regime-multiplier-calibration.md.
+        rm_cfg = config.get('regime_multipliers', {}) or {}
+        if bool(rm_cfg.get('enabled', False)):
+            for _key in ('bull_trend', 'bear_trend', 'range'):
+                if _key in rm_cfg:
+                    self.regime_risk_multipliers[_key] = float(rm_cfg[_key])
+
         quality_cfg = config.get('trade_quality', {})
         self.trade_quality_enabled = bool(quality_cfg.get('enabled', True))
         self.min_trade_quality_score = float(quality_cfg.get('min_score', 0.55))

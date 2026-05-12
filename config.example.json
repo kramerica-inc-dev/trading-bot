@@ -119,5 +119,12 @@
     "_comment": "Step 5: Per-TF calibrated parameter profiles. Run backtest/calibrate_per_timeframe.py to generate.",
     "enabled": false,
     "path": "memory/timeframe_profiles.json"
+  },
+  "regime_multipliers": {
+    "_comment": "Fase 4: walk-forward-calibrated regime risk-multipliers (Calmar-optimized). Disabled by default. When enabled, overrides bull_trend/bear_trend/range entries of the strategy's regime risk multipliers; chop/unclear stay at their defaults. See backtest/calibrate_regime_multipliers.py and docs/regime-multiplier-calibration.md.",
+    "enabled": false,
+    "bull_trend": 1.0,
+    "bear_trend": 0.8,
+    "range": 0.55
   }
 }
