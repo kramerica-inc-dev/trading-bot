@@ -229,8 +229,17 @@ class TrailingStopStrategyTests(unittest.TestCase):
 
 class B2VerificationTests(unittest.TestCase):
     """The §7 verification gate: the one-shot trailing-stop-on-BH must roughly
-    reproduce docs/edge-diagnosis/I-ablations.md row 14 over the diagnosis
-    window (~+15-20% return, ~8-12% max-DD).  Skips if the daily CSV is absent."""
+    reproduce docs/edge-diagnosis/I-ablations.md row 14 (~+15-20% return,
+    ~8-12% max-DD) **over the diagnosis window** — i.e. the ~2025-04 → 2026-04
+    span of BTC-USDT_5m.csv.  The daily CSV now covers ~3.3 years (2023-01 →);
+    over that longer window plain BH is up >300% and the one-shot rule (which
+    exits once in 2023 and never re-enters) does NOT beat it — that's expected
+    and is exactly why M3 picks the variant deliberately.  This test therefore
+    slices the daily series down to the diagnosis window before checking.
+    Skips if the daily CSV is absent."""
+
+    DIAG_START = pd.Timestamp("2025-04-13", tz="UTC")
+    DIAG_END = pd.Timestamp("2026-04-18", tz="UTC")
 
     def test_oneshot_b2_reproduces_diagnosis_numbers(self):
         csv = Path(__file__).resolve().parent.parent / "backtest" / "data" / "BTC-USDT_1d.csv"
@@ -239,17 +248,21 @@ class B2VerificationTests(unittest.TestCase):
                           "python -m backtest.build_daily_csv)")
         df = pd.read_csv(csv)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df = df[(df["timestamp"] >= self.DIAG_START) & (df["timestamp"] < self.DIAG_END)] \
+            .reset_index(drop=True)
+        if len(df) < 200:
+            self.skipTest("daily CSV does not cover the diagnosis window")
         # No funding (the diagnosis didn't subtract perp funding), realistic fees.
         cfg = DailyBacktestConfig(initial_balance=5000.0, funding_series_path=None)
         r = DailyBacktester(TrailingStopBH(0.10, 20, reenter=False), cfg).run(df)
-        # Expect ~+17-21% total return and ~8-12% max-DD.
+        # Expect ~+15-21% total return and ~8-12% max-DD over the diagnosis window.
         self.assertGreater(r.total_roi, 8.0,
                            f"B2 one-shot return {r.total_roi:.2f}% too low — possible bug")
         self.assertLess(r.total_roi, 30.0, f"B2 one-shot return {r.total_roi:.2f}% too high")
         self.assertGreater(r.max_drawdown_pct, 5.0)
         self.assertLess(r.max_drawdown_pct, 14.0,
                         f"B2 one-shot max-DD {r.max_drawdown_pct:.2f}% — diagnosis was ~10%")
-        # And it must beat plain buy-and-hold (B1) over this window.
+        # And it must beat plain buy-and-hold (B1) over the diagnosis window.
         b1 = DailyBacktester(BuyAndHold(1.0), cfg).run(df)
         self.assertGreater(r.total_roi, b1.total_roi)
         self.assertLess(r.max_drawdown_pct, b1.max_drawdown_pct)
