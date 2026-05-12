@@ -76,3 +76,19 @@ not introducing regressions. If A fails to show any lift after 4 weeks live,
 pause before C and re-examine assumptions.
 
 ---
+## 2026-05-12 — 'advanced' strategy deprecated; next strategy is a simple low-frequency trend + vol-target overlay
+
+**Context.** The v2.7 improvement plan (`IMPROVEMENT_PLAN.md`) ran 6 phases (benchmark/metrics, lookahead audit, funding analysis, regime-multiplier calibration, continuous risk score, bear-check). Fase 1 established the baseline; Fases 3/4/5/6 all came back NO-GO. An 8-axis post-mortem (`docs/edge-diagnosis.md` + `docs/edge-diagnosis/{A..I}-*.md`) then showed conclusively that `MultiIndicatorConfluence` ('advanced') has **no entry edge even gross**: over ~370d on BTC-USDT 5m it returns −32.9% vs a passive BTC buy-and-hold's −9.5% (alpha −23.4%); gross PnL before fees/slippage ≈ −$1.2 on $115 (break-even) so ~97% of the net loss is transaction-cost drag; median per-trade gross move 0.13% vs the ~0.22% round-trip cost floor (82% of trades "dead on arrival"); MFE caps at ~1% ever; the confluence scores (confidence/quality/regime_confidence/MTF-alignment) all have ~zero IC (which is why Fase 5 did nothing); RSI/MACD-hist IC ≈ −0.27 vs 15-bar forward return — wrong sign; it loses in all months and all regimes (worst in sideways, its own thesis regime); a random-entry-same-turnover-same-friction backtest produces ≈ the same result; and **a single trailing −10% stop on plain buy-and-hold returns +17.7% / Calmar +1.76 / 10% max-DD over the same period** — the dumbest systematic rule beats it by ~50 pp. Plan D (single-asset mean-reversion) had already failed the same way (fee share >60%).
+
+**Decision.**
+1. `MultiIndicatorConfluence` ('advanced') and the single-asset mean-reversion (`mean_reversion_strategy.py`, Plan D) are **deprecated as live candidates.** The code stays in the repo for reference; the inert-by-default infra from Fases 4–6 (`regime_multipliers`, `risk_scoring`, `bear_check` config sections) can remain. No further development, optimization, or exit-tuning on these — the ablations show exit fixes move it < ~2 pp and zero-cost only reaches break-even.
+2. The next strategy development effort is a **simple, low-frequency, trend + volatility-target overlay** on a small crypto basket (BTC, optionally + ETH), rebalanced daily, holds of weeks — spec in `docs/STRATEGY-V1-TREND-VOLTARGET.md`. It is benchmarked explicitly against (a) BTC buy-and-hold and (b) trailing-stop-on-BH, on Calmar / max-DD (not raw return). If it cannot beat (b) out-of-sample there is no reason to run anything more complex than that one-line rule.
+3. Plan E (cross-sectional multi-asset, the live `plan-e@*` paper instances) keeps running as a paper experiment but gets **no further build-out** (OKX EU live-executor / maker-execution / reconciliation bundle stays on hold per the existing paper-PASS gate) until it demonstrably beats BH on Calmar OOS over its paper window.
+
+**Process rule (binding going forward).** Every future strategy candidate must, BEFORE any backtest optimization: (i) demonstrate forward-return separation from a random-entry null, out-of-sample; (ii) pass the diagnosis template in `docs/edge-diagnosis/` (gross-vs-net per-trade expectancy, MFE/MAE capture, IC of every signal component, exposure/Brinson decomposition). If gross per-trade expectancy ≈ 0, stop — it's a friction harvester. One strategy at a time, hard kill-criteria set in advance, no parallel variant farms.
+
+**Why this matters.** Two strategies have now failed in exactly the same way; the temptation will be to "tune our way out" a third time. The data says the edge in this project is in low-frequency risk management, not in timed entries — record it here so future work doesn't drift back.
+
+**Review condition.** Revisit point 1 only if a concrete scoring/exit bug is found that materially changes the gross-expectancy number. Revisit point 3 after Plan E's paper window closes with measured results.
+
+---
