@@ -144,3 +144,24 @@ Probed the OKX EU API directly (with the working demo creds) to see what could b
 **Review condition.** Revisit point 1 only if (a) MiCA/OKX-EU rules change, (b) the user moves to a non-EU entity, or (c) a concrete OKX API/docs change shows acctLv≥2 became available for EU retail. Revisit point 3 if BloFin discontinues or restricts spot trading at the user's KYC level.
 
 ---
+## 2026-05-13 — Carry on BloFin also blocked (no spot trading API); carry direction parked
+
+**Context.** After OKX EU was found to be acctLv=1-capped today (no perp for EU retail → carry blocked), the plan was to pivot to BloFin. Feasibility check first (`docs/CARRY-BLOFIN-FEASIBILITY.md`) before any adapter work.
+
+**Findings (Phase 0 only — no build started).**
+- BloFin's **spot market data API works** (253 SPOT instruments incl. BTC-USDT, healthy depth). But the **spot trading API is undocumented / unimplemented**: no docs at `docs.blofin.com`, no spot place-order method in the official Python SDK, every trading method goes through `/api/v1/trade/*` with `marginMode`+`positionSide` (i.e. swap-only). CCXT issue #24675 (re-confirmed by a maintainer **2026-03-04**): "BloFin only supports swap trading through the API." Probes against guessed spot trade endpoints return 401 with no signing-shape documentation — reverse-engineering an undocumented endpoint is out of scope.
+- The user's OKX KYC is already at the EU max ("Identiteit geverifieerd", fee tier "Vaste gebruiker"). There is no higher KYC tier to try on OKX EU. The 2026-05-13 plan-step "(a) user tries KYC Lv3" is therefore a dead path — the cap is regulatory, not KYC-tier.
+- BloFin's UTA Multi-Currency Margin mode (since April 2025) would have made BloFin yield-comparable to OKX unified-margin (~9%/yr, not the ~6.3% the spec assumed) — but this is moot given no spot trading API.
+- BloFin's regulatory exposure for NL users: not on their geo-block list, BVI/Cayman base, "seeking MiCA CASP authorization before 2026-07-01"; AFM has investigated unlicensed CASPs (Binance NL exit 2023). Tail risk, not a current blocker.
+
+**Decision.**
+1. **The funding/basis-carry strategy is parked** for now. Two venues blocked for two different reasons (OKX EU = regulatory cap on perp; BloFin = no spot trading API). No third venue is materially better placed: BloFin's competitors with API spot+perp (Bybit, Binance global, OKX global) all either geo-block NL, withdrew from the Dutch market post-MiCA, or carry the same offshore tail risk.
+2. **Project falls back to the recorded fallback path** (per the 2026-05-12 DECISIONS entry's last paragraph): "this account holds BTC/ETH with a drawdown circuit-breaker + vol-targeting". That's the legitimate endpoint when the active-strategy candidates don't clear the bar — exactly the situation we're in.
+3. **Keep what's been built.** The OKX P1/P2 adapter work (spot order surface, unified-margin awareness, EU base URL, UA fix, dry-run/P2_DEMO/P3_LIVE three-state gate, legging window, basis-kill, manual halt, reconcile) stays in the repo. The carry runner, position math, dashboard tab, ops doc, and infra all stay. If BloFin ships a spot trading API later, or OKX EU rules change, or the user moves to a non-EU entity, the carry is one config/adapter swap away from running.
+4. **Plan E** unchanged: keeps paper-running on BloFin with its own go/no-go gate at the end of its paper window. The Plan-E live-executor + maker-execution + reconciliation bundle (`[[project_okx_live_executor_commit]]`) is at the same OKX EU regulatory wall the carry hit — so it's also effectively on hold unless Plan E's live-deploy plan migrates to BloFin-only or to a non-EU entity. To be decided when Plan E's paper window closes.
+
+**One low-cost option worth keeping in mind:** contact BloFin support to ask if a spot trading API exists on partner/institutional tier or is on the public roadmap. Cheap (~5 min email), 1–3 day turnaround, and if they say "yes Q3" or "white-listable" we have a path. Not blocking; just noted.
+
+**Review condition.** Revisit point 1 when any of: (a) BloFin's spot trading API ships, (b) OKX EU loosens its EU retail acctLv cap, (c) a different licensed-in-NL exchange offers spot+perp with API access, (d) the user opens an account under a non-EU entity. Otherwise the carry stays parked.
+
+---
