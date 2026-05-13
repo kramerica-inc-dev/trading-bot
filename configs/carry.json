@@ -1,0 +1,17 @@
+{
+  "instance_name": "carry",
+  "exchange": "okx",
+  "spot_symbol": "BTC-USDT",
+  "perp_symbol": "BTC-USDT",
+  "initial_notional_usd": 5000.0,
+  "target_dn_notional_fraction": 0.6,
+  "leverage_cap": 2.0,
+  "funding_on_threshold_annualised": 0.05,
+  "trailing_window_samples": 270,
+  "basis_kill_pct": 0.01,
+  "margin_ratio_alarm": 1.5,
+  "cycle_interval_sec": 300,
+  "dry_run": true,
+  "okx_base_url": null,
+  "okx_demo": false
+}

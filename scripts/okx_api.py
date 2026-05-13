@@ -2,8 +2,8 @@
 """OKX v5 REST API Client.
 
 Faithful client for OKX's v5 endpoints. Symbols use OKX's native naming
-(`BTC-USDT-SWAP` for perp futures) — the OkxAdapter layer above is what
-normalizes BTC-USDT ↔ BTC-USDT-SWAP for the runner.
+(`BTC-USDT-SWAP` for perp futures; `BTC-USDT` for spot) — the OkxAdapter
+layer above is what normalizes BTC-USDT ↔ BTC-USDT-SWAP for the perp side.
 
 Auth scheme (OK-ACCESS-* headers):
     timestamp = ISO 8601 UTC with millisecond precision
@@ -12,12 +12,23 @@ Auth scheme (OK-ACCESS-* headers):
 
 Demo trading: pass demo=True; adds `x-simulated-trading: 1` header on the
 same base URL (no separate hostname like BloFin).
+
+EU region note (P1 carry build, 2026-05-13): the BASE_URL `https://www.okx.com`
+is the global host. OKX EU traffic uses the same v5 endpoints but EU-region
+accounts may be served from a region-specific edge; the host below works
+for public market data globally. For EU-private endpoints we set
+`OKX_API_BASE` (env override) so the carry-runner can point at the EU
+host without touching code. Spot trading on OKX EU for retail is
+documented as available; perp/swap on OKX EU has a documented leverage
+cap of 2× for retail (MiCA). These are flagged as assumptions in
+`docs/CARRY-BUILD-PLAN.md` until confirmed live.
 """
 
 import base64
 import hashlib
 import hmac
 import json
+import os
 import random
 import threading
 import time
@@ -46,11 +57,15 @@ class OkxAPI:
         api_secret: str = "",
         passphrase: str = "",
         demo: bool = False,
+        base_url: Optional[str] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
         self.passphrase = passphrase
         self.demo = demo
+        # Allow EU/region override via env or constructor without forking code.
+        # If both unset, default to global host.
+        self.base_url = base_url or os.environ.get("OKX_API_BASE") or self.BASE_URL
         self.session = requests.Session()
 
         # Rate limits on OKX vary per endpoint (5-60 req/2s). Keep
@@ -107,7 +122,7 @@ class OkxAPI:
             qs = urlencode({k: v for k, v in params.items() if v is not None})
             if qs:
                 request_path = f"{path}?{qs}"
-        url = f"{self.BASE_URL}{request_path}"
+        url = f"{self.base_url}{request_path}"
         body_str = json.dumps(body) if body is not None else ""
 
         last_error: Optional[str] = None
@@ -390,6 +405,142 @@ class OkxAPI:
         # Each item must have algoId + instId per OKX's batch-cancel API.
         return self._request("POST", "/api/v5/trade/cancel-algos",
                              body=orders, auth=True)
+
+    # =====================  SPOT (added for carry P1)  =====================
+    #
+    # OKX uses the *same* /api/v5/trade/order endpoint for spot and perp;
+    # the difference is `instId` (BTC-USDT for spot vs BTC-USDT-SWAP for
+    # perp) and `tdMode` ("cash" for spot un-margined; "cross"/"isolated"
+    # for spot-on-margin under unified-margin). `posSide` is not used for
+    # spot. Order types and price field are the same.
+
+    def get_spot_ticker(self, inst_id: str = "BTC-USDT") -> Dict:
+        """Spot ticker. Identical endpoint to perp ticker but inst_id is the
+        spot symbol (no -SWAP suffix)."""
+        return self._request("GET", "/api/v5/market/ticker",
+                             params={"instId": inst_id})
+
+    def get_spot_instruments(self, inst_id: Optional[str] = None) -> Dict:
+        """Spot instrument metadata: minSz, tickSz, lotSz, state, baseCcy,
+        quoteCcy, settleCcy, etc. Used to validate min order size."""
+        params: Dict[str, Any] = {"instType": "SPOT"}
+        if inst_id:
+            params["instId"] = inst_id
+        return self._request("GET", "/api/v5/public/instruments", params=params)
+
+    def place_spot_order(
+        self, inst_id: str, side: str, order_type: str, size: str,
+        price: Optional[str] = None,
+        td_mode: str = "cash",
+        client_order_id: Optional[str] = None,
+        target_currency: Optional[str] = None,
+    ) -> Dict:
+        """Place a SPOT order.
+
+        Args:
+            inst_id: spot symbol, e.g. "BTC-USDT" (no -SWAP).
+            side: "buy" or "sell".
+            order_type: "market" | "limit" | "post_only" | "fok" | "ioc".
+            size: order size. For market BUY on OKX spot, size is the
+                  *quote* amount (USDT) unless `target_currency=base_ccy`.
+                  For limit/post_only, size is in base currency (BTC).
+            price: required for limit/post_only/fok/ioc.
+            td_mode: "cash" (no margin) or "cross"/"isolated" (margin/unified).
+            client_order_id: optional clOrdId.
+            target_currency: only used for spot market orders to disambiguate
+                  whether `size` is base or quote currency. OKX accepts
+                  "base_ccy" or "quote_ccy".
+
+        Returns the raw OKX response. Caller is responsible for symbol
+        munging (no -SWAP suffix here — this is the spot endpoint, callers
+        pass the spot inst_id directly).
+        """
+        body: Dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": order_type,
+            "sz": size,
+        }
+        if order_type in ("limit", "post_only", "fok", "ioc") and price:
+            body["px"] = price
+        if client_order_id:
+            body["clOrdId"] = client_order_id
+        if target_currency:
+            body["tgtCcy"] = target_currency
+        return self._request("POST", "/api/v5/trade/order", body=body, auth=True)
+
+    def cancel_spot_order(self, inst_id: str, order_id: Optional[str] = None,
+                          client_order_id: Optional[str] = None) -> Dict:
+        """Cancel a spot order by orderId or clientOrderId."""
+        body: Dict[str, Any] = {"instId": inst_id}
+        if order_id:
+            body["ordId"] = order_id
+        elif client_order_id:
+            body["clOrdId"] = client_order_id
+        else:
+            return {"code": "error",
+                    "msg": "order_id or client_order_id is required",
+                    "data": None}
+        return self._request("POST", "/api/v5/trade/cancel-order",
+                             body=body, auth=True)
+
+    def get_spot_order_detail(self, inst_id: str,
+                              order_id: Optional[str] = None,
+                              client_order_id: Optional[str] = None) -> Dict:
+        """Get spot order detail. Same endpoint as perp; OKX disambiguates
+        by instId."""
+        params: Dict[str, Any] = {"instId": inst_id}
+        if order_id:
+            params["ordId"] = order_id
+        elif client_order_id:
+            params["clOrdId"] = client_order_id
+        else:
+            return {"code": "error",
+                    "msg": "order_id or client_order_id is required",
+                    "data": None}
+        return self._request("GET", "/api/v5/trade/order",
+                             params=params, auth=True)
+
+    def get_spot_active_orders(self, inst_id: Optional[str] = None) -> Dict:
+        """List pending spot orders."""
+        params: Dict[str, Any] = {"instType": "SPOT"}
+        if inst_id:
+            params["instId"] = inst_id
+        return self._request("GET", "/api/v5/trade/orders-pending",
+                             params=params, auth=True)
+
+    def get_spot_fills(self, inst_id: Optional[str] = None,
+                       order_id: Optional[str] = None,
+                       begin: Optional[str] = None,
+                       end: Optional[str] = None,
+                       limit: int = 100) -> Dict:
+        """Spot fills history."""
+        params: Dict[str, Any] = {"instType": "SPOT", "limit": str(limit)}
+        if inst_id:
+            params["instId"] = inst_id
+        if order_id:
+            params["ordId"] = order_id
+        if begin:
+            params["begin"] = begin
+        if end:
+            params["end"] = end
+        return self._request("GET", "/api/v5/trade/fills-history",
+                             params=params, auth=True)
+
+    # =====================  Unified-margin awareness  =====================
+
+    def get_account_config(self) -> Dict:
+        """Account configuration (alias for get_position_mode — OKX returns
+        acctLv + posMode + autoLoan etc. on the same endpoint).
+
+        Key field for the carry strategy:
+            acctLv: '1' = Simple, '2' = Single-currency margin,
+                    '3' = Multi-currency margin, '4' = Portfolio margin.
+        For the carry we want '3' or '4' (spot BTC collateralizes the
+        perp short → ~50% effective-yield improvement vs siloed margin).
+        """
+        return self._request("GET", "/api/v5/account/config", auth=True)
 
 
 if __name__ == "__main__":
