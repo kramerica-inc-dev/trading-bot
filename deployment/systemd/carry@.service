@@ -1,0 +1,31 @@
+[Unit]
+Description=Carry runner (%i) — funding/basis cash-and-carry on OKX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+# Per-instance credentials and overrides; the leading `-` makes it optional
+# so the unit can be loaded before the env-file is created. The runner will
+# log an error and skip its order/account paths if credentials are missing.
+EnvironmentFile=-/etc/trading-bot/carry-%i.env
+ExecStart=/usr/bin/python3 -m scripts.carry_runner --loop --config /opt/trading-bot/configs/carry-%i.json
+Restart=on-failure
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=carry-%i
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot
+
+[Install]
+WantedBy=multi-user.target

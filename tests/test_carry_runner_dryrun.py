@@ -148,7 +148,7 @@ class TestRunnerDryRunCycle(unittest.TestCase):
                                   leverage_cap=2.0,
                                   funding_on_threshold_annualised=0.05)
             entry = runner.one_cycle()
-            self.assertEqual(entry["mode"], "dry_run")
+            self.assertEqual(entry["mode"], "DRY_RUN")
             self.assertTrue(entry["gate"]["on"])
             self.assertIsNotNone(entry["target"])
             self.assertAlmostEqual(entry["target"]["notional_usd"], 3000.0)

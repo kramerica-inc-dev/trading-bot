@@ -1,0 +1,30 @@
+{
+  "instance_name": "btc",
+  "exchange": "okx",
+  "spot_symbol": "BTC-USDT",
+  "perp_symbol": "BTC-USDT",
+
+  "dry_run": false,
+  "okx_demo": true,
+  "allow_live": false,
+  "live_max_usd": 1000,
+
+  "okx_base_url": null,
+  "_okx_api_base_comment": "TBD — runner verifies endpoints on startup. The user accesses OKX EU via https://my.okx.com/nl; if the EU edge needs a different host the runner will surface auth errors on first call and we set this field (e.g. https://eea.okx.com or whichever EU host the API portal lists).",
+
+  "initial_notional_usd": 5000.0,
+  "target_dn_notional_fraction": 0.6,
+
+  "leverage_cap": 2.0,
+  "_leverage_cap_comment": "TBD — runner verifies via /api/v5/account/leverage-info at startup. If EU retail caps below 2× the runner refuses to start with a clear MISMATCH log line; lower this field and restart.",
+
+  "basis_kill_pct": 0.01,
+  "funding_on_threshold_annualised": 0.05,
+  "trailing_window_samples": 270,
+  "margin_ratio_alarm": 1.5,
+  "legging_window_sec": 5,
+  "rebalance_threshold_pct": 0.05,
+
+  "cycle_interval_sec": 60,
+  "_cycle_comment": "Health check / market data each cycle; funding settles every 8h; rebalance triggers only when target ≠ current beyond rebalance_threshold_pct."
+}
