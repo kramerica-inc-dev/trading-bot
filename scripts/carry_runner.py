@@ -580,7 +580,13 @@ class CarryRunner:
         self.mode = resolve_mode(cfg)
 
         self.cfg = cfg
-        instance_dir = (state_dir or PROJECT_ROOT / "state") / cfg.instance_name
+        # State namespace: nest under `state/carry/<instance>/` so carry
+        # instances don't collide with Plan E's `state/plan-e-*/` layout.
+        # `state_dir` (test override) still wins as-is when provided.
+        if state_dir is not None:
+            instance_dir = state_dir / cfg.instance_name
+        else:
+            instance_dir = PROJECT_ROOT / "state" / "carry" / cfg.instance_name
         instance_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = instance_dir / "state.json"
         self.log_path = instance_dir / "trades.log"

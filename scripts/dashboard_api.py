@@ -42,6 +42,12 @@ LEGACY_RUNNER_CACHE = STATE_DIR / "runner_cache"
 
 DEFAULT_INSTANCE = "plan-e-base"
 
+# Carry runner state lives under `state/carry/<instance>/` (see
+# scripts/carry_runner.py — the runner nests its instance dirs under
+# `carry/` so they don't collide with Plan E's flat `state/plan-e-*/`).
+CARRY_STATE_DIR = STATE_DIR / "carry"
+# CARRY_INSTANCE_NAME_RE compiled below, after `import re`.
+
 # Backtest results (Fase 1: benchmark + risk-adjusted metrics).  Prefer the
 # deployed location under BOT_DIR; fall back to the repo layout next to this
 # file so the dashboard works in a checkout too.
@@ -62,6 +68,8 @@ CONTROLLABLE_SERVICES = {"plan-e-runner"}
 INSTANCE_NAME_RE = None  # compiled below
 import re  # noqa: E402
 INSTANCE_NAME_RE = re.compile(r"^plan-e-[a-z0-9]{1,16}$")
+# Carry instance names — short safe charset, can't escape the carry dir.
+CARRY_INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 # Simple CSRF/auth token — generated once per process start, embedded in the
 # served HTML, required on POST /api/control. Tailscale-private network so
@@ -714,6 +722,118 @@ def build_plan_e_response(instance: str = DEFAULT_INSTANCE) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Carry (OKX funding/basis) readers
+# ---------------------------------------------------------------------------
+
+def _validate_carry_instance(instance: str) -> str:
+    """Validate + normalise an `instance` query arg for the carry tab.
+
+    Raises ValueError on any path-traversal or unsafe-charset attempt. The
+    same allow-listed charset is enforced for both directory listings and
+    per-instance reads so the API surface is uniform.
+    """
+    if not instance or not CARRY_INSTANCE_NAME_RE.match(instance):
+        raise ValueError(f"invalid carry instance: {instance!r}")
+    return instance
+
+
+def _carry_instance_dir(instance: str) -> Path:
+    return CARRY_STATE_DIR / _validate_carry_instance(instance)
+
+
+def _list_carry_instances() -> List[Dict[str, Any]]:
+    """Scan `state/carry/*/` and return a compact summary per instance.
+
+    Only directories that actually contain a `health.json` are returned —
+    avoids surfacing empty placeholder dirs. Sorted alphabetically for a
+    deterministic UI ordering.
+    """
+    out: List[Dict[str, Any]] = []
+    if not CARRY_STATE_DIR.exists():
+        return out
+    for child in sorted(CARRY_STATE_DIR.iterdir()):
+        if not child.is_dir():
+            continue
+        name = child.name
+        if not CARRY_INSTANCE_NAME_RE.match(name):
+            continue
+        health_path = child / "health.json"
+        if not health_path.exists():
+            continue
+        h = _read_json_file(health_path, {}) or {}
+        out.append({
+            "instance": name,
+            "mode": h.get("mode"),
+            "halted": h.get("halted", False),
+            "halt_reason": h.get("halt_reason"),
+            "last_cycle_ts": h.get("last_cycle_ts"),
+            "cycles_total": h.get("cycles_total", 0),
+            "have_private_creds": h.get("have_private_creds", False),
+        })
+    return out
+
+
+# Cap how many funding samples we ship to the client — the state.json file
+# stores up to `trailing_window_samples` (270 by default) but the chart
+# doesn't need more than ~200 points and we want to keep the response small.
+CARRY_FUNDING_SAMPLES_MAX = 200
+
+
+def _read_carry_state_summary(instance: str) -> Dict[str, Any]:
+    """Summary of `state/carry/<instance>/state.json` for the dashboard.
+
+    Does NOT include `last_account_check` verbatim (it can contain raw
+    exchange balances). The trade log carries the per-cycle account
+    fields the UI actually renders.
+    """
+    inst_dir = _carry_instance_dir(instance)
+    state = _read_json_file(inst_dir / "state.json", None)
+    if state is None:
+        return {"_error": "no state.json"}
+
+    samples = state.get("funding_samples", []) or []
+    samples_ts = state.get("funding_samples_ts", []) or []
+    # Downsample if oversized — keep the most recent N samples.
+    if len(samples) > CARRY_FUNDING_SAMPLES_MAX:
+        samples = samples[-CARRY_FUNDING_SAMPLES_MAX:]
+        samples_ts = samples_ts[-CARRY_FUNDING_SAMPLES_MAX:]
+
+    return {
+        "instance": instance,
+        "started_ts": state.get("started_ts"),
+        "last_cycle_ts": state.get("last_cycle_ts"),
+        "cycles_total": state.get("cycles_total", 0),
+        "halted": state.get("halted", False),
+        "halt_reason": state.get("halt_reason"),
+        "last_basis_kill_ts": state.get("last_basis_kill_ts"),
+        "legging_aborts_total": state.get("legging_aborts_total", 0),
+        "last_mode": state.get("last_mode"),
+        "last_funding_rate": state.get("last_funding_rate", 0.0),
+        "last_basis_usd": state.get("last_basis_usd", 0.0),
+        "last_spot_price": state.get("last_spot_price", 0.0),
+        "last_perp_price": state.get("last_perp_price", 0.0),
+        "simulated_equity": state.get("simulated_equity", 0.0),
+        "simulated_position": state.get("simulated_position", {}),
+        "funding_samples": samples,
+        "funding_samples_ts": samples_ts,
+        "funding_samples_total": len(state.get("funding_samples", []) or []),
+        "last_reconcile_ok": state.get("last_reconcile_ok", True),
+        "last_reconcile_errors": state.get("last_reconcile_errors", []),
+    }
+
+
+def _read_carry_trades(instance: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Most-recent JSONL entries from `trades.log`, newest-first."""
+    inst_dir = _carry_instance_dir(instance)
+    trades_path = inst_dir / "trades.log"
+    # Reuse the global JSONL reader (cached, max_lines = limit), then reverse
+    # so the dashboard's "most recent first" rendering doesn't need to flip.
+    limit = max(1, min(int(limit or 50), 500))
+    rows = _read_jsonl_file(trades_path, max_lines=limit)
+    return list(reversed(rows))
+
+
+# ---------------------------------------------------------------------------
 # Service control (start/stop Plan E runner)
 # ---------------------------------------------------------------------------
 
@@ -923,6 +1043,61 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     self._send_json({"error": "no baseline backtest available"}, 404)
                 else:
                     self._send_json(payload)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/carry/instances":
+            # List carry instances with a compact health summary each.
+            try:
+                self._send_json({"instances": _list_carry_instances()})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path.startswith("/api/carry/"):
+            # Per-instance endpoints: /api/carry/<instance>/{health,state,trades}
+            try:
+                tail = path[len("/api/carry/"):]
+                parts = tail.split("/")
+                if len(parts) != 2:
+                    self._send_json({"error": "not found"}, 404)
+                    return
+                instance, resource = parts[0], parts[1]
+                _validate_carry_instance(instance)
+                inst_dir = CARRY_STATE_DIR / instance
+
+                if resource == "health":
+                    health_path = inst_dir / "health.json"
+                    if not health_path.exists():
+                        self._send_json({"error": "health.json not found"}, 404)
+                        return
+                    payload = _read_json_file(health_path, None)
+                    if payload is None:
+                        self._send_json({"error": "health.json not readable"}, 404)
+                    else:
+                        self._send_json(payload)
+                elif resource == "state":
+                    state_path = inst_dir / "state.json"
+                    if not state_path.exists():
+                        self._send_json({"error": "state.json not found"}, 404)
+                        return
+                    self._send_json(_read_carry_state_summary(instance))
+                elif resource == "trades":
+                    try:
+                        limit = int(q.get("limit", "50"))
+                    except (TypeError, ValueError):
+                        limit = 50
+                    trades_path = inst_dir / "trades.log"
+                    if not trades_path.exists():
+                        self._send_json({"error": "trades.log not found"}, 404)
+                        return
+                    self._send_json({
+                        "instance": instance,
+                        "trades": _read_carry_trades(instance, limit=limit),
+                    })
+                else:
+                    self._send_json({"error": "unknown carry resource"}, 404)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 

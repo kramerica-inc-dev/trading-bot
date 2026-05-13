@@ -164,6 +164,7 @@
   <button class="tab" data-tab="logs">Logs</button>
   <button class="tab" data-tab="compare">Compare</button>
   <button class="tab" data-tab="backtest">Backtest</button>
+  <button class="tab" data-tab="carry">OKX Carry</button>
 </div>
 
 <div class="content">
@@ -370,6 +371,114 @@
       </div>
       <div id="bt-conditional" style="margin-top:8px;overflow-x:auto"></div>
     </div>
+  </div>
+
+  <!-- ═══ OKX CARRY ═══ -->
+  <div class="tab-content" id="tab-carry">
+    <!-- Top status banner -->
+    <div id="cy-status-banner" style="display:flex;align-items:center;gap:14px;padding:10px 14px;margin-bottom:10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-family:var(--font);font-size:12px">
+      <span style="color:var(--text-dim)">Instance</span>
+      <select id="cyInstanceSelect" onchange="switchCarryInstance(this.value)"
+        style="background:var(--surface-alt);color:var(--text);border:1px solid var(--border);
+               padding:3px 8px;border-radius:4px;font-family:var(--font);font-size:11px">
+        <option value="btc">btc</option>
+      </select>
+      <span id="cy-mode-pill" class="pill pill-dim">— MODE</span>
+      <span id="cy-service-state" style="display:inline-flex;align-items:center;gap:6px;color:var(--text-muted)">
+        <span id="cy-service-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-dim)"></span>
+        <span id="cy-service-text">—</span>
+      </span>
+      <span id="cy-halt-pill" style="display:none" class="pill pill-red">HALTED</span>
+      <span id="cy-creds-pill" style="display:none" class="pill pill-amber">NO CREDS</span>
+      <span style="flex:1"></span>
+      <span style="color:var(--text-dim)">Last cycle</span>
+      <span id="cy-last-cycle" style="color:var(--text);font-weight:600">—</span>
+      <span style="color:var(--text-dim)">·</span>
+      <span style="color:var(--text-dim)">Cycles</span>
+      <span id="cy-cycles-total" style="color:var(--text)">0</span>
+    </div>
+
+    <!-- Auth-error banner (only shown when account.raw_balance.msg contains "API key") -->
+    <div id="cy-auth-banner" style="display:none;align-items:center;gap:10px;padding:10px 14px;margin-bottom:10px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:6px;font-family:var(--font);font-size:12px;color:var(--amber)">
+      <span style="font-size:14px">⚠</span>
+      <span><strong style="color:var(--amber)">OKX API auth error</strong> — <span id="cy-auth-msg">authentication failure</span>. The runner keeps cycling on market data only; orders & balance queries fail. See <code>docs/CARRY-OPS.md</code> for re-provisioning steps.</span>
+    </div>
+
+    <!-- Halt banner -->
+    <div id="cy-halt-banner" style="display:none;align-items:center;gap:10px;padding:10px 14px;margin-bottom:10px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:var(--font);font-size:12px;color:var(--red)">
+      <span style="font-size:14px">⛔</span>
+      <span><strong style="color:var(--red)">RUNNER HALTED</strong> — <span id="cy-halt-msg">reason unknown</span>. Clear the halt sentinel or restart the service after investigating.</span>
+    </div>
+
+    <!-- Cards row: Gate state + Current cycle + Position -->
+    <div class="grid grid-3" style="margin-bottom:12px">
+      <div class="card" id="cy-gate-card">
+        <div class="label">Green-button gate</div>
+        <div class="big-number" id="cy-gate-state">—</div>
+        <div id="cy-gate-detail" style="font-size:11px;color:var(--text-dim);font-family:var(--font);margin-top:2px">—</div>
+        <!-- mini bar: trailing annualised vs threshold (0..2× threshold scaled) -->
+        <div style="margin-top:10px;height:6px;background:var(--surface-alt);border-radius:3px;position:relative;overflow:hidden">
+          <div id="cy-gate-fill" style="position:absolute;left:0;top:0;height:100%;width:0;background:var(--text-dim);transition:width 0.3s,background 0.3s"></div>
+          <div id="cy-gate-threshold" style="position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--amber);left:50%"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text-dim);margin-top:4px;font-family:var(--font)">
+          <span>0%</span><span id="cy-gate-thr-label">threshold</span><span id="cy-gate-max-label">2× thr</span>
+        </div>
+        <div id="cy-gate-samples" style="font-size:10px;color:var(--text-dim);font-family:var(--font);margin-top:6px">— samples</div>
+      </div>
+
+      <div class="card">
+        <div class="label">Current cycle</div>
+        <table style="width:100%;margin-top:4px">
+          <tbody id="cy-cycle-body">
+            <tr><td colspan="2" style="color:var(--text-dim);padding:8px 0">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" id="cy-position-card">
+        <div class="label">Position</div>
+        <div class="big-number" id="cy-position-state">—</div>
+        <div id="cy-position-sub" style="font-size:11px;color:var(--text-dim);font-family:var(--font);margin-top:2px">—</div>
+        <div id="cy-position-detail" style="margin-top:8px;font-family:var(--font);font-size:11px"></div>
+      </div>
+    </div>
+
+    <!-- Trailing funding chart -->
+    <div class="card" style="margin-bottom:12px">
+      <div class="label">Funding rate (annualised) — trailing
+        <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — orange line = +5%/yr gate threshold</span>
+      </div>
+      <svg id="cy-funding-chart" viewBox="0 0 1200 280" preserveAspectRatio="none"
+           style="width:100%;height:280px;margin-top:8px;background:var(--surface-alt);border-radius:4px"></svg>
+      <div id="cy-funding-legend" style="margin-top:6px;font-family:var(--font);font-size:11px;color:var(--text-dim)">—</div>
+    </div>
+
+    <!-- Recent actions + Risk indicators -->
+    <div class="grid grid-2-1" style="margin-bottom:12px">
+      <div class="card">
+        <div class="label">Recent cycles
+          <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — newest first</span>
+          <select id="cy-action-filter" onchange="renderCarryRecent()"
+            style="float:right;background:var(--surface-alt);color:var(--text);border:1px solid var(--border);
+                   padding:2px 6px;border-radius:3px;font-family:var(--font);font-size:10px">
+            <option value="non-noop">non-noop only</option>
+            <option value="all">all</option>
+          </select>
+        </div>
+        <div id="cy-recent-actions" style="margin-top:6px"></div>
+      </div>
+      <div class="card">
+        <div class="label">Risk indicators</div>
+        <div id="cy-risk-body" style="margin-top:6px"></div>
+      </div>
+    </div>
+
+    <!-- Verbatim health.json (collapsible) -->
+    <details class="card" style="margin-bottom:12px">
+      <summary style="cursor:pointer;font-family:var(--font);font-size:11px;color:var(--text-muted);letter-spacing:0.04em;text-transform:uppercase">Raw health.json (debug)</summary>
+      <pre id="cy-raw-health" style="margin-top:8px;font-family:var(--font);font-size:11px;color:var(--text-muted);white-space:pre-wrap;word-break:break-word">—</pre>
+    </details>
   </div>
 
 </div><!-- end .content -->
@@ -1154,14 +1263,439 @@ function renderBacktest(d) {
     `<span style="color:var(--text-dim)">bull/bear/sideways: ${rc.bull||0}/${rc.bear||0}/${rc.sideways||0} bars</span>`;
 }
 
+// ═══ OKX Carry tab ═══
+let _carryInstance = localStorage.getItem('carry-instance') || 'btc';
+let _carryInstances = [];
+let _carryLastHealth = null;
+let _carryLastState = null;
+let _carryLastTrades = [];
+
+function switchCarryInstance(name) {
+  _carryInstance = name;
+  localStorage.setItem('carry-instance', name);
+  fetchCarry();
+}
+
+function carryEmpty(msg) {
+  // Mark the tab as unavailable — used when API endpoints 404 (e.g. mid-deploy).
+  document.getElementById('cy-mode-pill').textContent = 'UNAVAILABLE';
+  document.getElementById('cy-mode-pill').className = 'pill pill-dim';
+  document.getElementById('cy-service-text').textContent = msg || 'OKX Carry data unavailable';
+  document.getElementById('cy-service-dot').style.background = 'var(--text-dim)';
+  document.getElementById('cy-last-cycle').textContent = '—';
+  document.getElementById('cy-cycles-total').textContent = '0';
+  document.getElementById('cy-cycle-body').innerHTML =
+    '<tr><td colspan="2" style="color:var(--text-dim);padding:8px 0">' + (msg || 'No data') + '</td></tr>';
+  document.getElementById('cy-position-state').textContent = '—';
+  document.getElementById('cy-position-sub').textContent = '';
+  document.getElementById('cy-position-detail').innerHTML = '';
+  document.getElementById('cy-gate-state').textContent = '—';
+  document.getElementById('cy-gate-detail').textContent = '';
+  document.getElementById('cy-gate-samples').textContent = '';
+  document.getElementById('cy-gate-fill').style.width = '0';
+  document.getElementById('cy-recent-actions').innerHTML =
+    '<div style="color:var(--text-dim);font-size:11px;font-family:var(--font);padding:12px 4px">No data</div>';
+  document.getElementById('cy-risk-body').innerHTML = '';
+  document.getElementById('cy-funding-chart').innerHTML =
+    '<text x="600" y="140" fill="#64748b" text-anchor="middle" font-family="monospace" font-size="12">' +
+    (msg || 'No data') + '</text>';
+  document.getElementById('cy-funding-legend').textContent = '';
+  document.getElementById('cy-raw-health').textContent = '—';
+  // Hide banners
+  document.getElementById('cy-auth-banner').style.display = 'none';
+  document.getElementById('cy-halt-banner').style.display = 'none';
+  document.getElementById('cy-halt-pill').style.display = 'none';
+  document.getElementById('cy-creds-pill').style.display = 'none';
+}
+
+function relTime(iso) {
+  if (!iso) return '—';
+  try {
+    const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (diff < 0) return 'in future';
+    if (diff < 60) return Math.floor(diff) + 's ago';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + 'h ' + Math.floor((diff % 3600) / 60) + 'm ago';
+    return Math.floor(diff / 86400) + 'd ago';
+  } catch (e) { return iso; }
+}
+
+async function loadCarryInstances() {
+  try {
+    const r = await fetch('/api/carry/instances');
+    if (!r.ok) return; // 404 mid-deploy — keep current default
+    const d = await r.json();
+    _carryInstances = (d.instances || []).map(x => x.instance);
+    const sel = document.getElementById('cyInstanceSelect');
+    if (sel && _carryInstances.length) {
+      // Preserve current selection if still present, else fall back to first.
+      if (!_carryInstances.includes(_carryInstance)) {
+        _carryInstance = _carryInstances[0];
+      }
+      sel.innerHTML = _carryInstances.map(i =>
+        `<option value="${i}"${i===_carryInstance?' selected':''}>${i}</option>`
+      ).join('');
+    }
+  } catch (e) { /* keep current */ }
+}
+
+async function fetchCarry() {
+  // Parallel fetch — health drives top banner; state drives gate+samples;
+  // trades drives the recent-actions list.
+  let healthOk = false, stateOk = false, tradesOk = false;
+  try {
+    const [hR, sR, tR] = await Promise.all([
+      fetch('/api/carry/' + encodeURIComponent(_carryInstance) + '/health'),
+      fetch('/api/carry/' + encodeURIComponent(_carryInstance) + '/state'),
+      fetch('/api/carry/' + encodeURIComponent(_carryInstance) + '/trades?limit=50'),
+    ]);
+    if (hR.ok) { _carryLastHealth = await hR.json(); healthOk = true; }
+    if (sR.ok) { _carryLastState = await sR.json(); stateOk = true; }
+    if (tR.ok) { const td = await tR.json(); _carryLastTrades = td.trades || []; tradesOk = true; }
+  } catch (e) { /* network */ }
+
+  if (!healthOk && !stateOk && !tradesOk) {
+    carryEmpty('OKX Carry data unavailable — API endpoints not reachable (deploy in progress?)');
+    return;
+  }
+  renderCarry();
+}
+
+function renderCarry() {
+  const h = _carryLastHealth || {};
+  const st = _carryLastState || {};
+  const trades = _carryLastTrades || [];
+
+  // ── Top banner: mode pill + service freshness + halt + creds ──
+  const modePill = document.getElementById('cy-mode-pill');
+  const mode = h.mode || st.last_mode || '—';
+  modePill.textContent = mode;
+  modePill.className = 'pill ' + (
+    mode === 'DRY_RUN' ? 'pill-dim'
+    : mode === 'P2_DEMO' ? 'pill-accent'
+    : mode === 'P3_LIVE' ? 'pill-red'
+    : 'pill-dim');
+
+  const lastTs = h.last_cycle_ts || st.last_cycle_ts;
+  const staleSec = lastTs ? (Date.now() - new Date(lastTs).getTime()) / 1000 : Infinity;
+  const isStale = staleSec > 300; // >5min => STALE
+  const dot = document.getElementById('cy-service-dot');
+  const txt = document.getElementById('cy-service-text');
+  if (!lastTs) {
+    dot.style.background = 'var(--text-dim)';
+    txt.textContent = 'no cycles yet';
+    txt.style.color = 'var(--text-dim)';
+  } else if (isStale) {
+    dot.style.background = 'var(--red)';
+    txt.textContent = 'STALE (' + relTime(lastTs) + ')';
+    txt.style.color = 'var(--red)';
+  } else {
+    dot.style.background = 'var(--green)';
+    txt.textContent = 'active';
+    txt.style.color = 'var(--green)';
+  }
+
+  document.getElementById('cy-last-cycle').textContent = lastTs ? relTime(lastTs) : '—';
+  document.getElementById('cy-cycles-total').textContent = (h.cycles_total != null ? h.cycles_total : (st.cycles_total || 0));
+
+  // Halt pill + banner
+  const haltPill = document.getElementById('cy-halt-pill');
+  const haltBanner = document.getElementById('cy-halt-banner');
+  if (h.halted || st.halted) {
+    haltPill.style.display = 'inline-flex';
+    haltBanner.style.display = 'flex';
+    document.getElementById('cy-halt-msg').textContent = h.halt_reason || st.halt_reason || 'unknown';
+  } else {
+    haltPill.style.display = 'none';
+    haltBanner.style.display = 'none';
+  }
+
+  // Creds pill
+  const credsPill = document.getElementById('cy-creds-pill');
+  if (h.have_private_creds === false) {
+    credsPill.style.display = 'inline-flex';
+  } else {
+    credsPill.style.display = 'none';
+  }
+
+  // ── Auth-error banner (driven by latest trade's account.raw_balance.msg) ──
+  const authBanner = document.getElementById('cy-auth-banner');
+  let authMsg = null;
+  const latestTrade = trades[0] || null;
+  if (latestTrade && latestTrade.account && latestTrade.account.raw_balance) {
+    const rb = latestTrade.account.raw_balance;
+    const msg = (rb && typeof rb === 'object') ? (rb.msg || '') : '';
+    if (rb && rb.code && rb.code !== '0' && rb.code !== 0 && typeof msg === 'string' && msg.toLowerCase().indexOf('api key') !== -1) {
+      authMsg = msg;
+    }
+  }
+  if (authMsg) {
+    authBanner.style.display = 'flex';
+    document.getElementById('cy-auth-msg').textContent = authMsg;
+  } else {
+    authBanner.style.display = 'none';
+  }
+
+  // ── Gate card ──
+  // Prefer the latest trade's gate block (richest) — falls back to state.
+  const tg = latestTrade && latestTrade.gate ? latestTrade.gate : null;
+  const trailing = tg ? tg.trailing_annualised : null;
+  const threshold = tg ? tg.threshold : 0.05;
+  const samples = tg ? tg.samples : (st.funding_samples || []).length;
+  const gateOn = tg ? !!tg.on : false;
+  const gateState = document.getElementById('cy-gate-state');
+  if (tg) {
+    gateState.textContent = gateOn ? 'ON' : 'OFF';
+    gateState.style.color = gateOn ? 'var(--green)' : 'var(--red)';
+  } else {
+    gateState.textContent = '—';
+    gateState.style.color = 'var(--text-dim)';
+  }
+  const gd = document.getElementById('cy-gate-detail');
+  if (trailing != null && threshold != null) {
+    const trPct = (trailing * 100).toFixed(2);
+    const thrPct = (threshold * 100).toFixed(2);
+    gd.textContent = trPct + '% / +' + thrPct + '% threshold' + (tg && tg.reason ? ' · ' + tg.reason : '');
+  } else {
+    gd.textContent = '—';
+  }
+  // Bar fill: scale trailing into [0..2×threshold]
+  const fill = document.getElementById('cy-gate-fill');
+  if (trailing != null && threshold > 0) {
+    const ratio = Math.max(0, Math.min(1, trailing / (2 * threshold)));
+    fill.style.width = (ratio * 100) + '%';
+    fill.style.background = gateOn ? 'var(--green)' : (trailing > 0 ? 'var(--amber)' : 'var(--red)');
+  } else {
+    fill.style.width = '0';
+  }
+  document.getElementById('cy-gate-thr-label').textContent =
+    threshold != null ? '+' + (threshold * 100).toFixed(1) + '%' : 'threshold';
+  document.getElementById('cy-gate-max-label').textContent =
+    threshold != null ? '+' + (threshold * 200).toFixed(1) + '%' : '2× thr';
+  document.getElementById('cy-gate-samples').textContent =
+    samples + ' samples in trailing window';
+
+  // ── Current cycle table ──
+  const cb = document.getElementById('cy-cycle-body');
+  if (!latestTrade) {
+    cb.innerHTML = '<tr><td colspan="2" style="color:var(--text-dim);padding:8px 0">No cycles logged yet</td></tr>';
+  } else {
+    const basisUsd = latestTrade.basis_usd;
+    const basisFrac = latestTrade.basis_frac;
+    const fund8h = latestTrade.funding_rate_8h;
+    const fundAnn = latestTrade.funding_rate_annualised;
+    cb.innerHTML =
+      cyRow('Last cycle', (latestTrade.ts ? relTime(latestTrade.ts) : '—')) +
+      cyRow('Spot price', latestTrade.spot_price != null ? '$' + fmt(latestTrade.spot_price, 2) : '—') +
+      cyRow('Perp price', latestTrade.perp_price != null ? '$' + fmt(latestTrade.perp_price, 2) : '—') +
+      cyRow('Basis', (basisUsd != null ? fmtSignedUsd(basisUsd) : '—') +
+        (basisFrac != null ? ' (' + (basisFrac * 100).toFixed(3) + '%)' : '')) +
+      cyRow('Funding 8h', fund8h != null ? (fund8h * 10000).toFixed(3) + ' bps' : '—') +
+      cyRow('Funding annualised', fundAnn != null ? (fundAnn * 100).toFixed(3) + '%' : '—',
+        (fundAnn || 0) >= (threshold || 0.05) ? 'var(--green)' : 'var(--text)');
+  }
+
+  // ── Position card ──
+  const pos = h.simulated_position || st.simulated_position || {};
+  const spotQ = pos.spot_qty || 0;
+  const perpQ = pos.perp_qty || 0;
+  const psEl = document.getElementById('cy-position-state');
+  const subEl = document.getElementById('cy-position-sub');
+  const detEl = document.getElementById('cy-position-detail');
+  if (Math.abs(spotQ) < 1e-9 && Math.abs(perpQ) < 1e-9) {
+    psEl.textContent = 'FLAT';
+    psEl.style.color = 'var(--text-dim)';
+    subEl.textContent = 'No open carry pair';
+    detEl.innerHTML = '';
+  } else {
+    psEl.textContent = '+' + spotQ.toFixed(6) + ' BTC';
+    psEl.style.color = 'var(--green)';
+    subEl.textContent = perpQ.toFixed(6) + ' BTC perp (short)';
+    // Realized + unrealized P&L (best-effort from state + latest cycle prices).
+    const entrySpot = pos.entry_spot_price || 0;
+    const entryPerp = pos.entry_perp_price || 0;
+    const lastSpot = (latestTrade && latestTrade.spot_price) || st.last_spot_price || 0;
+    const lastPerp = (latestTrade && latestTrade.perp_price) || st.last_perp_price || 0;
+    const upnlSpot = entrySpot > 0 ? spotQ * (lastSpot - entrySpot) : 0;
+    const upnlPerp = entryPerp > 0 ? perpQ * (lastPerp - entryPerp) : 0; // perpQ<0 → short, sign cancels
+    const upnlTotal = upnlSpot + upnlPerp;
+    let d = '';
+    d += configRow('Entry spot', '$' + fmt(entrySpot, 2));
+    d += configRow('Entry perp', '$' + fmt(entryPerp, 2));
+    d += configRow('Unrealized P&L', fmtSignedUsd(upnlTotal),
+      upnlTotal >= 0 ? 'var(--green)' : 'var(--red)');
+    d += configRow('Funding accrued', fmtSignedUsd(pos.funding_accrued || 0),
+      (pos.funding_accrued || 0) >= 0 ? 'var(--green)' : 'var(--red)');
+    d += configRow('Fees paid', fmtUsd(pos.fees_paid || 0), 'var(--amber)');
+    if (pos.opened_ts) d += configRow('Opened', relTime(pos.opened_ts));
+    detEl.innerHTML = d;
+  }
+
+  // ── Funding chart (trailing per-cycle annualised from trade log) ──
+  renderCarryFundingChart(trades, threshold);
+
+  // ── Recent actions list ──
+  renderCarryRecent();
+
+  // ── Risk indicators ──
+  const rb = document.getElementById('cy-risk-body');
+  const basisKillPct = 0.01; // hard-coded default from cfg; runner clamps via config
+  let basisFracNow = latestTrade ? latestTrade.basis_frac : null;
+  let basisColor = 'var(--green)';
+  if (basisFracNow != null) {
+    if (basisFracNow >= basisKillPct) basisColor = 'var(--red)';
+    else if (basisFracNow >= basisKillPct * 0.5) basisColor = 'var(--amber)';
+  }
+  let rh = '';
+  rh += configRow('Basis vs kill threshold',
+    basisFracNow != null
+      ? (basisFracNow * 100).toFixed(3) + '% / ' + (basisKillPct * 100).toFixed(2) + '%'
+      : '—',
+    basisColor);
+  const reconOk = h.reconcile_ok != null ? h.reconcile_ok : st.last_reconcile_ok;
+  rh += configRow('Reconcile', reconOk ? 'OK' : 'FAIL',
+    reconOk ? 'var(--green)' : 'var(--red)');
+  rh += configRow('Reconcile errors', h.reconcile_errors_count != null ? h.reconcile_errors_count : (st.last_reconcile_errors || []).length);
+  rh += configRow('Legging aborts (total)', h.legging_aborts_total != null ? h.legging_aborts_total : (st.legging_aborts_total || 0),
+    (h.legging_aborts_total || 0) > 0 ? 'var(--red)' : 'var(--text)');
+  const lc = latestTrade && latestTrade.leverage_check ? latestTrade.leverage_check : null;
+  if (lc) {
+    rh += configRow('Leverage check', lc.ok ? 'OK' : 'MISMATCH',
+      lc.ok ? 'var(--green)' : 'var(--red)');
+    if (lc.effective_max != null) {
+      rh += configRow('Effective max', lc.effective_max + '×');
+    }
+  } else {
+    rh += configRow('Leverage check', '—');
+  }
+  rb.innerHTML = rh;
+
+  // ── Raw health.json (debug pane) ──
+  document.getElementById('cy-raw-health').textContent =
+    JSON.stringify(h, null, 2);
+}
+
+function cyRow(k, v, color) {
+  return '<tr><td style="color:var(--text-dim);padding:4px 0">' + k + '</td>' +
+         '<td style="text-align:right;color:' + (color || 'var(--text)') + ';font-weight:600;padding:4px 0">' + v + '</td></tr>';
+}
+
+function renderCarryRecent() {
+  const filterEl = document.getElementById('cy-action-filter');
+  const filter = filterEl ? filterEl.value : 'non-noop';
+  const el = document.getElementById('cy-recent-actions');
+  let rows = (_carryLastTrades || []).slice();
+  if (filter === 'non-noop') {
+    rows = rows.filter(r => r.action && r.action.kind && r.action.kind !== 'noop' && r.action.kind !== 'skip');
+  }
+  if (!rows.length) {
+    const gateOn = _carryLastTrades[0] && _carryLastTrades[0].gate && _carryLastTrades[0].gate.on;
+    el.innerHTML = '<div style="color:var(--text-dim);font-size:11px;font-family:var(--font);padding:12px 4px">' +
+      (filter === 'non-noop' && !gateOn ? 'No actions yet — gate is OFF' : 'No entries match the current filter') +
+      '</div>';
+    return;
+  }
+  let h = '<table style="width:100%"><thead><tr>' +
+    '<th>Time</th><th>Action</th><th>Reason</th><th>Result</th>' +
+    '</tr></thead><tbody>';
+  rows.slice(0, 15).forEach(r => {
+    const ts = r.ts ? relTime(r.ts) : '—';
+    const a = r.action || {};
+    const kind = a.kind || '—';
+    const kindColor =
+      kind === 'noop' ? 'var(--text-dim)' :
+      kind.indexOf('open') !== -1 ? 'var(--green)' :
+      kind.indexOf('unwind') !== -1 || kind.indexOf('flatten') !== -1 ? 'var(--amber)' :
+      kind === 'skip' ? 'var(--text-dim)' :
+      kind === 'startup_halt' ? 'var(--red)' : 'var(--accent)';
+    let resTxt = '—';
+    const or = r.order_result;
+    if (or) {
+      resTxt = or.ok ? '<span style="color:var(--green)">ok</span>' :
+        '<span style="color:var(--red)">' + (or.reason || 'fail') + '</span>';
+    }
+    h += '<tr>' +
+      '<td style="color:var(--text-muted)">' + ts + '</td>' +
+      '<td style="color:' + kindColor + ';font-weight:600">' + kind + '</td>' +
+      '<td style="color:var(--text-muted);font-size:10px">' + (a.reason || '—') + '</td>' +
+      '<td>' + resTxt + '</td>' +
+      '</tr>';
+  });
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+function renderCarryFundingChart(trades, threshold) {
+  const svg = document.getElementById('cy-funding-chart');
+  const legend = document.getElementById('cy-funding-legend');
+  // Points = (ts, annualised) from each trade-log entry. Skip nulls.
+  // Trade log is newest-first → reverse for chronological order.
+  const ordered = (trades || []).slice().reverse();
+  const pts = ordered
+    .map(t => ({ t: t.ts ? new Date(t.ts).getTime() / 1000 : null, v: t.funding_rate_annualised }))
+    .filter(p => isFinite(p.t) && typeof p.v === 'number');
+  if (!pts.length) {
+    svg.innerHTML = '<text x="600" y="140" fill="#64748b" text-anchor="middle" font-family="monospace" font-size="12">No funding history yet — first cycles building the window…</text>';
+    legend.textContent = '';
+    return;
+  }
+  // Downsample if >500 points (defensive — server already caps at 50 trades).
+  let sampled = pts;
+  if (pts.length > 500) {
+    const step = Math.ceil(pts.length / 500);
+    sampled = pts.filter((_, i) => i % step === 0);
+  }
+  const W = 1200, H = 280, padL = 48, padR = 10, padT = 10, padB = 24;
+  let tMin = Infinity, tMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+  for (const p of sampled) {
+    if (p.t < tMin) tMin = p.t;
+    if (p.t > tMax) tMax = p.t;
+    if (p.v < yMin) yMin = p.v;
+    if (p.v > yMax) yMax = p.v;
+  }
+  if (threshold != null) {
+    if (threshold < yMin) yMin = threshold;
+    if (threshold > yMax) yMax = threshold;
+  }
+  if (tMax === tMin) tMax = tMin + 1;
+  const yRange = Math.max(yMax - yMin, 0.001);
+  const yPad = yRange * 0.1;
+  yMin -= yPad; yMax += yPad;
+  const sx = t => padL + ((t - tMin) / (tMax - tMin)) * (W - padL - padR);
+  const sy = v => padT + (1 - (v - yMin) / (yMax - yMin)) * (H - padT - padB);
+
+  let grid = '';
+  for (let i = 0; i <= 4; i++) {
+    const v = yMin + (yMax - yMin) * i / 4;
+    const y = sy(v);
+    grid += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#1e2a3a" stroke-width="1"/>` +
+      `<text x="${padL - 6}" y="${y + 3}" fill="#64748b" text-anchor="end" font-family="monospace" font-size="10">${(v * 100).toFixed(2)}%</text>`;
+  }
+  let thrLine = '';
+  if (threshold != null) {
+    const ty = sy(threshold);
+    thrLine = `<line x1="${padL}" y1="${ty}" x2="${W - padR}" y2="${ty}" stroke="#f59e0b" stroke-dasharray="4,3" stroke-width="1.5"/>` +
+      `<text x="${W - padR - 4}" y="${ty - 4}" fill="#f59e0b" text-anchor="end" font-family="monospace" font-size="10">+${(threshold * 100).toFixed(2)}% gate</text>`;
+  }
+  const d = sampled.map((p, i) => (i === 0 ? 'M' : 'L') + sx(p.t).toFixed(1) + ' ' + sy(p.v).toFixed(1)).join(' ');
+  const line = `<path d="${d}" stroke="#22d3ee" stroke-width="1.5" fill="none"/>`;
+  svg.innerHTML = grid + thrLine + line;
+  const last = sampled[sampled.length - 1];
+  legend.textContent = sampled.length + ' cycles · latest ' + (last.v * 100).toFixed(3) + '%';
+}
+
 loadInstances();
 fetchPlanE();
 fetchCompare();
 fetchBacktest();
+loadCarryInstances();
+fetchCarry();
 setInterval(fetchPlanE, REFRESH_MS);
 setInterval(fetchCompare, REFRESH_MS * 3);
 setInterval(fetchBacktest, REFRESH_MS * 12);
 setInterval(loadInstances, REFRESH_MS * 6);
+setInterval(loadCarryInstances, REFRESH_MS * 6);
+setInterval(fetchCarry, REFRESH_MS * 2);  // ~10s
 setInterval(() => {
   const el = document.getElementById('pe-countdown');
   if (el && _nextRebalanceIso) el.textContent = countdownText(_nextRebalanceIso);
