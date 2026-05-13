@@ -107,3 +107,18 @@ pause before C and re-examine assumptions.
 **Why this matters.** Three directional-signal strategies have failed identically. The next move must be a structurally different bet (carry/arb), not a fourth attempt at timing price. Recorded so effort doesn't drift back.
 
 ---
+## 2026-05-13 — Build the carry now, on OKX EU; decouple from Plan E's paper-PASS gate
+
+**Context.** The 2026-05-12 carry scoping (`docs/STRATEGY-CARRY.md`, `backtest/carry_backtest.py`) concluded GO-conditional: structural ~+10.5%/yr gross funding-premium harvest with ~1.6% max-DD, Calmar ~6.7 — the first thing in the project to clear the bar. Blocker: neither the BloFin nor the OKX adapter in this repo can place SPOT orders (both perp/swap-only — Plan E has only ever traded perps); a spot order/balance leg is net-new (modest) integration work. OKX EU is the better carry venue (unified-margin → spot BTC collateralizes the perp short → ~9%/yr effective book yield vs ~6.3% on BloFin's siloed margin, a ~50% improvement) but OKX EU enablement has been on hold per the 2026-05 memory rule that bundled OKX EU + maker-execution + reconciliation together as "after Plan E paper-PASS."
+
+**Decision.**
+1. **Build the carry strategy now on OKX EU, in unified-margin mode**, even though current trailing-90d funding is compressed (2026 YTD ≈ −0.9%). Rationale: the integration work is real (a few days) and we want it ready when funding normalises, not chasing it; the carry is delta-neutral so building "early" has near-zero risk; and the carry is the first strategy with a structural rather than statistical edge.
+2. **Unblock OKX EU specifically for the carry** — this *decouples* OKX EU enablement from Plan E's paper-PASS gate. The Plan E live-executor + maker-execution + reconciliation bundle stays on its own gate (still gated on Plan E paper beating BH on Calmar OOS). What changes: OKX EU credentials/adapter can now sign and route for the carry runner without waiting for Plan E. The two strategies stay logically separate (different services, different state directories).
+3. **Phased build**, paper/dry-run first per the P1 policy. P1 = extend `scripts/okx_adapter.py` / `scripts/okx_api.py` for spot orders + balance + unified-margin awareness, plus a dry-run carry runner that computes target positions and *simulates* leg placement; verify against the historical-backtest numbers. P2 = paper/demo-account trading on OKX. P3 = live on OKX EU with a tiny notional ($500–$1000), monitor real fills/funding/margin for 2+ weeks. P4 = scale to $5k. A go-live "green-button" rule: trailing-90d funding > +5%/yr (else the build sits ready but no money deployed — the strategy is "always on when funding is on", not "always on regardless").
+4. **Risk controls (binding before any P3):** the perp-short leg runs at low effective leverage (book-vs-notional ≤ 2×) with a fat margin buffer + auto-top-up; a basis-blowout kill-switch (flatten if spot−perp basis exceeds N×rolling-stdev); a margin-utilisation alarm; one venue only (OKX EU, no two-venue legging); legging window < 5s with leg-1-flatten on leg-2-failure. Detail in `docs/STRATEGY-CARRY.md`.
+
+**What this does NOT change.** Plan E keeps running on BloFin as paper with its own go/no-go. The 'advanced' / Plan-D deprecation stands. The v1 trend-overlay parking stands. The price-derived directional-signal lane stays closed.
+
+**Review condition.** Revisit point 1/2 if OKX EU integration turns out to be substantially harder than estimated (≥1 week of work) or if a regulatory/account issue blocks spot trading on OKX EU. Revisit the green-button funding threshold (+5%/yr trailing-90d) after a quarter of live data — it's a starting heuristic, not a tuned parameter.
+
+---
