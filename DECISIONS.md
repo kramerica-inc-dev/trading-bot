@@ -122,3 +122,25 @@ pause before C and re-examine assumptions.
 **Review condition.** Revisit point 1/2 if OKX EU integration turns out to be substantially harder than estimated (≥1 week of work) or if a regulatory/account issue blocks spot trading on OKX EU. Revisit the green-button funding threshold (+5%/yr trailing-90d) after a quarter of live data — it's a starting heuristic, not a tuned parameter.
 
 ---
+## 2026-05-13 — OKX EU retail is acctLv=1 capped; carry on OKX blocked, pivot needed
+
+**Context.** P2 was deployed on the LXC as `carry@btc.service` with the user's freshly-created OKX EU demo-tier API key. After fixing two real bugs (browser User-Agent on the adapter Session, `okx_base_url` set to `https://my.okx.com`), auth started working and live probes ran successfully (fees, leverage cap = 3× = MiCA retail cap). But the funding-on green-button kept firing `do_open` and every open kept failing — root cause: the demo account had `totalEq=0` (never funded) and `acctLv=1` (Simple mode = spot only, no perp).
+
+Probed the OKX EU API directly (with the working demo creds) to see what could be unblocked:
+- `POST /api/v5/account/set-account-level acctLv=2` → `"Operation not supported"` (code 3).
+- `POST /api/v5/account/set-account-level acctLv=3` → `"Operation not supported"` (code 3).
+- `POST /api/v5/asset/transfer` → `"Due to local laws and regulations, you cannot trade with your chosen crypto"` (code 50052).
+- `GET /api/v5/asset/deposit-address` → `"This feature is unavailable in demo trading"` (50038).
+- The UI itself has no "Account Mode" toggle and deposit/buy redirects are broken.
+
+**The picture: OKX EU retail (NL portal, KYC Lv2, user.region=EU) is locked to acctLv=1 (Simple / spot only) at the API level by what OKX calls "local laws and regulations" — i.e. MiCA / OKX EU's licensing constraints.** Lv≥2 is required for perpetual derivatives; spot-only cannot run a cash-and-carry (which needs the perp short leg). The current account cannot host the carry, in demo OR live.
+
+**Decision.**
+1. **Carry on OKX EU is blocked** for retail accounts in this jurisdiction at this time. `carry@btc.service` stopped on the LXC. The P1/P2 OKX adapter work (spot order surface, unified-margin awareness, EU base URL, UA fix) is kept — it's correct and reusable if OKX EU's retail rules change or if the user ever switches to a non-EU entity.
+2. **One short detour before pivoting**: try KYC Lv3 (Advanced verification — passport/ID + selfie, ~10–15 min) and re-test. ~30% chance it unlocks Lv2/3 because Lv3 KYC is sometimes a prerequisite; ~70% chance it doesn't because the restriction is regulatory, not KYC-tier. If the API still returns "Operation not supported" after Lv3 → carry on OKX EU is definitively dead.
+3. **Pivot to BloFin for the carry** if the OKX route doesn't open. BloFin has no MiCA blocker, spot + perp on one account, and the project already integrates BloFin (Plan E). The BloFin adapter is currently perp-only — needs the same spot-extension work that was done for OKX in P1 (place_spot_order / cancel / balance / instrument-meta). Estimated 1–2 dev days. Trade-off vs OKX unified-margin: BloFin has siloed margin → effective book yield ~6.3%/yr instead of ~9%/yr (already noted in `docs/STRATEGY-CARRY.md`). Strategy logic, risk controls, and `carry_runner.py` are exchange-agnostic — the only changes are the adapter and a `configs/carry-btc-blofin.json`.
+4. **Plan E unchanged.** OKX EU enablement for the live-executor bundle (per the prior `[[project_okx_live_executor_commit]]` gate) is now also questionable for the same regulatory reason; revisit only after KYC Lv3 result is in.
+
+**Review condition.** Revisit point 1 only if (a) MiCA/OKX-EU rules change, (b) the user moves to a non-EU entity, or (c) a concrete OKX API/docs change shows acctLv≥2 became available for EU retail. Revisit point 3 if BloFin discontinues or restricts spot trading at the user's KYC level.
+
+---
