@@ -1,0 +1,21 @@
+{
+  "instance_name": "btc",
+  "asset": "BTC-USDT",
+  "paper_only": true,
+  "allow_live": false,
+  "_live_comment": "P1 = paper only. Live deploy is a separate future phase once a spot venue is selected (Bitvavo / Kraken / Coinbase EU / OKX EU spot). The runner refuses to start if paper_only=false until a venue adapter is wired.",
+  "initial_equity_usd": 5000.0,
+  "vol_target_annualised": 0.20,
+  "vol_window_days": 30,
+  "leverage_cap": 1.0,
+  "no_trade_band_pct": 0.15,
+  "trailing_stop_pct": 0.10,
+  "reentry_n_days": 20,
+  "round_trip_cost_pct": 0.002,
+  "_cost_comment": "Total round-trip cost on the *traded notional delta* at each rebalance. 20bps = 10bps in + 10bps out — covers maker fee + small slippage on a spot venue at this size. Make this configurable so we can calibrate to the chosen venue once selected.",
+  "cycle_interval_sec": 3600,
+  "_cycle_comment": "Strategy is daily-decision; cycle is 1h so the dashboard stays fresh. Only one decision per UTC day — subsequent intra-day cycles just refresh price/equity.",
+  "price_source": "okx_spot_public",
+  "_price_source_options": "okx_spot_public | blofin_spot_public — both work, public market data, no auth needed",
+  "_fallback_doc": "Per DECISIONS.md 2026-05-13 this is the documented fallback (BH + drawdown stop + vol-target) — NOT a demonstrated edge. STRATEGY-V1-RESULTS.md §3 records that the underlying trend rule did NOT clear the random-entry null gate (84th-percentile Calmar, inside the 5–95 band). The rationale to run it anyway is the marginal risk-adjusted improvement vs B1 BH on the 3.3-year series + EU-executability on spot only."
+}
