@@ -67,6 +67,13 @@ class OkxAPI:
         # If both unset, default to global host.
         self.base_url = base_url or os.environ.get("OKX_API_BASE") or self.BASE_URL
         self.session = requests.Session()
+        # OKX sits behind Cloudflare; the default `python-requests/x.y` UA is
+        # blocked on many datacenter egress IPs (CF error 1010 -> HTTP 403).
+        # Use a browser-shaped UA so requests reach the upstream.
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        })
 
         # Rate limits on OKX vary per endpoint (5-60 req/2s). Keep
         # conservative aggregate similar to the BloFin client.
