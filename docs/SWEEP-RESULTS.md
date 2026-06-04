@@ -88,6 +88,41 @@ funding dispersion.
   venue-blocked carry. Cross-sectional perp-carry needs a beta hedge to work.
   Forward-collect OKX funding for a proper (non-3mo) assessment.
 
-**Net of wave 1b: the cross-sectional momentum lead (M4.5) remains the best
-candidate.** B6 (cross-venue basis) and B7 (VRP/options) need new venue/option
-data + infra — scoped as the next broadening, not run this wave.
+### B7 variance-risk-premium — STRUCTURAL-PASS / PASS-TAIL-RISK (the strongest premium)
+`backtest/deribit_dvol.py` (Deribit DVOL implied-vol index, 1899d 2021→2026) +
+`backtest/sweep/vrp.py`. Sell 30d implied vol (DVOL) vs realized vol of BTC
+daily, non-overlapping monthly, delta-hedged proxy. Over the OKX-overlap
+(2022-11 → 2026-06, 43 months):
+
+| cost (vol pts) | mean P&L/mo | t (p) | Sharpe | sub-periods + | verdict |
+|---|---|---|---|---|---|
+| 0 | +7.4 | 2.85 (0.007) | 1.51 | 3/3 | STRUCTURAL-PASS |
+| **2 (realistic)** | **+5.4** | **2.08 (0.043)** | **1.10** | **3/3** | **PASS-TAIL-RISK** |
+| 4 | +3.4 | 1.31 (0.20) | 0.69 | 2/3 | KILL |
+
+- **Raw VRP = +6.75 vol points** (IV systematically exceeds realized vol) — a
+  real, significant, sub-period-consistent **unconditional** premium (one of the
+  most robust in finance). Beats a random-sign-vol null at the 100th percentile.
+- **Tail is the catch:** worst month −48 vol points (~9× the mean monthly
+  harvest), CVaR-5% ≈ −35. Short vol blows up in spikes — **needs an explicit
+  tail-hedge (long wings) and/or small sizing** before live.
+- **Cost-sensitive:** dies above ~3 vol points round-trip → execution
+  (Deribit ATM spread + delta-hedge slippage) must stay tight.
+- **Caveats:** options execution on Deribit (offshore, same regulatory question
+  as other venues); the backtest is a vol-points model, not full option
+  replication — the +6.75 raw VRP is model-free, but tradable P&L depends on
+  delta-hedge frequency / option selection not fully modelled.
+- Note: the timing-shuffle sham is category-inappropriate for an *unconditional*
+  level premium (it would always retain the premium); the correct control here
+  is sub-period consistency (3/3) + the random-sign null + the tail gate.
+
+## Two real candidates after broadening
+1. **Cross-sectional momentum** (perp long-short, OKX): modest, OOS-survives
+   (M4.5), simple execution, market-neutral. Sharpe ~0.6–1.0, 2/4 walk-forward.
+2. **VRP short-vol** (options, Deribit): stronger + significant + consistent
+   (Sharpe ~1.1, p=0.04, 3/3 sub-periods), but tail-exposed, cost-tight, and
+   harder to execute (options + delta-hedge + tail-hedge + offshore venue).
+
+B6 (cross-venue basis) remains low-value on daily data (needs intraday
+multi-venue feeds) and is not pursued. Funding-carry (B3) is venue-blocked for
+clean harvest. So the live shortlist is **momentum and/or VRP**.
