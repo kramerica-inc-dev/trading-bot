@@ -27,10 +27,12 @@ import argparse
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import eth_account
+import numpy as np
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
@@ -89,6 +91,26 @@ class HLAdapter:
 
     def all_mids(self) -> Dict[str, float]:
         return {k: float(v) for k, v in self.info.all_mids().items()}
+
+    def daily_closes(self, coins: List[str], lookback: int, *, pad: int = 12
+                     ) -> Dict[str, np.ndarray]:
+        """Recent CLOSED daily closes per coin (oldest→newest) for the momentum
+        signal. Public (no wallet). Drops the in-progress bar (T > now)."""
+        need = lookback + pad
+        now_ms = int(time.time() * 1000)
+        start = now_ms - (need + 3) * 86_400_000
+        out: Dict[str, np.ndarray] = {}
+        for c in coins:
+            try:
+                data = self.info.post("/info", {"type": "candleSnapshot", "req": {
+                    "coin": c, "interval": "1d", "startTime": start, "endTime": now_ms}})
+            except Exception:
+                continue
+            closed = [float(d["c"]) for d in data if int(d["T"]) <= now_ms]
+            if len(closed) >= lookback + 1:
+                out[c] = np.asarray(closed, dtype=float)
+            time.sleep(0.05)
+        return out
 
     def account_value(self) -> float:
         if not self.address:

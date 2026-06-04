@@ -1,0 +1,31 @@
+[Unit]
+Description=Cross-sectional momentum runner on Hyperliquid (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+# Optional per-instance env: HL_PRIVATE_KEY (API/agent wallet) + HL_ACCOUNT_ADDRESS.
+# MAINNET_DRY (the default config) needs NONE — it forward-papers on real
+# mainnet prices with no wallet and places no orders.
+EnvironmentFile=-/etc/trading-bot/hl-xsectional-%i.env
+ExecStart=/usr/bin/python3 -m scripts.hl_xs_runner --loop --config /opt/trading-bot/configs/hl-xsectional-%i.json --interval-sec 3600
+Restart=on-failure
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hl-xsectional-%i
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot
+
+[Install]
+WantedBy=multi-user.target
