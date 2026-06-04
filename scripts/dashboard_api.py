@@ -92,14 +92,16 @@ SWEEP_ROUTE = {
             "name": "VRP short-vol",
             "venue": "options · Deribit",
             "status": "LEAD",
-            "verdict": "faithful-replication-proof; constraint = tail management",
+            "verdict": "premium proven; statistical deepening exhausted",
             "metrics": ["+6.4 vol-pts/mo, t=2.34, Sharpe 1.24 (6bps/1vp)",
                         "null 98th, 3/3 sub-periods, 100% of 30 roll-offsets +",
-                        "tail = multi-day burst, not a gap",
-                        "static OTM wings = a wash (hand back the premium)"],
-            "note": ("Strongest premium in the project. Next: walk-forward the "
-                     "DVOL-richness filter offline before any Deribit build. "
-                     "Venue offshore (MED regulatory). See docs/VRP-DEEPENING.md."),
+                        "tail = multi-day burst; static OTM wings = a wash",
+                        "DVOL-richness = modest causal entry-gate, NOT a risk overlay",
+                        "43-cycle dataset maxed out (edge rests on 1-2 events)"],
+            "note": ("Project's best-validated edge, but no more backtesting adds "
+                     "info. Next = forward-collect Deribit DVOL surface + paper-log "
+                     "the causal gate. No live executor on this evidence. Venue "
+                     "offshore (MED regulatory). See docs/VRP-DEEPENING.md."),
         },
         {
             "name": "Carry (cash-and-carry)",
@@ -136,10 +138,13 @@ SWEEP_ROUTE = {
         "v1 trend + vol-target overlay — failed the random-entry null",
         "4 single-asset directional families on OKX — all inside the null band",
     ],
-    "current_focus": ("VRP deepening complete (faithful replication confirms the "
-                      "premium; tail can't be cheaply wing-hedged)."),
-    "next_step": ("walk-forward / OOS the momentum lead and the VRP DVOL-richness "
-                  "filter on data in hand; do NOT build the Deribit adapter yet."),
+    "current_focus": ("VRP deepening exhausted: premium proven (faithful "
+                      "replication), but the tail is un-hedgeable cheaply, the "
+                      "DVOL-richness rule is only a modest entry-gate, and the "
+                      "43-cycle dataset is maxed out."),
+    "next_step": ("VRP needs FORWARD data (collect Deribit DVOL surface + paper-log "
+                  "the causal gate) — no more in-sample grids, no live executor yet. "
+                  "Momentum lead = parallel paper-candidate (needs perp access)."),
 }
 
 # Simple CSRF/auth token — generated once per process start, embedded in the

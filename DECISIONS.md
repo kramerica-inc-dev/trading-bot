@@ -183,4 +183,22 @@ Probed the OKX EU API directly (with the working demo creds) to see what could b
 
 **LXC follow-up (manual — prod SSH not auto-authorized this session):** stop+disable `bh_overlay@btc`, remove its unit + state, and redeploy the dashboard. Plan E paper instances and `carry@btc` (already stopped) are untouched.
 
+*(Update same day: the LXC follow-up was done via SSH once authorized — `bh_overlay@btc` stopped/removed, dashboard redeployed + enabled; an orphan dashboard process crash-looping the service was also fixed.)*
+
+---
+## 2026-06-04 — DVOL-richness filter walk-forward done; VRP statistical deepening EXHAUSTED
+
+**Context.** The prior entry's recommended next step was to walk-forward / OOS-validate the DVOL-richness filter offline. Done: `backtest/sweep/vrp_richness.py` (+6 tests) implements a causal trailing-percentile rule (trade full size iff `DVOL[t] ≥ trailing-pctl`, strictly before t), a subset null (IV-selection vs random same-count), and matched-tail sizing. A 4-agent adversarial validation reproduced every number and corrected a too-optimistic first draft.
+
+**Findings.**
+1. **The causal high-DVOL SELECTION signal is real.** corr(entry DVOL, P&L) = +0.638; high-DVOL half +12.3 vp vs low-DVOL +0.2 vp. The DVOL-selected cycles beat random same-count subsets at the 99.9th pct (mean) / 97th (Sharpe); a random subset beats naked only 12.4% of the time. Genuinely causal and null-beating.
+2. **But it is NOT a tail-reduction overlay.** At a matched 10% CVaR budget the realised worst month is *worse* for the filter (−12.2% vs naked −10.1%) — it cuts the −50 vp cycle and re-levers ~1.9× on the surviving tail.
+3. **The headline +24 pp %/yr (40.6 → 64.5) is a whole-sample-CVaR sizing look-ahead.** Re-sized causally (expanding-window CVaR) the gap collapses to **+4–9 pp**. Single-digit-pp deployable uplift.
+4. **Borderline + fragile:** 0/36 (lookback×pctl) configs clear a Bonferroni multiple-testing threshold; the entire %/yr edge traces to 1–2 of 43 cycles (drop the 2 worst → the win reverses). Tuning the cutpoint FAILS OOS (keeps the −50 cycle → below naked).
+
+**Decision.**
+1. **VRP's statistical deepening is exhausted.** 43 non-overlapping cycles, with the edge resting on 1–2 events — no further backtesting / re-slicing adds information. The premium itself remains the project's **best-validated edge** (faithful-replication-proof, roll-robust, +6.4 vp/mo); the DVOL-richness rule is a **modest causal entry-gate, not a risk overlay**.
+2. **No live executor on this evidence, and no more in-sample grids.** The only step that adds genuine new information is **forward data**: collect the Deribit DVOL surface live and paper-log the causal gate forward (≥~12 independent forward cycles) before any runner. That is gated on the offshore-Deribit venue/regulatory question (MED — accessible to NL retail via the Panama entity + KYC, but unregulated-in-EU; the compliant Coinbase-EU route is futures-only in 2026).
+3. **Until forward data exists, VRP is parked at the research boundary** (premium proven, execution venue + dataset are the blockers). The cross-sectional momentum lead remains the parallel paper-candidate (needs perp access). Full write-up: `docs/VRP-DEEPENING.md`.
+
 ---

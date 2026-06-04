@@ -151,7 +151,9 @@ Three options, in order of how cheaply they can be checked:
    median, and surprised upward). So the correct, economically-motivated rule is
    the inverse: **sell vol only when DVOL is rich (>~50%), stand aside when it is
    cheap.** In-sample this preserves the mean and roughly halves CVaR (Sharpe
-   1.24 → ~1.5; +60%/yr → +76%/yr at a matched 15% budget). **Discount this
+   1.24 → ~1.5; +60%/yr → +76%/yr at a matched 15% budget — *but the OOS section
+   below runs this properly and corrects it down hard: that %/yr is largely a
+   whole-sample-CVaR sizing look-ahead*). **Discount this
    hard:** best-of-sweep multiple-testing p = 0.16 (not significant after
    penalising the threshold/direction search), the worst-month fix is
    **knife-edge** (worst stays −50 vp at threshold 47%, drops to −10 vp at 48%,
@@ -169,6 +171,77 @@ high-value test — and do NOT build the heavy Deribit options-adapter + delta
 -hedge loop yet.**
 
 ---
+
+## DVOL-richness filter — walk-forward / OOS validation (the recommended next step, now run)
+
+Option 2 above was "suggestive, not proven" in the first pass. This section runs
+the recommended test: does the "sell vol only when DVOL is rich" rule survive a
+**causal / out-of-sample** design? Engine: `backtest/sweep/vrp_richness.py`
+(6 tests, incl. a look-ahead-free property test). The honest causal rule trades
+full size iff `DVOL[t] ≥ the p-th percentile of DVOL over the trailing
+lookback` (strictly before t) — a relative, adaptive cutpoint, no global tuning.
+
+Economic context: corr(entry DVOL, cycle P&L) = **+0.638**; the high-DVOL half of
+cycles averages **+12.3 vp** vs **+0.2 vp** for the low-DVOL half. The premium is
+genuinely concentrated in rich-IV entries.
+
+| variant | deploy | Sharpe | matched-tail %/yr | worst | subset-null |
+|---|---|---|---|---|---|
+| naked | 1.00 | 1.24 | 40.6 | −10.1% | — |
+| in-sample best abs threshold (overfit) | 0.58 | 1.56 | 50.7 | −10.6% | 95th |
+| **causal trailing-median (stand aside)** | **0.44** | **1.54** | **64.5** | −12.2% | **97th** |
+| causal trailing-median (half size) | 0.72 | 1.44 | 65.1 | −11.1% | 97th |
+| expanding-window OPTIMISED threshold (OOS) | 0.70 | 1.07 | **36.1** | −50.1% | — |
+
+> **Note: the `matched-tail %/yr` column sizes off the WHOLE-SAMPLE CVaR — a
+> backtest-wide sizing look-ahead. The honest causal-sized figures are in
+> finding 3 below.** A 5-agent adversarial validation (2026-06-04) reproduced
+> every number to the digit and forced three corrections, folded in here.
+
+Findings (corrected — the selection signal is real; the headline %/yr and the
+"tail-reduction" framing were not):
+1. **The causal high-DVOL SELECTION signal is real.** The DVOL-selected cycles
+   beat random same-count subsets at the **99.9th percentile on mean**, 97.2nd on
+   Sharpe, 96.6th on matched-tail return; a random same-count subset beats naked
+   only **12.4%** of the time. High-IV entries genuinely earn more, causally
+   (trailing-percentile, strictly `< t`). **But borderline under multiple
+   testing:** across 36 (lookback × pctl) configs the subset-null median is 95th
+   and **0/36 clear Bonferroni** — real, not robust on 43 obs.
+2. **NOT a tail-reduction overlay — retract that framing.** At the matched 10%
+   CVaR budget the realised **worst month is *worse* for the filter (−12.2% vs
+   naked −10.1%)**: it cuts the −50 vp cycle then re-levers ~1.9× on the surviving
+   tail. The benefit is *leverage at equal whole-sample CVaR*, not a smaller
+   drawdown.
+3. **The 40.6 → 64.5%/yr headline is a sizing look-ahead.** `matched_tail_ann`
+   sizes off the whole-sample CVaR (worst 2 of 43 cycles). Re-sized with a
+   **causal expanding-window CVaR** (`matched_tail_ann_causal`, prior cycles
+   only) the gap collapses to **+4 to +9 pp** (naked ~48–52 vs causal ~55.5%/yr).
+   The honest deployable uplift is single-digit pp, not +24.
+4. **The whole %/yr edge traces to one-to-two cycles.** Drop the −50 vp cycle and
+   causal still edges naked on %/yr (66 vs 52) but **loses Sharpe** (1.56 vs 1.70);
+   drop the **two** worst dollar cycles and the %/yr **win reverses** (naked 72.4
+   vs causal 67.6). The grid "94% of 72 configs beat naked" is the *same single
+   −50-cycle exclusion* re-expressed across correlated configs — one event, not 72.
+5. **Confirmed (these hold):** the signal is genuinely look-ahead-free; the
+   +0.638 corr and +12.3 vs +0.2 vp half-split are real; and **tuning the cutpoint
+   FAILS OOS** — the expanding-window *optimised* threshold keeps the −50 cycle
+   (entry DVOL 47.1) → Sharpe 1.07 / 36%/yr / worst −50 vp, *below* naked. The
+   robust form is the parameter-light trailing rule, not an optimised number.
+
+**Corrected verdict on option 2:** the DVOL-richness rule is a **causal entry
+filter with genuine, null-beating per-trade SELECTION skill — but not a risk
+overlay.** It does not reduce the realised drawdown (it raises it), its headline
+%/yr gain is mostly a whole-sample-CVaR sizing artifact (+4–9 pp under causal
+sizing), it is borderline under multiple testing, and the entire edge rests on
+1–2 of 43 cycles. Deployable form: a modest *entry gate* (skip cheap-DVOL months),
+**causally** sized and small — not a leverage/tail overlay.
+
+**The statistical deepening is now exhausted** — 43 non-overlapping cycles with
+the edge resting on one-to-two events; no further re-slicing fixes n. The only
+step that adds genuine new information is **forward data**: collect the Deribit
+DVOL surface live and paper-log the causal gate going forward (≥~12 independent
+forward cycles) before any runner. Do **not** build more in-sample grids, and do
+**not** ship a live executor on this evidence.
 
 ## Deribit feasibility (for the eventual build — not the gating step)
 
@@ -199,8 +272,12 @@ Probed against the public Deribit API:
   *compliance-grey* — a live-decision gate, not a research gate.
 
 ## Open gaps (honest)
-1. **Walk-forward / OOS validation of the richness filter** — the recommendation
-   depends on it; not yet run. Biggest gap.
+1. ~~Walk-forward / OOS validation of the richness filter~~ — **DONE** (section
+   above): the causal SELECTION signal survives (null-beating), but it is **not** a
+   risk overlay (realised drawdown larger), the %/yr gain is mostly a sizing
+   look-ahead (+4–9 pp causally), it's borderline under multiple testing, and the
+   edge rests on 1–2 of 43 cycles. The dataset is exhausted — next info is forward
+   data only.
 2. **Moving-block bootstrap null** — only the weak sign-flip null exists.
 3. **Hedge-leg perp funding** unmodelled — a real recurring cost on an inverse
    perp; could erode the 6.4 vp; never quantified.
