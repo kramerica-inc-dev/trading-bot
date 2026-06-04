@@ -202,3 +202,16 @@ Probed the OKX EU API directly (with the working demo creds) to see what could b
 3. **Until forward data exists, VRP is parked at the research boundary** (premium proven, execution venue + dataset are the blockers). The cross-sectional momentum lead remains the parallel paper-candidate (needs perp access). Full write-up: `docs/VRP-DEEPENING.md`.
 
 ---
+## 2026-06-04 — Venue wall is NOT absolute: momentum/carry executable today; VRP needs Deribit
+
+**Context.** The momentum lead's P2_DEMO was confirmed blocked (OKX EU demo = acctLv=1, perp code 51155 — the same MiCA wall as carry). Three validated edges (carry, VRP, momentum) were all execution-blocked. User chose to investigate the venue/entity problem. A deep-research effort (6 angles, 27 sources, **25 claims adversarially 3-vote-verified, 0 killed**) produced `docs/VENUE-ACCESS-RESEARCH.md`.
+
+**Finding: there IS a path.** Momentum + carry are executable TODAY for an NL retail user:
+- **Hyperliquid (DEX)** — no KYC, no NL/EU geoblock (NL not on its restricted list; independently corroborated), 100+ perps incl. all 10 momentum assets long+short, full public REST/SDK API with funding history, hourly funding, low fees. **Grey area** (EU-unregulated; custody/smart-contract risk); build = a new DEX SDK adapter. The momentum runner is an adapter-swap away (strategy is exchange-agnostic).
+- **Kraken Pro EU** (CySEC/MiFID, all 10 perps, ~10x, **no options**) and **OKX X-Perps** (Malta MFSA OEML-15905 — a DIFFERENT entity than the MiCA-blocked OKX retail one; 5yr-expiry futures w/ funding mechanism, 10x, suitability-gated) — the **compliant** route, closer to the existing OKX adapter, but gated + leverage-capped + universe/NL-enablement needs verification.
+- **VRP** still needs **Deribit** (offshore Panama DRB Panama Inc., NL not restricted, retail after KYC) — heaviest + least certain (no 2026 source confirms an NL-retail options trade end-to-end). On-chain Aevo options too thin.
+- **Non-EU entity (Path C): unsubstantiated + unnecessary.** ESMA (Feb-2026) is tightening EU retail perp access (CFD intervention) — compliant venues carry leverage-cap/re-gating risk; offshore/DEX carry enforcement risk.
+
+**Decision.** The execution path is **reopened** but the venue choice has a legal/tax dimension that is the user's (grey-area offshore/DEX vs gated-but-compliant EU CEX). No venue committed yet. **This is a factual feasibility assessment, not legal/tax advice** — the user should confirm NL tax/legality before deploying real capital. Recommended sequencing: (1) momentum first (a working DRY_RUN runner already exists), via either Hyperliquid (fast, grey) or Kraken-EU/OKX-X-Perps (compliant, gated); (2) carry follows on the same venue; (3) VRP/Deribit last. The momentum DRY_RUN forward-paper keeps running meanwhile. Open questions (10-asset coverage on the compliant venues, Deribit NL-retail end-to-end, Hyperliquid net-edge at size) to verify before capital.
+
+---
