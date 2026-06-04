@@ -124,14 +124,16 @@ recorded; `account_value` no longer skips a perp-funded account on a spot-endpoi
 outage; `health.json n_positions` reflects the live venue book in live mode (was
 structurally 0); the equity docstring is corrected. **Close these during the soak,
 before any mainnet capital:**
-- [ ] **Turnover rebalance** — force a close-some/open-others rotation on testnet
-  (shorten `rebal_days` or hand-edit `last_rebalance_ts` back >5d) and confirm a
-  clean transition (the validated run was a from-flat open; stage-1 closed nothing).
-- [ ] **Drift / resize** — the live path never resizes a held-correct-side leg, so
-  dollar-neutrality can erode between rebalances (verify tolerates 0.5x–∞). Add
-  resize-to-target in `_execute_live`; watch L/S skew across multiple held cycles.
-- [ ] **op_halt recovery** — trip it on testnet; write + verify the operator
-  recovery steps (currently terminal until a hand-edit of `state.json` cb_state).
+- [x] **Turnover rebalance — DONE 2026-06-04.** Forced a lb=30 ranking (flips 4 of
+  6 legs) → a 4-close + 4-open rotation completed cleanly: `complete=True`, neutral
+  (994/992), **0 retries/flattens, no op_halt**. The close-some/open-others path holds.
+- [ ] **Drift / resize** *(the real 2nd CRITICAL — a CODE fix, still open)* — the
+  live path never resizes a held-correct-side leg, so dollar-neutrality can erode
+  between rebalances (`_verify_book` tolerates 0.5x–∞). Add resize-to-target in
+  `_execute_live`; watch L/S skew across multiple held cycles.
+- [x] **op_halt trip + recovery — DONE 2026-06-04.** Tripped via a manually
+  non-neutral book → reconcile-halt flattened all legs to FLAT + set `op_halt`; the
+  recovery procedure below restores cleanly. Verified end-to-end.
 - [ ] **Funding** — DRY/sim omits the ~6%/yr funding drag (paper P&L too rosy);
   confirm on-chain equity accrues funding over the soak; decide whether to model it
   in DRY for comparability.
@@ -143,6 +145,32 @@ before any mainnet capital:**
   cap never causes a non-fill on thin books; compare to the 0.00045 sim assumption.
 - [ ] **Crash-mid-rebalance / overlap** — kill between stage-1 closes and stage-2
   opens, confirm clean restart recovery; no lock guards overlapping `run_once`.
+
+### op_halt recovery procedure (verified 2026-06-04)
+`op_halt` (a failed rebalance or a reconcile divergence) is **manual-clear only**:
+the book is auto-flattened and the instance stays parked until an operator clears
+it. First read `trades.log` for the `rebalance_halt` / `reconcile_halt` entry and
+understand WHY it halted. Then:
+```bash
+systemctl stop hl-xsectional@main
+# 1. CONFIRM THE VENUE IS FLAT before clearing (never clear a non-flat halt):
+python3 - <<'PY'
+import sys; sys.path.insert(0,"/opt/trading-bot/scripts")
+from hl_adapter import HLAdapter
+a = HLAdapter(network="testnet", account_address="0x<MASTER>")
+assert not a.book_notional(), "NOT flat — investigate, do NOT clear"
+print("flat — safe to clear")
+PY
+# 2. clear the halt and let it re-enter on the next cycle:
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("/opt/trading-bot/state/hl_xsectional/main/state.json")
+s = json.loads(p.read_text()); s["cb_state"] = "normal"; s["last_rebalance_ts"] = None
+p.write_text(json.dumps(s, indent=2))
+PY
+systemctl start hl-xsectional@main   # rebuilds the basket
+# 3. verify: health.json cb_state=normal, reconcile_ok=true, a fresh neutral book.
+```
 
 ## Mainnet (real money) — NOT yet
 Only after testnet validates AND your legal/tax review of using an EU-unregulated
