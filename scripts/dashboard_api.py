@@ -1393,10 +1393,18 @@ def main():
     print(f"  Bot dir:   {BOT_DIR}")
     print(f"  Memory:    {MEMORY_DIR}")
     print(f"  Dashboard: {DASHBOARD_HTML}")
+    # systemd sends SIGTERM on restart/stop; without a handler Python terminates
+    # WITHOUT releasing :8080, leaving an orphan that EADDRINUSE-crashloops the
+    # next start. Shut down cleanly so restarts release the socket promptly.
+    import signal as _signal
+    import threading as _threading
+    _signal.signal(_signal.SIGTERM, lambda *_: _threading.Thread(
+        target=server.shutdown, daemon=True).start())
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down...")
+    finally:
         server.server_close()
 
 
