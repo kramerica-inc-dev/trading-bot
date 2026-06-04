@@ -42,7 +42,9 @@ UPGRADE-SAMENVATTING.md
 
 # Backtest data (regenereerbaar via data_collector.py)
 backtest/data/*.csv
+backtest/data/okx/          # OKX-sourced backfill (regenereerbaar via backtest/okx_backfill.py)
 backtest/results/regime_diagnostics.csv
+backtest/results/sweep/
 backtest/results/archive/
 
 # Plan E runner operational state (portfolio, trade log, runner cache)
