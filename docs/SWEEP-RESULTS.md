@@ -68,3 +68,26 @@ robustly. Everything else this wave is a confirmed KILL.
 - Cross-venue basis (B6): needs Bitvavo/Kraken adapters + synchronized books.
 - Variance-risk-premium (B7): needs an options client (none in repo).
 - Maker-rebate MM (B10): only honest via live paper-fill measurement.
+
+## Wave 1b — structural candidates (broadening)
+
+### B3 cross-sectional funding carry — PRELIM-NOEDGE (data-limited)
+`backtest/sweep/funding_carry.py`, OKX-native, ~3mo window (the OKX funding
+limit). Long lowest-funding / short highest-funding perps to harvest the
+funding dispersion.
+- **Gross funding dispersion available: ~12.4%/yr** (max−min per-asset mean
+  funding) — the premium exists.
+- **But not cleanly harvestable** via a simple cross-sectional perp long-short:
+  funding harvested +1.3–2.7% over 93d vs **price-leg noise −5 to −16%** — a
+  funding-ranked basket is not beta-neutral, so residual price drift dominates.
+  Net negative, Sharpe negative across configs.
+- The funding *direction* is cross-sectionally valid (lb=3/rb=1 clears the 3mo
+  null at 99.6th) but absolute PnL is swamped by price noise + turnover.
+- **Conclusion:** the funding edge is real but small; the clean way to harvest
+  it is per-asset delta-neutral cash-and-carry (spot+perp) — exactly the
+  venue-blocked carry. Cross-sectional perp-carry needs a beta hedge to work.
+  Forward-collect OKX funding for a proper (non-3mo) assessment.
+
+**Net of wave 1b: the cross-sectional momentum lead (M4.5) remains the best
+candidate.** B6 (cross-venue basis) and B7 (VRP/options) need new venue/option
+data + infra — scoped as the next broadening, not run this wave.

@@ -85,6 +85,23 @@ class TestFunding(unittest.TestCase):
         self.assertTrue((fp == 0).all())
 
 
+class TestFundingCarry(unittest.TestCase):
+
+    def test_carry_harvests_negative_funding(self):
+        from sweep.funding_carry import _backtest, CarryConfig
+        # constant prices (no price PnL); asset 0 has persistently negative
+        # funding -> longing it (lowest funding) RECEIVES funding.
+        n, k = 60, 4
+        closes = np.ones((n, k)) * 100.0
+        fpanel = np.zeros((n, k))
+        fpanel[:, 0] = -0.001                 # asset 0 pays shorts -> longs receive
+        cfg = CarryConfig(funding_lookback=5, rebal=1, m=1, cost_rate=0.0)
+        fund_sig = pd.DataFrame(fpanel).rolling(5, min_periods=5).mean().to_numpy()
+        out, fout = _backtest(closes, fpanel, fund_sig, cfg, selection="carry")
+        self.assertGreater(fout.sum(), 0.0)   # funding harvested
+        self.assertGreater(out.sum(), 0.0)    # net positive (no price move, no cost)
+
+
 class TestLoadPanel(unittest.TestCase):
 
     def test_missing_dir_returns_empty(self):
