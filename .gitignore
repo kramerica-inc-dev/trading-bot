@@ -60,3 +60,5 @@ scripts/models/
 
 # Edge-diagnosis: large regenerable per-bar export (regen via backtest/diag_export.py)
 backtest/results/diag_bars.csv
+# OKX-sourced backfill is already ignored above; same for Hyperliquid (regen via backtest/hyperliquid_backfill.py)
+backtest/data/hyperliquid/

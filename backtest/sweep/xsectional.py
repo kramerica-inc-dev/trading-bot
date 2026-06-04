@@ -55,7 +55,7 @@ def load_panel(assets: List[str], *, data_dir: str = OKX_DATA, bar: str = "1Dutc
         if not os.path.exists(p):
             continue
         d = pd.read_csv(p)
-        d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
+        d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True, format="ISO8601")
         series[a] = d.set_index("timestamp")["close"].astype(float)
     if not series:
         return pd.DataFrame()
@@ -76,7 +76,7 @@ def load_funding_panel(dates: pd.DatetimeIndex, assets: List[str], *,
             cols.append(pd.Series(0.0, index=dates))
             continue
         d = pd.read_csv(p)
-        d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
+        d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True, format="ISO8601")
         daily = d.groupby(d["timestamp"].dt.floor("D"))["funding_rate"].sum()
         cols.append(daily.reindex(dates).fillna(0.0))
     return np.column_stack([c.to_numpy() for c in cols])

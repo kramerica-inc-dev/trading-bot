@@ -109,6 +109,36 @@ carve-outs elsewhere (UAE, Panama) — so strongly supported, not 100% confirmed
   path-dependence — fees are competitive but a full Hyperliquid-data backtest was
   not part of this research.
 
+## Hyperliquid validation — the edge SURVIVES on the executable venue (2026-06-04)
+
+Before any wallet or capital, the gating question was: does the momentum lead
+that cleared the null on OKX data also clear it on **Hyperliquid's own** prices +
+funding? Built `backtest/hyperliquid_backfill.py` (public info API — all 10 assets,
+1244 daily bars 2023-01→2026-05, plus **3 years of real hourly funding**) and
+re-ran the lead (lb=120/rebal=5/m=3) on both panels (`scripts/validate_momentum_hyperliquid.py`):
+
+| metric | **Hyperliquid** (executable) | OKX (original) |
+|---|---|---|
+| verdict | **ADVANCE** | ADVANCE |
+| net return | **+252%** | +243% |
+| null %ile | **99.9** | 100 |
+| Sharpe | +1.03 | +1.02 |
+| cross-sec IC | **0.069 (p=0.013)** | 0.069 (p=0.018) |
+| real funding drag | **+6.0%/yr (1113 funded days)** | +4.0%/yr (94 days) |
+
+**The edge is venue-independent** — near-identical metrics on two independent
+price panels → it is a real cross-sectional momentum effect, not an OKX-data
+artifact. Hyperliquid even gives **3 years of real funding** (vs OKX's 3-month
+proxy): the realistic headwind is **~6%/yr (1.65 bps/day)**, comfortably inside
+the breakeven (~4× margin; net only goes negative around ~6–7 bps/day flat drag).
+The validation charged a conservative 15 bps/|Δweight|; Hyperliquid's actual fees
+(taker 0.045%, maker 0.015%) are *lower*, so the real edge is if anything
+understated. **Conclusion: Hyperliquid is technically + economically confirmed as
+the executable venue for the momentum lane.** Remaining to go live: a Hyperliquid
+order-execution adapter (wallet/EIP-712 signing via the `/exchange` endpoint) +
+the user's legal/tax decision on the grey area. Data files are gitignored
+(regenerate via `python -m backtest.hyperliquid_backfill`).
+
 ## Time-sensitivity
 All facts are 2026-dated but the frontier moves fast (ESMA Feb-2026 CFD stance,
 MiCA full implementation Jul 2026). Compliant EU perp offerings could be re-gated
