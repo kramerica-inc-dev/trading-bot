@@ -9,3 +9,6 @@ websocket-client>=1.8.0
 
 # Optional: For better logging
 # colorama>=0.4.6
+
+# Hyperliquid execution adapter (scripts/hl_adapter.py)
+hyperliquid-python-sdk>=0.9.0
