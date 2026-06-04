@@ -127,10 +127,12 @@ before any mainnet capital:**
 - [x] **Turnover rebalance — DONE 2026-06-04.** Forced a lb=30 ranking (flips 4 of
   6 legs) → a 4-close + 4-open rotation completed cleanly: `complete=True`, neutral
   (994/992), **0 retries/flattens, no op_halt**. The close-some/open-others path holds.
-- [ ] **Drift / resize** *(the real 2nd CRITICAL — a CODE fix, still open)* — the
-  live path never resizes a held-correct-side leg, so dollar-neutrality can erode
-  between rebalances (`_verify_book` tolerates 0.5x–∞). Add resize-to-target in
-  `_execute_live`; watch L/S skew across multiple held cycles.
+- [x] **Drift / resize — DONE 2026-06-04.** `_execute_live` now resizes a
+  held-correct-side leg toward target (`_resize_order`, gated by
+  `resize_threshold=0.10` so it doesn't churn on noise; the trim/reduce path can
+  never flip a side). Validated on testnet: an ETH long manually oversized to $529
+  was trimmed by a `resize` (delta −198.71) back to $330, book re-neutralized
+  (skew 0.27%), only the drifted leg touched.
 - [x] **op_halt trip + recovery — DONE 2026-06-04.** Tripped via a manually
   non-neutral book → reconcile-halt flattened all legs to FLAT + set `op_halt`; the
   recovery procedure below restores cleanly. Verified end-to-end.

@@ -161,6 +161,37 @@ class TestAcceptPostTradeEquity(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestResizeOrder(unittest.TestCase):
+    def rz(self, cur, tgt, th=0.10, mn=10.0):
+        return R.HLXSRunner._resize_order(cur, tgt, th, mn)
+
+    def test_within_tolerance_no_resize(self):
+        self.assertIsNone(self.rz(320.0, 330.0))        # drift 10 < max(10, 33)
+
+    def test_below_min_order_no_resize(self):
+        self.assertIsNone(self.rz(100.0, 105.0))        # drift 5 < $10 min
+
+    def test_grow_long(self):
+        self.assertEqual(self.rz(300.0, 400.0), (True, 100.0))    # buy 100 more
+
+    def test_trim_long(self):
+        self.assertEqual(self.rz(500.0, 300.0), (False, 200.0))   # sell 200 (reduce)
+
+    def test_grow_short(self):
+        self.assertEqual(self.rz(-300.0, -400.0), (False, 100.0)) # sell 100 more
+
+    def test_trim_short(self):
+        self.assertEqual(self.rz(-500.0, -300.0), (True, 200.0))  # buy back 200
+
+    def test_resize_never_flips_side(self):
+        # the trim amount is always strictly less than the current notional
+        for cur, tgt in [(500.0, 10.0), (-500.0, -10.0)]:
+            ro = self.rz(cur, tgt)
+            self.assertIsNotNone(ro)
+            self.assertLess(ro[1], abs(cur))
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
 class TestHealthLivePositions(unittest.TestCase):
     def _stub(self, tmp, live, book):
         adapter = types.SimpleNamespace(wallet=object(), address="0xMaster",

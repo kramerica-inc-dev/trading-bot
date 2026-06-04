@@ -62,6 +62,7 @@ class HLXSConfig:
     cost_rate: float = 0.00045          # HL taker, for sim accounting
     flat_funding_annual: float = 0.06   # HL-calibrated headwind (sim)
     slippage: float = 0.05              # marketable-IOC slippage (live)
+    resize_threshold: float = 0.10      # min drift (fraction of target $) to resize a held leg
     min_assets: int = 6
     halt_drawdown_pct: float = 0.25
     network: str = "mainnet"            # 'mainnet' (DRY default) or 'testnet'
@@ -172,6 +173,20 @@ class HLXSRunner:
             out.append({"act": "flatten", "coin": coin, "ok": r.ok, "err": r.error})
         return out
 
+    @staticmethod
+    def _resize_order(cur_notional: float, tgt: float, threshold: float, min_order: float):
+        """For a leg already held on the CORRECT side, the (is_buy, usd) order to
+        move it toward the target notional — or None if the drift is within
+        tolerance (< threshold·|tgt|) or below the venue minimum. `is_buy = delta>0`
+        grows a long / trims a short and trims a long / grows a short symmetrically;
+        because tgt is same-signed as cur here, |delta| < |cur| so a resize can
+        never flip the side."""
+        delta = tgt - cur_notional
+        drift = abs(delta)
+        if drift < max(min_order, threshold * abs(tgt)):
+            return None
+        return (delta > 0, drift)
+
     # -- execution: LIVE (testnet / mainnet-live) --------------------------
     def _execute_live(self, targets: Dict[str, float], now: datetime) -> dict:
         orders = []
@@ -187,14 +202,26 @@ class HLXSRunner:
             if tgt == 0.0 or int(np.sign(tgt)) != (1 if p["szi"] > 0 else -1):
                 r = self.adapter.close(coin)
                 orders.append({"act": "close", "coin": coin, "ok": r.ok, "err": r.error})
-        # 2. establish target legs not already held on the correct side
+        # 2. establish target legs not held; RESIZE legs held on the correct side
+        #    toward target notional (correct drift instead of silently skipping).
         try:
             held = self.adapter.positions()
         except Exception:
             held = cur
+        mids = self.adapter.all_mids()
         for coin, tgt in targets.items():
             h = held.get(coin)
             if h and int(np.sign(h["szi"])) == int(np.sign(tgt)):
+                mk = mids.get(coin) or h.get("entry_px") or 0.0
+                cur_notional = h["szi"] * mk
+                ro = self._resize_order(cur_notional, tgt, self.cfg.resize_threshold,
+                                        self.adapter.MIN_ORDER_USD)
+                if ro is None:
+                    continue                         # drift within tolerance — leave it
+                is_buy, usd = ro
+                r = self.adapter.market_order_usd(coin, is_buy, usd, slippage=self.cfg.slippage)
+                orders.append({"act": "resize", "coin": coin, "side": int(np.sign(tgt)),
+                               "delta": round(tgt - cur_notional, 2), "ok": r.ok, "err": r.error})
                 continue
             r = self.adapter.market_order_usd(coin, tgt > 0, abs(tgt), slippage=self.cfg.slippage)
             orders.append({"act": "open", "coin": coin, "side": int(np.sign(tgt)),
