@@ -62,12 +62,40 @@ def load_panel(assets: List[str], *, data_dir: str = OKX_DATA, bar: str = "1Dutc
     return pd.DataFrame(series).dropna()
 
 
+def load_funding_panel(dates: pd.DatetimeIndex, assets: List[str], *,
+                       data_dir: str = OKX_DATA) -> np.ndarray:
+    """Per-asset daily funding aligned to `dates` (sum of 8h settlements per UTC
+    day; 0 where unavailable). Column order matches `assets`. Row t = funding
+    over day t. OKX public funding is ~3 months, so most of a multi-year panel
+    is 0 — use only for the recent-window realistic estimate, not full history.
+    """
+    cols = []
+    for a in assets:
+        p = os.path.join(data_dir, f"funding_{a}.csv")
+        if not os.path.exists(p):
+            cols.append(pd.Series(0.0, index=dates))
+            continue
+        d = pd.read_csv(p)
+        d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True)
+        daily = d.groupby(d["timestamp"].dt.floor("D"))["funding_rate"].sum()
+        cols.append(daily.reindex(dates).fillna(0.0))
+    return np.column_stack([c.to_numpy() for c in cols])
+
+
 def _portfolio_returns(closes: np.ndarray, cfg: XSConfig, *, selection: str,
-                       rng: Optional[np.random.Generator] = None) -> np.ndarray:
+                       rng: Optional[np.random.Generator] = None,
+                       funding_panel: Optional[np.ndarray] = None,
+                       flat_drag_daily: float = 0.0) -> np.ndarray:
     """Daily dollar-neutral portfolio returns for a selection rule.
 
     selection: 'momentum' (rank by trailing return), 'random' (random baskets),
     'shuffle' (rank a shuffled trailing-return vector == random ranking).
+
+    funding_panel: optional (n, k) array of per-asset daily funding (row t =
+        funding over day t->t+1, positive == longs pay). A long position pays
+        and a short receives, so funding PnL_t = -sum(weights * funding_panel[t]).
+    flat_drag_daily: optional flat funding-headwind stress applied to the gross
+        book each day (cost = drag * sum|weights|).
     """
     n, k = closes.shape
     rets = closes[1:] / closes[:-1] - 1.0       # (n-1, k)
@@ -91,7 +119,9 @@ def _portfolio_returns(closes: np.ndarray, cfg: XSConfig, *, selection: str,
             new_w[order[:m]] = -1.0 / m          # shorts (bottom)
             cost = np.abs(new_w - weights).sum() * cfg.cost_rate
             weights = new_w
-        out[t] = float((weights * rets[t]).sum() - cost)
+        fpnl = -float(np.dot(weights, funding_panel[t])) if funding_panel is not None else 0.0
+        drag = flat_drag_daily * float(np.abs(weights).sum())
+        out[t] = float((weights * rets[t]).sum() - cost + fpnl - drag)
     return out
 
 

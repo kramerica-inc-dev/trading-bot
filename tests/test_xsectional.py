@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "backtest"))
 
 from sweep.xsectional import (  # noqa: E402
     XSConfig, _portfolio_returns, _total_return_pct, _sharpe, load_panel,
+    load_funding_panel,
 )
 
 
@@ -53,6 +54,35 @@ class TestPortfolioReturns(unittest.TestCase):
 
     def test_sharpe_zero_on_flat(self):
         self.assertEqual(_sharpe(np.zeros(100)), 0.0)
+
+
+class TestFunding(unittest.TestCase):
+
+    def test_flat_drag_reduces_return(self):
+        closes = _panel_with_one_trender()
+        cfg = XSConfig(lookback=20, rebal=5, m=1, cost_rate=0.0)
+        base = _total_return_pct(_portfolio_returns(closes, cfg, selection="momentum"))
+        drag = _total_return_pct(_portfolio_returns(closes, cfg, selection="momentum",
+                                                    flat_drag_daily=0.001))
+        self.assertLess(drag, base)
+
+    def test_funding_panel_long_pays(self):
+        # positive funding on the longed asset must cost the long leg
+        closes = _panel_with_one_trender()
+        cfg = XSConfig(lookback=20, rebal=5, m=1, cost_rate=0.0)
+        n, k = closes.shape
+        fpanel = np.zeros((n, k))
+        fpanel[:, 0] = 0.001          # asset 0 (the trender, always longed) pays
+        base = _total_return_pct(_portfolio_returns(closes, cfg, selection="momentum"))
+        with_f = _total_return_pct(_portfolio_returns(closes, cfg, selection="momentum",
+                                                      funding_panel=fpanel))
+        self.assertLess(with_f, base)
+
+    def test_load_funding_panel_missing_is_zero(self):
+        dates = pd.date_range("2026-01-01", periods=5, freq="D", tz="UTC")
+        fp = load_funding_panel(dates, ["NONEXIST-USDT"], data_dir="/nope")
+        self.assertEqual(fp.shape, (5, 1))
+        self.assertTrue((fp == 0).all())
 
 
 class TestLoadPanel(unittest.TestCase):

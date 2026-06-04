@@ -202,6 +202,9 @@ def main() -> int:
     ap.add_argument("--days", type=int, default=1300)
     ap.add_argument("--bar", default="1D", help="OKX bar: 1D,4H,1H,15m,5m")
     ap.add_argument("--funding", action="store_true", help="also backfill funding")
+    ap.add_argument("--no-candles", action="store_true",
+                    help="skip candle fetch (e.g. refresh funding without "
+                         "clobbering a longer candle history)")
     ap.add_argument("--spot", action="store_true",
                     help="fetch spot candles (default: perp/SWAP)")
     ap.add_argument("--out-dir", default=str(OUT_DIR))
@@ -214,17 +217,18 @@ def main() -> int:
     assets = [a.strip() for a in args.assets.split(",")] if args.assets else [args.inst]
     summary: List[str] = []
 
-    for inst in assets:
-        cdf = backfill_candles(api, inst, args.bar, args.days, spot=args.spot)
-        suffix = "_spot" if args.spot else ""
-        cpath = out_dir / f"{inst}_{args.bar}{suffix}.csv"
-        cdf.to_csv(cpath, index=False)
-        line = f"{cpath.name}: {len(cdf)} bars"
-        if not cdf.empty:
-            line += f" ({cdf['timestamp'].min()} .. {cdf['timestamp'].max()})"
-        summary.append(line)
-        if inst == "BTC-USDT" and args.bar in ("1D", "1Dutc") and not args.spot:
-            summary.append(sanity_diff_daily(cdf))
+    if not args.no_candles:
+        for inst in assets:
+            cdf = backfill_candles(api, inst, args.bar, args.days, spot=args.spot)
+            suffix = "_spot" if args.spot else ""
+            cpath = out_dir / f"{inst}_{args.bar}{suffix}.csv"
+            cdf.to_csv(cpath, index=False)
+            line = f"{cpath.name}: {len(cdf)} bars"
+            if not cdf.empty:
+                line += f" ({cdf['timestamp'].min()} .. {cdf['timestamp'].max()})"
+            summary.append(line)
+            if inst == "BTC-USDT" and args.bar in ("1D", "1Dutc") and not args.spot:
+                summary.append(sanity_diff_daily(cdf))
 
     if args.funding:
         for inst in assets:
