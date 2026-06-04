@@ -65,6 +65,9 @@ import re  # noqa: E402
 INSTANCE_NAME_RE = re.compile(r"^plan-e-[a-z0-9]{1,16}$")
 # Carry instance names — short safe charset, can't escape the carry dir.
 CARRY_INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+# Templated systemd units the dashboard may start/stop (was referenced in
+# _unit_allowed but never defined — a latent NameError; fixed here).
+_TEMPLATE_UNIT_RE = re.compile(r"^(plan-e|carry|xsectional|hl-xsectional)@[a-z0-9][a-z0-9_-]{0,31}$")
 
 # ---------------------------------------------------------------------------
 # Current research route & scope (served at /api/sweep/status). This is the

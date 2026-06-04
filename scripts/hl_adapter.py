@@ -43,10 +43,15 @@ MODE_MAINNET_LIVE = "MAINNET_LIVE"
 
 
 def resolve_hl_mode(network: str, allow_live: bool) -> str:
+    """Strict mode gate. MAINNET_LIVE (real money) requires allow_live to be the
+    bool `True` (identity, not truthiness — so a stray 'false'/'0'/1 can never
+    enable it) AND an out-of-band confirmation env var HL_CONFIRM_LIVE=YES."""
     if network == "testnet":
         return MODE_TESTNET
     if network == "mainnet":
-        return MODE_MAINNET_LIVE if allow_live else MODE_MAINNET_DRY
+        if allow_live is True and os.environ.get("HL_CONFIRM_LIVE") == "YES":
+            return MODE_MAINNET_LIVE
+        return MODE_MAINNET_DRY
     raise ValueError(f"network must be 'testnet' or 'mainnet', got {network!r}")
 
 
@@ -90,12 +95,22 @@ class HLAdapter:
         return {u["name"]: int(u["szDecimals"]) for u in self.meta()["universe"]}
 
     def all_mids(self) -> Dict[str, float]:
-        return {k: float(v) for k, v in self.info.all_mids().items()}
+        out: Dict[str, float] = {}
+        try:
+            for k, v in (self.info.all_mids() or {}).items():
+                try:
+                    out[k] = float(v)
+                except (TypeError, ValueError):
+                    continue
+        except Exception:
+            pass
+        return out
 
     def daily_closes(self, coins: List[str], lookback: int, *, pad: int = 12
                      ) -> Dict[str, np.ndarray]:
         """Recent CLOSED daily closes per coin (oldest→newest) for the momentum
-        signal. Public (no wallet). Drops the in-progress bar (T > now)."""
+        signal. Public (no wallet). Drops the in-progress bar (T > now). A
+        malformed response for one coin is skipped, never aborts the universe."""
         need = lookback + pad
         now_ms = int(time.time() * 1000)
         start = now_ms - (need + 3) * 86_400_000
@@ -104,32 +119,61 @@ class HLAdapter:
             try:
                 data = self.info.post("/info", {"type": "candleSnapshot", "req": {
                     "coin": c, "interval": "1d", "startTime": start, "endTime": now_ms}})
+                if not isinstance(data, list):
+                    continue
+                closed = [float(d["c"]) for d in data
+                          if isinstance(d, dict) and "c" in d and "T" in d
+                          and int(d["T"]) <= now_ms]
             except Exception:
                 continue
-            closed = [float(d["c"]) for d in data if int(d["T"]) <= now_ms]
             if len(closed) >= lookback + 1:
                 out[c] = np.asarray(closed, dtype=float)
             time.sleep(0.05)
         return out
 
-    def account_value(self) -> float:
+    def account_value(self) -> Optional[float]:
+        """Account value (USD). Retries; returns None on a TRANSIENT/empty read
+        (missing marginSummary) so a hiccup isn't mistaken for a real 0 /
+        drawdown. A genuine unfunded account returns 0.0."""
         if not self.address:
             return 0.0
-        st = self.info.user_state(self.address)
-        return float((st.get("marginSummary") or {}).get("accountValue", 0.0))
+        for i in range(3):
+            try:
+                st = self.info.user_state(self.address)
+                ms = st.get("marginSummary")
+                if ms is None or "accountValue" not in ms:
+                    time.sleep(0.4 * (i + 1)); continue
+                return float(ms["accountValue"])
+            except Exception:
+                time.sleep(0.4 * (i + 1))
+        return None
 
     def positions(self) -> Dict[str, dict]:
-        """{coin: {szi, entry_px, unrealized_pnl}} for open perp positions."""
+        """{coin: {szi, entry_px, unrealized_pnl}} for open perp positions.
+        Raises on a hard read failure (callers must NOT treat that as 'flat')."""
         if not self.address:
             return {}
         st = self.info.user_state(self.address)
         out: Dict[str, dict] = {}
         for ap in st.get("assetPositions", []) or []:
-            p = ap.get("position") or {}
-            szi = float(p.get("szi", 0.0))
-            if szi != 0.0:
-                out[p["coin"]] = {"szi": szi, "entry_px": float(p.get("entryPx") or 0.0),
-                                  "unrealized_pnl": float(p.get("unrealizedPnl") or 0.0)}
+            try:
+                p = ap.get("position") or {}
+                szi = float(p.get("szi", 0.0))
+                if szi != 0.0:
+                    out[p["coin"]] = {"szi": szi, "entry_px": float(p.get("entryPx") or 0.0),
+                                      "unrealized_pnl": float(p.get("unrealizedPnl") or 0.0)}
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
+    def book_notional(self) -> Dict[str, float]:
+        """Signed USD notional per held coin (szi * mark) — for notional-aware
+        reconcile / neutrality checks."""
+        mids = self.all_mids()
+        out: Dict[str, float] = {}
+        for coin, p in self.positions().items():
+            mk = mids.get(coin) or p.get("entry_px") or 0.0
+            out[coin] = p["szi"] * mk
         return out
 
     # ------------------------------------------------------------------ guard
@@ -146,36 +190,62 @@ class HLAdapter:
         return float(round(sz, d))
 
     # ----------------------------------------------------------------- orders
+    MIN_ORDER_USD = 10.0   # Hyperliquid minimum order value
+
     def market_order_usd(self, coin: str, is_buy: bool, usd_notional: float, *,
                          slippage: float = 0.05) -> HLOrderResult:
-        """Marketable IOC sized by USD notional (converted via mid, rounded to
-        the coin's szDecimals). Returns a parsed HLOrderResult."""
+        """Marketable IOC sized by USD notional (mid -> sz, rounded to szDecimals).
+        Enforces HL's $10 min and rejects if rounding moved the notional far, so a
+        leg is never silently mis-sized or dropped to 0. Never raises."""
         self._assert_can_trade()
+        if usd_notional < self.MIN_ORDER_USD:
+            return HLOrderResult(ok=False, raw={},
+                                 error=f"notional ${usd_notional:.2f} < ${self.MIN_ORDER_USD:.0f} min ({coin})")
         mid = self.all_mids().get(coin)
         if not mid or mid <= 0:
             return HLOrderResult(ok=False, raw={}, error=f"no mid for {coin}")
         sz = self._round_sz(coin, usd_notional / mid)
         if sz <= 0:
-            return HLOrderResult(ok=False, raw={}, error=f"size rounds to 0 for {coin}")
-        raw = self.exchange.market_open(coin, is_buy, sz, None, slippage)
+            return HLOrderResult(ok=False, raw={}, error=f"size rounds to 0 ({coin}, ${usd_notional:.2f})")
+        rounded = sz * mid
+        if rounded < self.MIN_ORDER_USD or abs(rounded - usd_notional) / usd_notional > 0.5:
+            return HLOrderResult(ok=False, raw={},
+                                 error=f"rounded notional ${rounded:.2f} off-target/below-min ({coin})")
+        try:
+            raw = self.exchange.market_open(coin, is_buy, sz, None, slippage)
+        except Exception as e:
+            return HLOrderResult(ok=False, raw={}, error=f"order exception: {e}")
         return self._parse_order(raw)
 
     def close(self, coin: str, *, slippage: float = 0.05) -> HLOrderResult:
         self._assert_can_trade()
-        return self._parse_order(self.exchange.market_close(coin, None, None, slippage))
+        try:
+            raw = self.exchange.market_close(coin, None, None, slippage)
+        except Exception as e:
+            return HLOrderResult(ok=False, raw={}, error=f"close exception: {e}")
+        if raw is None:                          # SDK returns None when nothing to close
+            return HLOrderResult(ok=True, raw={}, error=None)
+        return self._parse_order(raw)
 
     @staticmethod
-    def _parse_order(raw: dict) -> HLOrderResult:
+    def _parse_order(raw: Optional[dict]) -> HLOrderResult:
+        if raw is None:
+            return HLOrderResult(ok=False, raw={}, error="no response (None)")
         try:
             if raw.get("status") != "ok":
                 return HLOrderResult(ok=False, raw=raw, error=str(raw))
             statuses = raw["response"]["data"]["statuses"]
             filled = next((s["filled"] for s in statuses if "filled" in s), None)
             if filled:
-                return HLOrderResult(ok=True, raw=raw, filled_sz=float(filled["totalSz"]),
-                                     avg_px=float(filled["avgPx"]))
+                sz = float(filled["totalSz"])
+                return HLOrderResult(ok=sz > 0, raw=raw, filled_sz=sz,
+                                     avg_px=float(filled["avgPx"]),
+                                     error=None if sz > 0 else "zero fill")
             err = next((s["error"] for s in statuses if "error" in s), None)
-            return HLOrderResult(ok=err is None, raw=raw, error=err)
+            if err is not None:
+                return HLOrderResult(ok=False, raw=raw, error=err)
+            # resting/canceled IOC with no fill -> NOT filled (phantom-leg guard)
+            return HLOrderResult(ok=False, raw=raw, error="not filled (resting/canceled)")
         except (KeyError, TypeError, IndexError) as e:
             return HLOrderResult(ok=False, raw=raw, error=f"parse: {e}")
 

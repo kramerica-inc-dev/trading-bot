@@ -42,7 +42,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from xs_runner import XSState, Position, compute_target_weights  # noqa: E402
 from hl_adapter import (  # noqa: E402
-    HLAdapter, MODE_TESTNET, MODE_MAINNET_DRY, MODE_MAINNET_LIVE,
+    HLAdapter, MODE_TESTNET, MODE_MAINNET_DRY, MODE_MAINNET_LIVE, _mask,
 )
 
 PROJECT_ROOT = HERE.parent
@@ -71,7 +71,12 @@ class HLXSConfig:
 def load_config(path: str) -> HLXSConfig:
     raw = json.loads(Path(path).read_text())
     known = {f for f in HLXSConfig().__dataclass_fields__}
-    return HLXSConfig(**{k: v for k, v in raw.items() if k in known})
+    cfg = HLXSConfig(**{k: v for k, v in raw.items() if k in known})
+    if cfg.network not in ("testnet", "mainnet"):
+        raise ValueError(f"network must be 'testnet' or 'mainnet', got {cfg.network!r}")
+    if not isinstance(cfg.allow_live, bool):       # reject 'false'/0/1 strings — never silently go live
+        raise ValueError(f"allow_live must be a JSON boolean, got {cfg.allow_live!r}")
+    return cfg
 
 
 def _utcnow() -> datetime:
@@ -121,10 +126,14 @@ class HLXSRunner:
                 upnl += p.side * p.notional * (px / p.entry_price - 1.0)
         return s.cash + upnl
 
-    def equity(self, s: XSState, mids: Dict[str, float]) -> float:
-        if self.adapter.wallet is not None:
-            return self.adapter.account_value()      # real account
-        return self._sim_mark(s, mids)               # sim notional
+    def equity(self, s: XSState, mids: Dict[str, float]) -> Optional[float]:
+        """Live: real on-chain account value (None on a TRANSIENT read failure →
+        caller skips, never halts). Dry/sim: the simulated mark. Gated on
+        live_trading (NOT wallet presence) so a stray env key can't make DRY size
+        off real money."""
+        if self.live_trading:
+            return self.adapter.account_value()      # float, 0.0 (unfunded), or None
+        return self._sim_mark(s, mids)
 
     # -- targets -----------------------------------------------------------
     def _targets(self, closes, equity) -> Dict[str, float]:
@@ -132,30 +141,86 @@ class HLXSRunner:
         gross_book = equity * self.cfg.gross_exposure
         return {c: wt * gross_book for c, wt in w.items() if wt != 0.0}
 
+    # -- live book verification / remediation ------------------------------
+    def _verify_book(self, targets: Dict[str, float]):
+        """Does the live venue book == the intended dollar-neutral basket?
+        Notional-aware (szi*mark). Returns (ok, missing_legs, detail)."""
+        book = self.adapter.book_notional()          # {coin: signed usd}
+        missing = {}
+        for coin, tgt in targets.items():
+            cur = book.get(coin, 0.0)
+            if int(np.sign(cur)) != int(np.sign(tgt)) or abs(cur) < abs(tgt) * 0.5:
+                missing[coin] = tgt
+        extra = [c for c in book if c not in targets
+                 and abs(book[c]) > self.adapter.MIN_ORDER_USD]
+        ln = sum(v for v in book.values() if v > 0)
+        sn = -sum(v for v in book.values() if v < 0)
+        g = ln + sn
+        neutral = (g <= 0) or (abs(ln - sn) / g <= 0.15)
+        ok = (not missing) and (not extra) and neutral
+        return ok, missing, f"missing={list(missing)} extra={extra} L/S={ln:.0f}/{sn:.0f}"
+
+    def flatten_all(self) -> list:
+        """Close every live position (drawdown halt / failed-rebalance safety)."""
+        try:
+            coins = list(self.adapter.positions().keys())
+        except Exception as e:
+            return [{"act": "flatten", "ok": False, "err": f"positions read: {e}"}]
+        out = []
+        for coin in coins:
+            r = self.adapter.close(coin)
+            out.append({"act": "flatten", "coin": coin, "ok": r.ok, "err": r.error})
+        return out
+
     # -- execution: LIVE (testnet / mainnet-live) --------------------------
     def _execute_live(self, targets: Dict[str, float], now: datetime) -> dict:
-        cur = self.adapter.positions()               # {coin:{szi,...}}
         orders = []
-        # close positions leaving the basket or flipping side
+        try:
+            cur = self.adapter.positions()           # single snapshot
+        except Exception as e:
+            return {"action": "rebalance", "mode": self.mode, "execution": "live",
+                    "complete": False, "longs": [], "shorts": [],
+                    "orders": [{"act": "abort", "err": f"positions read: {e}"}]}
+        # 1. close legs leaving the basket or flipping side
         for coin, p in cur.items():
             tgt = targets.get(coin, 0.0)
-            cur_side = 1 if p["szi"] > 0 else -1
-            if tgt == 0.0 or int(np.sign(tgt)) != cur_side:
+            if tgt == 0.0 or int(np.sign(tgt)) != (1 if p["szi"] > 0 else -1):
                 r = self.adapter.close(coin)
                 orders.append({"act": "close", "coin": coin, "ok": r.ok, "err": r.error})
-        # open coins not already held on the correct side (size drift accepted v1)
-        cur2 = self.adapter.positions()
+        # 2. establish target legs not already held on the correct side
+        try:
+            held = self.adapter.positions()
+        except Exception:
+            held = cur
         for coin, tgt in targets.items():
-            held = cur2.get(coin)
-            if held and int(np.sign(held["szi"])) == int(np.sign(tgt)):
+            h = held.get(coin)
+            if h and int(np.sign(h["szi"])) == int(np.sign(tgt)):
                 continue
             r = self.adapter.market_order_usd(coin, tgt > 0, abs(tgt), slippage=self.cfg.slippage)
             orders.append({"act": "open", "coin": coin, "side": int(np.sign(tgt)),
                            "ok": r.ok, "filled": r.filled_sz, "err": r.error})
+        # 3. verify the realized book; bounded-retry missing legs; else FLATTEN
+        #    (never leave a one-legged / non-neutral book).
+        try:
+            ok, missing, detail = self._verify_book(targets)
+            for _ in range(2):
+                if ok:
+                    break
+                for coin, tgt in missing.items():
+                    r = self.adapter.market_order_usd(coin, tgt > 0, abs(tgt),
+                                                      slippage=self.cfg.slippage)
+                    orders.append({"act": "retry", "coin": coin, "ok": r.ok, "err": r.error})
+                ok, missing, detail = self._verify_book(targets)
+        except Exception as e:
+            ok, detail = False, f"verify error: {e}"
+        if not ok:
+            orders += self.flatten_all()             # back to flat, not one-legged
+            orders.append({"act": "rebalance_failed_flattened", "detail": detail})
         longs = sorted(c for c, t in targets.items() if t > 0)
         shorts = sorted(c for c, t in targets.items() if t < 0)
         return {"action": "rebalance", "mode": self.mode, "execution": "live",
-                "longs": longs, "shorts": shorts, "orders": orders}
+                "complete": bool(ok), "longs": longs, "shorts": shorts,
+                "orders": orders, "book": detail}
 
     # -- execution: SIM (mainnet-dry / no wallet) --------------------------
     def _execute_sim(self, s: XSState, targets: Dict[str, float],
@@ -194,13 +259,21 @@ class HLXSRunner:
     def reconcile(self, s: XSState, targets: Optional[Dict[str, float]]) -> dict:
         errs = []
         if self.live_trading:
-            pos = self.adapter.positions()
-            longs = [c for c, p in pos.items() if p["szi"] > 0]
-            shorts = [c for c, p in pos.items() if p["szi"] < 0]
-            if pos and abs(len(longs) - len(shorts)) > 1:
-                errs.append(f"venue not balanced: {len(longs)}L/{len(shorts)}S")
-            if len(pos) > 2 * self.cfg.m:
-                errs.append(f"venue {len(pos)} positions > 2m={2*self.cfg.m}")
+            # NOTIONAL-aware (szi*mark), not count-only: a count-balanced but
+            # size-skewed book is exactly the loss of dollar-neutrality we guard.
+            try:
+                book = self.adapter.book_notional()
+            except Exception as e:
+                s.last_reconcile_ok = False
+                return {"ok": False, "errors": [f"book read failed: {e}"]}
+            ln = sum(v for v in book.values() if v > 0)
+            sn = -sum(v for v in book.values() if v < 0)
+            g = ln + sn
+            if g > 0 and abs(ln - sn) / g > 0.15:
+                errs.append(f"venue not dollar-neutral: {ln:.0f}L/{sn:.0f}S")
+            n_legs = len([c for c in book if abs(book[c]) > self.adapter.MIN_ORDER_USD])
+            if n_legs > 2 * self.cfg.m:
+                errs.append(f"venue {n_legs} legs > 2m={2*self.cfg.m}")
         else:
             ln = sum(p.notional for p in s.positions.values() if p.side > 0)
             sn = sum(p.notional for p in s.positions.values() if p.side < 0)
@@ -216,7 +289,7 @@ class HLXSRunner:
         h = {"ts": _utcnow().isoformat(), "instance": self.cfg.instance_name,
              "mode": self.mode, "venue": "hyperliquid", "live_trading": self.live_trading,
              "have_wallet": self.adapter.wallet is not None,
-             "account": (self.adapter.address if self.adapter.wallet else None),
+             "account": (_mask(self.adapter.address) if self.adapter.wallet else None),
              "cycles_total": s.cycles_total, "rebalances_total": s.rebalances_total,
              "skips_total": s.skips_total, "equity": round(s.equity, 2),
              "peak_equity": round(s.peak_equity, 2), "drawdown_pct": round(dd * 100, 2),
@@ -252,32 +325,50 @@ class HLXSRunner:
             return {"action": "skip", "reason": f"insufficient data ({len(closes)} assets)"}
         mids = self.adapter.all_mids()
 
-        s.equity = self.equity(s, mids)
-        if s.cycles_total == 1:                      # anchor peak to the true starting equity
-            s.peak_equity = s.equity
-        if self.live_trading and s.equity < 5.0:     # live account not funded yet
+        eq = self.equity(s, mids)
+        if eq is None:                               # TRANSIENT account read — skip, never halt
             s.skips_total += 1
             self.save_state(s)
-            self.write_health(s, {"last_action": "skip",
-                                  "reason": "account unfunded — deposit USDC to trade"})
+            self.write_health(s, {"last_action": "skip", "reason": "account read transient"})
+            return {"action": "skip", "reason": "transient account read failure"}
+        s.equity = eq
+        if s.cycles_total == 1:                       # anchor peak to true starting equity
+            s.peak_equity = s.equity
+        if self.live_trading and s.equity < 5.0:      # live account not funded yet
+            s.skips_total += 1
+            self.save_state(s)
+            self.write_health(s, {"last_action": "skip", "reason": "account unfunded"})
             return {"action": "skip",
                     "reason": f"account unfunded (eq={s.equity}); deposit USDC to {self.adapter.address}"}
         s.peak_equity = max(s.peak_equity, s.equity)
         dd = (s.peak_equity - s.equity) / s.peak_equity if s.peak_equity > 0 else 0.0
-        if dd >= cfg.halt_drawdown_pct and s.cb_state != "halted":
+
+        # Circuit breaker. Two halt states: "halted" = drawdown breaker
+        # (auto-recovers when dd falls well below the line); "op_halt" =
+        # operational failure (failed rebalance / reconcile divergence — manual
+        # clear only). On a NEW drawdown halt, FLATTEN the live book (de-risk).
+        if dd >= cfg.halt_drawdown_pct and s.cb_state not in ("halted", "op_halt"):
             s.cb_state = "halted"
-            self.log({"action": "circuit_breaker_halt", "drawdown_pct": round(dd * 100, 2)})
-        if s.cb_state == "halted":
-            self.reconcile(s, None)
-            self.save_state(s)
-            self.write_health(s, {"last_action": "halted"})
-            return {"action": "halted", "drawdown_pct": round(dd * 100, 2)}
+            flat = self.flatten_all() if self.live_trading else []
+            self.log({"action": "circuit_breaker_halt", "drawdown_pct": round(dd * 100, 2),
+                      "flattened": flat})
+        if s.cb_state in ("halted", "op_halt"):
+            if s.cb_state == "halted" and dd < cfg.halt_drawdown_pct * 0.5:
+                s.cb_state = "normal"
+                self.log({"action": "circuit_breaker_resume", "drawdown_pct": round(dd * 100, 2)})
+            else:
+                if self.live_trading:                 # keep the book flat while halted
+                    self.flatten_all()
+                self.save_state(s)
+                self.write_health(s, {"last_action": "halted", "cb_state": s.cb_state,
+                                      "drawdown_pct": round(dd * 100, 2)})
+                return {"action": "halted", "cb_state": s.cb_state,
+                        "drawdown_pct": round(dd * 100, 2)}
 
         result = {"action": "noop"}
         targets = None
         if self._should_rebalance(s, now):
-            equity = self.equity(s, mids)
-            targets = self._targets(closes, equity)
+            targets = self._targets(closes, s.equity)
             if not targets:
                 result = {"action": "skip", "reason": "no target weights"}
                 s.skips_total += 1
@@ -285,14 +376,27 @@ class HLXSRunner:
                 result = (self._execute_live(targets, now) if self.live_trading
                           else self._execute_sim(s, targets, mids, now))
                 s.rebalances_total += 1
-                s.last_rebalance_ts = now.isoformat()
+                if self.live_trading and not result.get("complete", True):
+                    # rebalance could not be completed — _execute_live already
+                    # flattened the book; halt for an operator (no churn loop).
+                    s.cb_state = "op_halt"
+                    self.log({"action": "rebalance_halt", "book": result.get("book")})
+                elif result.get("complete", True):
+                    s.last_rebalance_ts = now.isoformat()   # advance only on a complete rebalance
             self.log(result)
 
-        s.equity = self.equity(s, mids)
-        s.peak_equity = max(s.peak_equity, s.equity)
+        eq2 = self.equity(s, mids)
+        if eq2 is not None:
+            s.equity = eq2
+            s.peak_equity = max(s.peak_equity, s.equity)
         rec = self.reconcile(s, targets)
         if not rec["ok"]:
             self.log({"action": "reconcile", **rec})
+            if self.live_trading and s.cb_state == "normal":
+                # safety net: a non-neutral / over-legged live book -> flatten + halt
+                flat = self.flatten_all()
+                s.cb_state = "op_halt"
+                self.log({"action": "reconcile_halt", "flattened": flat, "errors": rec["errors"]})
         self.save_state(s)
         self.write_health(s, {"last_action": result["action"], "n_assets": len(closes),
                               "reconcile_ok": rec["ok"]})

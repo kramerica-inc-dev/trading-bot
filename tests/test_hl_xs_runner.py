@@ -34,15 +34,52 @@ def _closes(finals):
 
 @unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
 class TestConfig(unittest.TestCase):
-    def test_load_config_filters_unknown(self, ):
-        import json, tempfile, os
-        d = {"instance_name": "x", "m": 2, "network": "testnet", "bogus": 1}
+    def _write(self, d):
+        import json, tempfile
         p = Path(tempfile.mkdtemp()) / "c.json"
         p.write_text(json.dumps(d))
-        cfg = R.load_config(str(p))
+        return str(p)
+
+    def test_load_config_filters_unknown(self):
+        cfg = R.load_config(self._write({"instance_name": "x", "m": 2, "network": "testnet", "bogus": 1}))
         self.assertEqual(cfg.m, 2)
         self.assertEqual(cfg.network, "testnet")
         self.assertFalse(hasattr(cfg, "bogus"))
+
+    def test_load_config_rejects_string_allow_live(self):
+        # the critical guard: a JSON-string boolean must NOT be accepted
+        with self.assertRaises(ValueError):
+            R.load_config(self._write({"network": "mainnet", "allow_live": "false"}))
+
+    def test_load_config_rejects_bad_network(self):
+        with self.assertRaises(ValueError):
+            R.load_config(self._write({"network": "demo"}))
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestVerifyBook(unittest.TestCase):
+    def _stub(self, book):
+        cfg = R.HLXSConfig(m=2)
+        adapter = types.SimpleNamespace(book_notional=lambda: book, MIN_ORDER_USD=10.0)
+        return types.SimpleNamespace(cfg=cfg, adapter=adapter)
+
+    def test_balanced_book_ok(self):
+        stub = self._stub({"A": 1000.0, "B": 1000.0, "C": -1000.0, "D": -1000.0})
+        ok, missing, _ = R.HLXSRunner._verify_book(stub, {"A": 1000.0, "B": 1000.0, "C": -1000.0, "D": -1000.0})
+        self.assertTrue(ok)
+        self.assertEqual(missing, {})
+
+    def test_one_legged_book_fails(self):
+        stub = self._stub({"A": 1000.0, "B": 1000.0})   # shorts never filled
+        ok, missing, _ = R.HLXSRunner._verify_book(stub, {"A": 1000.0, "B": 1000.0, "C": -1000.0, "D": -1000.0})
+        self.assertFalse(ok)
+        self.assertEqual(sorted(missing), ["C", "D"])
+
+    def test_size_skewed_book_fails(self):
+        # count-balanced 2L/2S but shorts tiny -> not dollar-neutral
+        stub = self._stub({"A": 1000.0, "B": 1000.0, "C": -100.0, "D": -100.0})
+        ok, _, _ = R.HLXSRunner._verify_book(stub, {"A": 1000.0, "B": 1000.0, "C": -1000.0, "D": -1000.0})
+        self.assertFalse(ok)
 
 
 @unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
