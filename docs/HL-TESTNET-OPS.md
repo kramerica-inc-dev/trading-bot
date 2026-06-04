@@ -5,24 +5,51 @@ runs on the LXC in **MAINNET_DRY** (forward-paper on real prices, no wallet,
 no orders). To validate the **real order path on testnet** (mock money, zero
 financial risk), do the following. Testnet = `app.hyperliquid-testnet.xyz`.
 
-## 1. Create + fund a testnet wallet (your step)
-- Open `app.hyperliquid-testnet.xyz`, connect an EVM wallet (MetaMask/Rabby).
-- Claim **mock USDC** from the testnet faucet (the UI's "claim test funds" /
-  deposit-mock flow). A few hundred USDC is plenty.
-- **Recommended (safer pattern): use an API/agent wallet** — in the HL UI go to
-  *API → generate agent wallet*. The agent key can place orders but **cannot
-  withdraw**, so the runner never holds your main key. The agent trades the main
-  account.
-  - Single-wallet alternative (fine for testnet mock money): just use the funded
-    wallet's own private key; no separate account address needed.
+## 1. Unlock the faucet + create a trading key (your step)
+
+**The testnet faucet is GATED** (official anti-bot rule, verified 2026-06-04): it
+only pays out to an address that has **already deposited on Hyperliquid mainnet**.
+So this is a two-network flow — one tiny **real** deposit on **mainnet** unlocks
+**mock** money on **testnet**. The runner only ever trades the testnet mock money;
+the mainnet deposit just sits there.
+
+### 1a. Unlock — one small real mainnet deposit (~$10)
+- In your self-custody EVM wallet (OKX), on **Arbitrum One**, hold: ~10 USDC of
+  **native** Arbitrum USDC (`0xaf88d065e77c8cC2239327C5EDb3A432268e5831`, **not**
+  bridged USDC.e) + a little Arbitrum **ETH** for gas.
+- Open the **official** mainnet app `https://app.hyperliquid.xyz` (verify the URL
+  — phishing clones exist), connect OKX, **Deposit** → Arbitrum One → USDC → ~10.
+  First deposit needs a one-time on-chain `approve` tx (a few cents of Arb ETH).
+  **⚠️ Never send < 5 USDC — anything below the 5 USDC minimum is lost forever.**
+  Credits in < 1 min. (Mainnet bridge is `0x2df1c51e09aecf9cacb7bc98cb1742757f163df7`;
+  the *testnet* bridge is a different address and does NOT unlock the faucet.)
+
+### 1b. Claim the testnet mock USDC
+- Open `https://app.hyperliquid-testnet.xyz`, connect the **same** OKX address
+  (do **not** use email/Privy login — it yields a different address and the gate
+  won't see your deposit), go to `/drip`, click **Claim 1000 Mock USDC**. One-time
+  claim, 1,000 mock USDC in seconds. All trading from here is mock money.
+
+### 1c. Create an agent (API) wallet for the bot — never use your main key
+- Testnet UI: **More → API**, name the agent, set an expiry (~30d), Generate, then
+  **Authorize** (sign `approveAgent` in OKX — gas-free EIP-712; the master must be
+  funded, which your mock USDC covers). **Save the agent private key shown once.**
+- The agent key can place/cancel orders but **cannot withdraw or transfer out** —
+  a leaked bot key can't drain you (it *can* still trade/liquidate, so guard it).
+  The bot signs with the agent key but **trades/queries the master account**, so
+  you MUST set `HL_ACCOUNT_ADDRESS` to your **master public address** (step 2).
+  Querying the agent's own address returns empty balances and silently breaks the
+  runner.
+  - Single-wallet alternative (fine for testnet mock money): use the funded
+    wallet's own private key as `HL_PRIVATE_KEY` and omit `HL_ACCOUNT_ADDRESS`.
 
 ## 2. Put the key on the LXC (env file, chmod 600)
 ```bash
 ssh root@trading-bot
 cat > /etc/trading-bot/hl-xsectional-main.env <<'EOF'
-HL_PRIVATE_KEY=0x<agent-or-wallet-private-key>
-# only if using an AGENT wallet for a different main account:
-# HL_ACCOUNT_ADDRESS=0x<main-account-address>
+HL_PRIVATE_KEY=0x<AGENT private key>
+HL_ACCOUNT_ADDRESS=0x<MASTER public address>   # required with an agent wallet: the account it trades
+# (single-wallet alt: use the wallet's own key above and omit HL_ACCOUNT_ADDRESS)
 EOF
 chmod 600 /etc/trading-bot/hl-xsectional-main.env
 ```
