@@ -46,19 +46,7 @@ DEFAULT_INSTANCE = "plan-e-base"
 # scripts/carry_runner.py — the runner nests its instance dirs under
 # `carry/` so they don't collide with Plan E's flat `state/plan-e-*/`).
 CARRY_STATE_DIR = STATE_DIR / "carry"
-# BH-overlay runner state lives under `state/bh_overlay/<instance>/`. Mirrors
-# the carry layout for namespace isolation (see scripts/bh_overlay_runner.py).
-BH_OVERLAY_STATE_DIR = STATE_DIR / "bh_overlay"
-# CARRY_INSTANCE_NAME_RE / BH_OVERLAY_INSTANCE_NAME_RE compiled below.
-
-# Backtest results (Fase 1: benchmark + risk-adjusted metrics).  Prefer the
-# deployed location under BOT_DIR; fall back to the repo layout next to this
-# file so the dashboard works in a checkout too.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKTEST_BASELINE_CANDIDATES = [
-    BOT_DIR / "backtest" / "results" / "baseline_latest.json",
-    _REPO_ROOT / "backtest" / "results" / "baseline_latest.json",
-]
+# CARRY_INSTANCE_NAME_RE compiled below.
 
 # DHCP watchdog event log (written by /usr/local/bin/dhcp-watchdog.sh on the
 # LXC). Read-only; fail-open if missing so deployments without the watchdog
@@ -73,8 +61,86 @@ import re  # noqa: E402
 INSTANCE_NAME_RE = re.compile(r"^plan-e-[a-z0-9]{1,16}$")
 # Carry instance names — short safe charset, can't escape the carry dir.
 CARRY_INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-# Same charset for BH-overlay instances (paper-only runner — see runner module).
-BH_OVERLAY_INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+# ---------------------------------------------------------------------------
+# Current research route & scope (served at /api/sweep/status). This is the
+# strategy-sweep narrative — what's live, what's a lead, what's parked/dead —
+# so the dashboard reflects where the project actually is. Static manifest
+# (the sweep is offline research); update it when the route changes.
+# ---------------------------------------------------------------------------
+SWEEP_ROUTE = {
+    "route": "OKX strategy sweep (V3) — paper-only, lighter regime",
+    "updated": "2026-06-04",
+    "summary": ("Price-directional lanes are dead even on fresh OKX data; two "
+                "candidates clear the random-entry null — cross-sectional "
+                "momentum and VRP short-vol. VRP was deepened with a faithful "
+                "option-replication model."),
+    "candidates": [
+        {
+            "name": "Cross-sectional momentum",
+            "venue": "OKX perp long-short",
+            "status": "LEAD",
+            "verdict": "PARTIAL — paper-candidate (OOS-surviving, modest)",
+            "metrics": ["config lb=120 / rebal=5 / m=3",
+                        "OOS holdout 97.4th pct, IC 0.119 (p=0.047)",
+                        "~4%/yr funding headwind (~5x margin)",
+                        "needs perp access (acctLv>=2)"],
+            "note": ("Market-neutral, simple. Honest expectation ~ single- to "
+                     "low-double-digit %/yr, not the +242% full-sample."),
+        },
+        {
+            "name": "VRP short-vol",
+            "venue": "options · Deribit",
+            "status": "LEAD",
+            "verdict": "faithful-replication-proof; constraint = tail management",
+            "metrics": ["+6.4 vol-pts/mo, t=2.34, Sharpe 1.24 (6bps/1vp)",
+                        "null 98th, 3/3 sub-periods, 100% of 30 roll-offsets +",
+                        "tail = multi-day burst, not a gap",
+                        "static OTM wings = a wash (hand back the premium)"],
+            "note": ("Strongest premium in the project. Next: walk-forward the "
+                     "DVOL-richness filter offline before any Deribit build. "
+                     "Venue offshore (MED regulatory). See docs/VRP-DEEPENING.md."),
+        },
+        {
+            "name": "Carry (cash-and-carry)",
+            "venue": "spot + perp",
+            "status": "PARKED",
+            "verdict": "venue-blocked now — kept as a potential direction",
+            "metrics": ["backtest ~+11%/yr, Calmar ~6.7 (BloFin funding)",
+                        "OKX EU acctLv=1 (MiCA) blocks the perp short",
+                        "BloFin has no spot trading API"],
+            "note": ("Feasibility is platform-dependent — may be feasible on "
+                     "another venue/entity. Runner + adapter kept, revivable."),
+        },
+        {
+            "name": "Cross-sectional funding carry",
+            "venue": "perp basket",
+            "status": "KILLED",
+            "verdict": "no clean harvest (price-leg noise dominates)",
+            "metrics": ["gross funding dispersion ~12.4%/yr exists",
+                        "basket not beta-neutral -> price drift swamps it"],
+            "note": "",
+        },
+        {
+            "name": "Cross-venue basis",
+            "venue": "spot multi-venue",
+            "status": "DEFERRED",
+            "verdict": "low value on daily data — needs intraday multi-venue feeds",
+            "metrics": ["not pursued this round"],
+            "note": "",
+        },
+    ],
+    "dead_lanes": [
+        "'advanced' MultiIndicatorConfluence — no entry edge (8-axis diagnosis)",
+        "Plan-D single-asset mean-reversion — no edge",
+        "v1 trend + vol-target overlay — failed the random-entry null",
+        "4 single-asset directional families on OKX — all inside the null band",
+    ],
+    "current_focus": ("VRP deepening complete (faithful replication confirms the "
+                      "premium; tail can't be cheaply wing-hedged)."),
+    "next_step": ("walk-forward / OOS the momentum lead and the VRP DVOL-richness "
+                  "filter on data in hand; do NOT build the Deribit adapter yet."),
+}
 
 # Simple CSRF/auth token — generated once per process start, embedded in the
 # served HTML, required on POST /api/control. Tailscale-private network so
@@ -838,132 +904,6 @@ def _read_carry_trades(instance: str, limit: int = 50) -> List[Dict[str, Any]]:
     return list(reversed(rows))
 
 
-# ---------------------------------------------------------------------------
-# BH-Overlay (fallback paper runner) readers
-# ---------------------------------------------------------------------------
-
-# Cap recent equity history points in the /state summary so the response stays
-# small (per the spec — "cap recent equity history at 500 pts").
-BH_OVERLAY_EQUITY_POINTS_MAX = 500
-
-
-def _validate_bh_overlay_instance(instance: str) -> str:
-    if not instance or not BH_OVERLAY_INSTANCE_NAME_RE.match(instance):
-        raise ValueError(f"invalid bh_overlay instance: {instance!r}")
-    return instance
-
-
-def _bh_overlay_instance_dir(instance: str) -> Path:
-    return BH_OVERLAY_STATE_DIR / _validate_bh_overlay_instance(instance)
-
-
-def _list_bh_overlay_instances() -> List[Dict[str, Any]]:
-    """Scan `state/bh_overlay/*/` and return a compact summary per instance."""
-    out: List[Dict[str, Any]] = []
-    if not BH_OVERLAY_STATE_DIR.exists():
-        return out
-    for child in sorted(BH_OVERLAY_STATE_DIR.iterdir()):
-        if not child.is_dir():
-            continue
-        name = child.name
-        if not BH_OVERLAY_INSTANCE_NAME_RE.match(name):
-            continue
-        health_path = child / "health.json"
-        if not health_path.exists():
-            continue
-        h = _read_json_file(health_path, {}) or {}
-        out.append({
-            "instance": name,
-            "mode": h.get("mode"),
-            "paper_only": h.get("paper_only", True),
-            "halted": h.get("halted", False),
-            "halt_reason": h.get("halt_reason"),
-            "last_cycle_ts": h.get("last_cycle_ts"),
-            "cycles_total": h.get("cycles_total", 0),
-            "asset": h.get("asset"),
-        })
-    return out
-
-
-def _read_bh_overlay_state_summary(instance: str) -> Dict[str, Any]:
-    """Summary of `state/bh_overlay/<instance>/state.json` plus a capped
-    equity-curve sourced from `trades.log` (last 500 rebalance/hold entries).
-    Drops nothing sensitive — paper-only runner, no credentials persisted.
-    """
-    inst_dir = _bh_overlay_instance_dir(instance)
-    state = _read_json_file(inst_dir / "state.json", None)
-    if state is None:
-        return {"_error": "no state.json"}
-
-    # Build a downsampled equity curve from the trades log so the chart has
-    # historical context without re-running the strategy in the browser.
-    trades_path = inst_dir / "trades.log"
-    trades = _read_jsonl_file(trades_path, max_lines=2000)
-    equity_curve: List[Dict[str, Any]] = []
-    for t in trades:
-        equity_curve.append({
-            "ts": t.get("ts"),
-            "btc_close": t.get("btc_close"),
-            "simulated_equity": t.get("simulated_equity"),
-            "bh_equity": t.get("bh_equity"),
-            "current_exposure": t.get("current_exposure"),
-            "rebalanced": t.get("rebalanced", False),
-            "action_kind": (t.get("action") or {}).get("kind"),
-        })
-    # Cap to MAX points by step-decimation (keep first + last + evenly spaced).
-    if len(equity_curve) > BH_OVERLAY_EQUITY_POINTS_MAX:
-        step = max(1, len(equity_curve) // BH_OVERLAY_EQUITY_POINTS_MAX)
-        decimated = [equity_curve[i] for i in range(0, len(equity_curve), step)]
-        if decimated[-1] is not equity_curve[-1]:
-            decimated.append(equity_curve[-1])
-        equity_curve = decimated
-
-    return {
-        "instance": instance,
-        "started_ts": state.get("started_ts"),
-        "last_cycle_ts": state.get("last_cycle_ts"),
-        "last_decision_date": state.get("last_decision_date"),
-        "last_decision_bar_ts": state.get("last_decision_bar_ts"),
-        "cycles_total": state.get("cycles_total", 0),
-        "rebalances_total": state.get("rebalances_total", 0),
-        "stops_fired_total": state.get("stops_fired_total", 0),
-        "reentries_total": state.get("reentries_total", 0),
-        "fees_paid_total": state.get("fees_paid_total", 0.0),
-        "simulated_equity": state.get("simulated_equity", 0.0),
-        "current_exposure": state.get("current_exposure", 0.0),
-        "bh_equity": state.get("bh_equity", 0.0),
-        "bh_anchor_close": state.get("bh_anchor_close", 0.0),
-        "bh_initialized": state.get("bh_initialized", False),
-        "peak_equity": state.get("peak_equity", 0.0),
-        "peak_equity_ts": state.get("peak_equity_ts"),
-        "last_dd_pct": state.get("last_dd_pct", 0.0),
-        "days_under_water": state.get("days_under_water", 0),
-        "last_btc_close": state.get("last_btc_close", 0.0),
-        "halted": state.get("halted", False),
-        "halt_reason": state.get("halt_reason"),
-        "last_mode": state.get("last_mode"),
-        "strategy_state": state.get("strategy_state", {}),
-        "equity_curve": equity_curve,
-        "equity_curve_points": len(equity_curve),
-    }
-
-
-def _read_bh_overlay_trades(instance: str, limit: int = 50) -> List[Dict[str, Any]]:
-    """Most-recent JSONL entries from `trades.log`, newest-first."""
-    inst_dir = _bh_overlay_instance_dir(instance)
-    trades_path = inst_dir / "trades.log"
-    limit = max(1, min(int(limit or 50), 500))
-    rows = _read_jsonl_file(trades_path, max_lines=limit)
-    return list(reversed(rows))
-
-
-# ---------------------------------------------------------------------------
-# Service control (start/stop Plan E runner)
-# ---------------------------------------------------------------------------
-
-_TEMPLATE_UNIT_RE = re.compile(r"^plan-e@[a-z0-9]{1,16}$")
-
-
 def _unit_allowed(unit: str) -> bool:
     if unit in CONTROLLABLE_SERVICES:
         return True
@@ -1153,23 +1093,6 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
-        elif path == "/api/backtest/baseline":
-            # Latest baseline backtest: strategy + BTC buy-and-hold benchmark,
-            # risk-adjusted metrics and conditional (bull/bear/sideways) stats.
-            try:
-                payload = None
-                for cand in BACKTEST_BASELINE_CANDIDATES:
-                    if cand.exists():
-                        payload = _read_json_file(cand, None)
-                        if payload is not None:
-                            break
-                if payload is None:
-                    self._send_json({"error": "no baseline backtest available"}, 404)
-                else:
-                    self._send_json(payload)
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
         elif path == "/api/carry/instances":
             # List carry instances with a compact health summary each.
             try:
@@ -1225,59 +1148,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
 
-        elif path == "/api/bh_overlay/instances":
-            try:
-                self._send_json({"instances": _list_bh_overlay_instances()})
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
-
-        elif path.startswith("/api/bh_overlay/"):
-            # Per-instance endpoints: /api/bh_overlay/<instance>/{health,state,trades}
-            try:
-                tail = path[len("/api/bh_overlay/"):]
-                parts = tail.split("/")
-                if len(parts) != 2:
-                    self._send_json({"error": "not found"}, 404)
-                    return
-                instance, resource = parts[0], parts[1]
-                _validate_bh_overlay_instance(instance)
-                inst_dir = BH_OVERLAY_STATE_DIR / instance
-
-                if resource == "health":
-                    health_path = inst_dir / "health.json"
-                    if not health_path.exists():
-                        self._send_json({"error": "health.json not found"}, 404)
-                        return
-                    payload = _read_json_file(health_path, None)
-                    if payload is None:
-                        self._send_json({"error": "health.json not readable"}, 404)
-                    else:
-                        self._send_json(payload)
-                elif resource == "state":
-                    state_path = inst_dir / "state.json"
-                    if not state_path.exists():
-                        self._send_json({"error": "state.json not found"}, 404)
-                        return
-                    self._send_json(_read_bh_overlay_state_summary(instance))
-                elif resource == "trades":
-                    try:
-                        limit = int(q.get("limit", "50"))
-                    except (TypeError, ValueError):
-                        limit = 50
-                    trades_path = inst_dir / "trades.log"
-                    if not trades_path.exists():
-                        self._send_json({"error": "trades.log not found"}, 404)
-                        return
-                    self._send_json({
-                        "instance": instance,
-                        "trades": _read_bh_overlay_trades(instance, limit=limit),
-                    })
-                else:
-                    self._send_json({"error": "unknown bh_overlay resource"}, 404)
-            except ValueError as e:
-                self._send_json({"error": str(e)}, 400)
-            except Exception as e:
-                self._send_json({"error": str(e)}, 500)
+        elif path == "/api/sweep/status":
+            # Current research route & scope (static manifest, see SWEEP_ROUTE).
+            self._send_json(SWEEP_ROUTE)
 
         elif path == "/api/system/dhcp":
             self._send_json(_read_dhcp_status())

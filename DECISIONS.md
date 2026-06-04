@@ -165,3 +165,22 @@ Probed the OKX EU API directly (with the working demo creds) to see what could b
 **Review condition.** Revisit point 1 when any of: (a) BloFin's spot trading API ships, (b) OKX EU loosens its EU retail acctLv cap, (c) a different licensed-in-NL exchange offers spot+perp with API access, (d) the user opens an account under a non-EU entity. Otherwise the carry stays parked.
 
 ---
+## 2026-06-04 — VRP deepened (premium real, tail un-hedgeable cheaply); dashboard/trader pruned to the live route
+
+**Context.** The OKX-sweep V3 surfaced two candidates past the random-entry null: cross-sectional momentum (perp, OKX) and VRP short-vol (options, Deribit). VRP was the stronger but had only been tested through a variance-swap proxy. This session built a faithful option-replication model (`backtest/sweep/vrp_replication.py`, 8 tests): Black-Scholes short ATM straddle, daily delta-hedge at frozen IV, real hedge + option-spread costs, held to expiry, plus a long-OTM-wing tail-hedge. A 5-agent adversarial validation workflow independently reproduced every number and caught two first-draft errors (a "−16% of capital" tail figure that is actually −10.1%, and a dynamic-sizing thesis that was backwards). Full write-up: `docs/VRP-DEEPENING.md`.
+
+**Findings.**
+1. **The VRP premium SURVIVES faithful replication.** Naked delta-hedged short straddle at realistic costs (6 bps hedge / 1 vp option spread) = **+6.4 vol-pts/mo, t=2.34, Sharpe 1.24, null 98th, 3/3 sub-periods, 100% of 30 roll-offsets positive**; survives dropping the FTX-era outlier (+4.7, p=0.038). The dollar-gamma weighting did not erode it. This is the project's most-validated edge.
+2. **The tail is un-hedgeable cheaply.** The −50 vp worst month is a multi-day high-vol BURST starting from calm, not a single gap. Static OTM wings are gap insurance → a near-pure cost: no symmetric or put-only wing beats naked at a matched worst-month budget; the symmetric hedge cuts return ~5× (40.6%/yr → 7.4%/yr) without improving the dollar-scale worst month.
+3. **Dynamic de-risking only helps in the INVERSE of the intuitive thesis** — the edge lives in HIGH-IV entries (corr +0.64) and the tail starts calm, so "cut size when vol rises" is backwards. The robust rule is "sell vol only when DVOL is rich," but its tail benefit is knife-edge / single-outlier-driven (best-of-sweep p=0.16) → suggestive, not proven.
+4. **Deribit feasibility: MED, a live-decision gate not a research gate.** DVOL backfillable; option-surface skew is live-snapshot only (forward-collect needed). Venue reachable by an NL retail user offshore (Panama entity + KYC) but unregulated-in-EU; the compliant Coinbase-EU route is futures-only in 2026.
+
+**Decision.**
+1. **Next VRP step = walk-forward / OOS-validate the DVOL-richness filter OFFLINE on data in hand** (cheapest high-value test). Do **not** build the Deribit options-adapter + delta-hedge loop until that passes. The momentum lead stays the parallel paper-candidate (needs perp access).
+2. **Dashboard + trader pruned to the live route.** Removed the "BH Overlay" fallback lane (no demonstrated edge — runner/strategy/config/systemd/tests + dashboard tab + API all deleted) and the "Backtest" tab (the deprecated 'advanced' baseline view; the benchmark/metrics *backtester* code stays — shared infra). Added an "OKX Sweep" tab + `/api/sweep/status` reflecting the current route.
+3. **Carry is explicitly KEPT as a parked-but-potential direction** (per user, 2026-06-04): its feasibility is platform-dependent and may be viable on another venue/entity. Runner, position math, OKX adapter, config, systemd unit, and the "OKX Carry" dashboard tab all stay.
+4. **The deprecated 'advanced'/Plan-D/v1 strategy SOURCE stays in the repo** (option A): it's entangled with the disabled legacy bot + ~10 tests, and the bot is already operationally disabled. Only its dashboard presence was removed. A deeper source-level removal is a separate, larger refactor if ever wanted.
+
+**LXC follow-up (manual — prod SSH not auto-authorized this session):** stop+disable `bh_overlay@btc`, remove its unit + state, and redeploy the dashboard. Plan E paper instances and `carry@btc` (already stopped) are untouched.
+
+---
