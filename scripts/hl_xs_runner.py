@@ -386,7 +386,12 @@ class HLXSRunner:
             self.log(result)
 
         eq2 = self.equity(s, mids)
-        if eq2 is not None:
+        # Guard a TRANSIENT post-trade read: right after fills the venue's
+        # spot/perp collateral split can momentarily under-report (settles in
+        # ~1s). A single rebalance cannot really lose >50%, so treat such a read
+        # as transient and keep the (settled) pre-rebalance equity — never let it
+        # poison peak_equity / the drawdown breaker.
+        if eq2 is not None and not (s.equity > 0 and eq2 < 0.5 * s.equity):
             s.equity = eq2
             s.peak_equity = max(s.peak_equity, s.equity)
         rec = self.reconcile(s, targets)

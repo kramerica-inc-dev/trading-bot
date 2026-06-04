@@ -215,3 +215,17 @@ Probed the OKX EU API directly (with the working demo creds) to see what could b
 **Decision.** The execution path is **reopened** but the venue choice has a legal/tax dimension that is the user's (grey-area offshore/DEX vs gated-but-compliant EU CEX). No venue committed yet. **This is a factual feasibility assessment, not legal/tax advice** — the user should confirm NL tax/legality before deploying real capital. Recommended sequencing: (1) momentum first (a working DRY_RUN runner already exists), via either Hyperliquid (fast, grey) or Kraken-EU/OKX-X-Perps (compliant, gated); (2) carry follows on the same venue; (3) VRP/Deribit last. The momentum DRY_RUN forward-paper keeps running meanwhile. Open questions (10-asset coverage on the compliant venues, Deribit NL-retail end-to-end, Hyperliquid net-edge at size) to verify before capital.
 
 ---
+
+## 2026-06-04 — Hyperliquid momentum runner VALIDATED on testnet (real orders, mock money)
+
+**Context.** User approved option A (a ~$10 real mainnet deposit to unlock the HL testnet faucet — the grey-area call is theirs). Faucet mechanics were adversarially re-verified (gated on a prior mainnet deposit; native Arbitrum USDC; 5 USDC floor; 1000 mock USDC). User deposited 57.52 USDC on mainnet, claimed 1000 mock USDC, created an **agent (API) wallet** (master `0x70Cb…4c89`, agent `0x34B9…5B12`). Runner flipped TESTNET on `hl-xsectional@main`.
+
+**Findings (all caught on mock money, none on real capital).**
+1. **Unified-account funds split.** HL's default *unified account* keeps USDC collateral in the **spot** clearinghouse; the per-perp `marginSummary.accountValue` reads a "not meaningful" 0. Fix: `account_value = perp accountValue + free spot USDC (total − hold)` — correct in unified AND standard modes (no Spot→Perps transfer; leaving unified needs >$10k).
+2. **Transient post-trade equity read.** Right after fills the collateral split momentarily under-reports → an 80% false-drawdown. Guard added: ignore a post-rebalance equity read <50% of the (settled) pre-rebalance equity; the drawdown breaker only acts on settled top-of-cycle reads.
+3. **Testnet BTC oracle is stale** (mid ~+2.7% off oracle) → marketable BTC orders rejected `Price too far from oracle`. Testnet universe = the 6 healthy perps `[ETH,SOL,BNB,ADA,AVAX,DOGE]`; **mainnet keeps all 10** (BTC mainnet oracle healthy).
+4. **Slippage 0.05→0.02** (both testnet and mainnet config): 5% stacked on stale mids and busted the oracle band; 2% still crosses every book (spreads ≤0.4%) and is a saner real-money cap.
+
+**Decision.** Execution path is **validated**: a clean 6-leg dollar-neutral basket held (net ~$0, neutrality skew 0.0%, reconcile_ok), correct equity (990), CB normal; and the atomic-or-flatten safety fired correctly when a leg rejected (flatten + op_halt, no one-legged book). The bot runs live on **testnet** mock money under the agent key (key in `/etc/trading-bot/hl-xsectional-main.env`, 600, never logged — verified no leak). **Mainnet (real money) remains gated** on: testnet soak + the user's legal/tax green light + `allow_live:true` + `HL_CONFIRM_LIVE=YES`. Remaining money-path items before real capital: live-position count in health (cosmetic), resize-on-drift, and a real-money risk review.
+
+---

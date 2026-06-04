@@ -57,10 +57,25 @@ The key is read once from env into an in-memory signer — never logged, never
 written to state/health/trades (verified by the security review).
 
 ## 3. Flip the config to testnet
-Edit `/opt/trading-bot/configs/hl-xsectional-main.json`: set `"network": "testnet"`
-(leave `allow_live` false — it is irrelevant on testnet). For a quicker first
-signal you may also temporarily lower `lookback_days` (testnet has shorter
-history; ~30 works) and raise the rebalance cadence.
+Edit `/opt/trading-bot/configs/hl-xsectional-main.json`:
+- `"network": "testnet"` (leave `allow_live` false — irrelevant on testnet).
+- **Drop BTC from `universe` on testnet.** HL *testnet*'s BTC oracle is badly
+  stale (mid ~+2.7% off oracle), so marketable BTC orders are rejected
+  `Price too far from oracle` and the basket can't form. Use the 6 healthy
+  testnet perps `["ETH","SOL","BNB","ADA","AVAX","DOGE"]` → a clean top-3/bottom-3
+  basket. (Mainnet keeps all 10 — BTC's mainnet oracle is healthy. XRP/DOT/LINK
+  don't exist on testnet and are auto-dropped anyway.)
+- `"slippage": 0.02` — 5% stacks on stale testnet mids and busts the oracle band;
+  2% still crosses every book (spreads ≤0.4%) and is a saner cap for mainnet too.
+- `lookback_days` can stay 120 (testnet has 400+ daily bars for these 6).
+
+**Unified accounts are handled automatically — no transfer/mode-switch needed.**
+HL's default *unified account* mode keeps USDC collateral in the **spot**
+clearinghouse (the per-perp `marginSummary.accountValue` reads a "not meaningful"
+0; the faucet's mock USDC lands in spot). The adapter computes equity as
+`perp accountValue + free spot USDC (total − hold)`, correct in both unified and
+standard modes. So you do **not** transfer Spot→Perps (that button is greyed in
+unified mode) or switch modes (leaving unified needs >$10k anyway).
 
 ## 4. Restart + verify
 ```bash
@@ -71,6 +86,19 @@ Expect: `mode=TESTNET live_trading=True`. On the next rebalance the runner place
 **real testnet orders**; the dashboard "Hyperliquid" tab shows the live book with
 a red **LIVE ORDERS** badge and `execution: live` rebalances. An **unfunded**
 account logs a clean "account unfunded — deposit USDC" skip (no halt).
+
+## Validated on testnet (2026-06-04)
+First real-order run on `hl-xsectional@main` (TESTNET, agent wallet
+`0x34B9…5B12`, master `0x70Cb…4c89`, 1000 mock USDC unified account): a clean
+**6-leg dollar-neutral basket held** — long BNB/DOGE/ETH, short ADA/AVAX/SOL,
+~$330/leg, **net ~$0, neutrality skew 0.0%**, `reconcile_ok=True`, equity read
+**990** (unified fix), drawdown 0.01%, CB normal. The atomic-or-flatten safety
+also fired correctly mid-debug (a rejected BTC leg → all legs flattened +
+`op_halt`, never a one-legged book). Four issues found+fixed on mock money before
+any mainnet exposure: (1) unified-account equity read
+(`account_value = perp AV + free spot USDC`), (2) a transient post-trade equity
+guard (ignore a settling read <50% of pre-rebalance equity), (3) testnet BTC
+oracle exclusion, (4) marketable `slippage` 0.05→0.02.
 
 ## Safety behaviour now built in (from the review hardening)
 - **Atomic-or-flatten rebalance:** if any leg rejects/partials, the runner

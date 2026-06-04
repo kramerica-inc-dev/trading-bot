@@ -131,10 +131,37 @@ class HLAdapter:
             time.sleep(0.05)
         return out
 
+    def _spot_usdc_free(self) -> Optional[float]:
+        """FREE (un-held) USDC in the spot clearinghouse state. In a UNIFIED
+        account (HL default) this is the spot-side collateral not yet earmarked
+        as perp margin; the earmarked part is mirrored in the perp
+        marginSummary.accountValue (so summing the two never double-counts).
+        None on a read failure."""
+        try:
+            ss = self.info.spot_user_state(self.address)
+            for b in ss.get("balances", []) or []:
+                if b.get("coin") == "USDC":
+                    total = float(b.get("total") or 0.0)
+                    hold = float(b.get("hold") or 0.0)
+                    return max(0.0, total - hold)
+            return 0.0
+        except Exception:
+            return None
+
     def account_value(self) -> Optional[float]:
-        """Account value (USD). Retries; returns None on a TRANSIENT/empty read
-        (missing marginSummary) so a hiccup isn't mistaken for a real 0 /
-        drawdown. A genuine unfunded account returns 0.0."""
+        """Total account equity (USD) usable as perp collateral — correct for
+        BOTH standard and UNIFIED (HL default) account modes:
+
+            equity = perp marginSummary.accountValue + free spot USDC
+
+        In standard mode spot USDC is ~0, so this is just the perp account value.
+        In a unified account the collateral SPLITS between the perp side
+        (accountValue, which already carries unrealized PnL and the margin
+        earmark) and the un-held spot balance; their sum is the true equity. This
+        avoids the 'unfunded' false-skip (perp reads ~0 before any position) and
+        the 80%-false-drawdown (perp accountValue alone ignores the spot
+        remainder once positions open). Retries; returns None on a TRANSIENT read
+        so a hiccup isn't mistaken for a real 0; a genuine empty account is 0.0."""
         if not self.address:
             return 0.0
         for i in range(3):
@@ -143,7 +170,11 @@ class HLAdapter:
                 ms = st.get("marginSummary")
                 if ms is None or "accountValue" not in ms:
                     time.sleep(0.4 * (i + 1)); continue
-                return float(ms["accountValue"])
+                perp_av = float(ms["accountValue"])
+                spot_free = self._spot_usdc_free()
+                if spot_free is None:
+                    time.sleep(0.4 * (i + 1)); continue
+                return perp_av + spot_free
             except Exception:
                 time.sleep(0.4 * (i + 1))
         return None

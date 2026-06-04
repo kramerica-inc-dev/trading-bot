@@ -8,7 +8,7 @@
   "gross_exposure": 1.0,
   "cost_rate": 0.00045,
   "flat_funding_annual": 0.06,
-  "slippage": 0.05,
+  "slippage": 0.02,
   "min_assets": 6,
   "halt_drawdown_pct": 0.25,
   "network": "mainnet",

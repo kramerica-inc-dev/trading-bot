@@ -7,6 +7,7 @@ response parsing without touching the network.
 
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -104,6 +105,66 @@ class TestParseOrder(unittest.TestCase):
         r = HLAdapter._parse_order(raw)
         self.assertFalse(r.ok)
         self.assertIn("invalid size", r.error)
+
+
+class _FakeInfo:
+    """Network-free stand-in exposing the two reads account_value uses."""
+    def __init__(self, perp=None, spot=None, raise_perp=False):
+        self._perp = perp or {}
+        self._spot = spot or {}
+        self._raise_perp = raise_perp
+
+    def user_state(self, addr):
+        if self._raise_perp:
+            raise RuntimeError("transient net error")
+        return self._perp
+
+    def spot_user_state(self, addr):
+        return self._spot
+
+
+def _adapter_with(info, address="0xMaster"):
+    a = HLAdapter.__new__(HLAdapter)        # bypass __init__ (no network/meta fetch)
+    a.address = address
+    a.info = info
+    return a
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestAccountValue(unittest.TestCase):
+    # equity = perp marginSummary.accountValue + free spot USDC (total - hold)
+    def test_standard_mode_uses_perp_account_value(self):
+        # funds on perp side, spot empty → perp accountValue is the equity
+        info = _FakeInfo(perp={"marginSummary": {"accountValue": "999.0"}},
+                         spot={"balances": []})
+        self.assertAlmostEqual(_adapter_with(info).account_value(), 999.0)
+
+    def test_unified_mode_no_positions_uses_spot(self):
+        # perp marginSummary is the 'not meaningful' 0, all USDC free in spot
+        info = _FakeInfo(perp={"marginSummary": {"accountValue": "0.0"}},
+                         spot={"balances": [{"coin": "USDC", "total": "999.0", "hold": "0.0"}]})
+        self.assertAlmostEqual(_adapter_with(info).account_value(), 999.0)
+
+    def test_unified_mode_with_positions_sums_perp_and_free_spot(self):
+        # the held spot USDC (197.99) is mirrored in perp accountValue (198.85);
+        # equity = 198.85 + (990.01 - 197.99) = 990.87  (no double-count)
+        info = _FakeInfo(
+            perp={"marginSummary": {"accountValue": "198.85"}},
+            spot={"balances": [{"coin": "USDC", "total": "990.01", "hold": "197.99"}]})
+        self.assertAlmostEqual(_adapter_with(info).account_value(), 990.87, places=2)
+
+    def test_genuinely_unfunded_returns_zero(self):
+        info = _FakeInfo(perp={"marginSummary": {"accountValue": "0.0"}},
+                         spot={"balances": [{"coin": "USDC", "total": "0.0", "hold": "0.0"}]})
+        self.assertEqual(_adapter_with(info).account_value(), 0.0)
+
+    def test_no_address_returns_zero(self):
+        self.assertEqual(_adapter_with(_FakeInfo(), address=None).account_value(), 0.0)
+
+    def test_transient_read_failure_returns_none(self):
+        import hl_adapter
+        with unittest.mock.patch.object(hl_adapter.time, "sleep", lambda *_: None):
+            self.assertIsNone(_adapter_with(_FakeInfo(raise_perp=True)).account_value())
 
 
 if __name__ == "__main__":
