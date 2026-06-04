@@ -1,0 +1,17 @@
+{
+  "instance_name": "mainnet",
+  "universe": ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "DOT", "LINK"],
+  "lookback_days": 120,
+  "rebal_days": 5,
+  "m": 3,
+  "initial_capital": 5000.0,
+  "gross_exposure": 1.0,
+  "cost_rate": 0.00045,
+  "flat_funding_annual": 0.06,
+  "slippage": 0.02,
+  "resize_threshold": 0.10,
+  "min_assets": 6,
+  "halt_drawdown_pct": 0.25,
+  "network": "mainnet",
+  "allow_live": false
+}

@@ -174,12 +174,31 @@ systemctl start hl-xsectional@main   # rebuilds the basket
 # 3. verify: health.json cb_state=normal, reconcile_ok=true, a fresh neutral book.
 ```
 
-## Mainnet (real money) — NOT yet
-Only after testnet validates AND your legal/tax review of using an EU-unregulated
-DEX as an NL resident (grey area — see docs/VENUE-ACCESS-RESEARCH.md). Then:
-`network: mainnet`, `allow_live: true`, env `HL_CONFIRM_LIVE=YES`, and start
-**small**. Review the money-path findings in the 2026-06-04 execution review
-first (slippage tuning, resize-on-drift, and a real-money risk review).
+## Mainnet — STAGED in MAINNET_DRY (creds in place, flag OFF)
+A separate instance **`hl-xsectional@mainnet`** is staged (2026-06-04):
+`configs/hl-xsectional-mainnet.json` (`instance_name=mainnet` → its own state dir,
+never collides with the testnet `@main` soak), `network=mainnet`,
+**`allow_live=false` → MAINNET_DRY (zero real orders)**, universe=10 (BTC included —
+mainnet oracle is healthy). The mainnet **agent** key is in
+`/etc/trading-bot/hl-xsectional-mainnet.env` (600, set by the user directly; never
+in chat). Agent validated read-only: derives to the approved agent "Agent Trader"
+(`extraAgents`), `account_value` reads the real $57.52. It forward-papers on real
+mainnet prices alongside the testnet soak. Both run independently.
+
+### Go-live — the one-flag flip (do NOT do until the gates clear)
+**Gates:** testnet soak green + your **legal/tax sign-off** (EU-unregulated DEX as
+an NL resident — grey area, see docs/VENUE-ACCESS-RESEARCH.md) + consider a funding
+top-up (at $57 a 6-leg basket is ~$19/leg, just above HL's $10 min — thin). Then:
+```bash
+# 1. arm: flip the flag + add the out-of-band confirm env var
+python3 -c "import json,pathlib; p=pathlib.Path('/opt/trading-bot/configs/hl-xsectional-mainnet.json'); c=json.loads(p.read_text()); c['allow_live']=True; p.write_text(json.dumps(c,indent=2)+'\n')"
+printf 'HL_CONFIRM_LIVE=YES\n' >> /etc/trading-bot/hl-xsectional-mainnet.env
+# 2. restart -> mode=MAINNET_LIVE, live_trading=True (REAL orders)
+systemctl restart hl-xsectional@mainnet
+journalctl -u hl-xsectional@mainnet -n 6 --no-pager   # expect mode=MAINNET_LIVE
+```
+Then watch the first live rebalance on the dashboard, start **small**, and review
+the open soak items (funding modeling, staleness, slippage) first.
 
 ## Op note: dashboard restart
 `systemctl restart trading-dashboard` can leave an orphan on :8080 on this LXC
