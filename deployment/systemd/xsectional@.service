@@ -1,0 +1,30 @@
+[Unit]
+Description=Cross-sectional momentum paper runner (%i) — OKX perp long-short
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+# Optional per-instance env (demo creds for P2_DEMO). DRY_RUN needs none —
+# the runner uses only the OKX public candle API.
+EnvironmentFile=-/etc/trading-bot/xsectional-%i.env
+ExecStart=/usr/bin/python3 -m scripts.xs_runner --loop --config /opt/trading-bot/configs/xsectional-%i.json --interval-sec 3600
+Restart=on-failure
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsectional-%i
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot
+
+[Install]
+WantedBy=multi-user.target

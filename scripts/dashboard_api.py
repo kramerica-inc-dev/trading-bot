@@ -46,7 +46,9 @@ DEFAULT_INSTANCE = "plan-e-base"
 # scripts/carry_runner.py — the runner nests its instance dirs under
 # `carry/` so they don't collide with Plan E's flat `state/plan-e-*/`).
 CARRY_STATE_DIR = STATE_DIR / "carry"
-# CARRY_INSTANCE_NAME_RE compiled below.
+# Cross-sectional momentum paper runner state (scripts/xs_runner.py).
+XSECTIONAL_STATE_DIR = STATE_DIR / "xsectional"
+# CARRY_INSTANCE_NAME_RE compiled below (reused for xsectional — same charset).
 
 # DHCP watchdog event log (written by /usr/local/bin/dhcp-watchdog.sh on the
 # LXC). Read-only; fail-open if missing so deployments without the watchdog
@@ -909,6 +911,59 @@ def _read_carry_trades(instance: str, limit: int = 50) -> List[Dict[str, Any]]:
     return list(reversed(rows))
 
 
+def _list_xsectional_instances() -> List[Dict[str, Any]]:
+    """Scan `state/xsectional/*/` and return a compact health summary each."""
+    out: List[Dict[str, Any]] = []
+    if not XSECTIONAL_STATE_DIR.exists():
+        return out
+    for child in sorted(XSECTIONAL_STATE_DIR.iterdir()):
+        if not child.is_dir() or not CARRY_INSTANCE_NAME_RE.match(child.name):
+            continue
+        h = _read_json_file(child / "health.json", {}) or {}
+        if not h:
+            continue
+        out.append({
+            "instance": child.name, "mode": h.get("mode"),
+            "equity": h.get("equity"), "drawdown_pct": h.get("drawdown_pct"),
+            "cb_state": h.get("cb_state"), "n_positions": h.get("n_positions"),
+            "rebalances_total": h.get("rebalances_total"),
+            "cycles_total": h.get("cycles_total"),
+            "last_rebalance_ts": h.get("last_rebalance_ts"),
+            "last_reconcile_ok": h.get("last_reconcile_ok", True),
+        })
+    return out
+
+
+def _read_xsectional_state_summary(instance: str) -> Dict[str, Any]:
+    if not CARRY_INSTANCE_NAME_RE.match(instance):
+        raise ValueError(f"invalid xsectional instance: {instance!r}")
+    state = _read_json_file(XSECTIONAL_STATE_DIR / instance / "state.json", None)
+    if state is None:
+        return {"_error": "no state.json"}
+    positions = state.get("positions", {}) or {}
+    longs = sorted(s for s, p in positions.items() if (p or {}).get("side", 0) > 0)
+    shorts = sorted(s for s, p in positions.items() if (p or {}).get("side", 0) < 0)
+    return {
+        "instance": instance, "equity": state.get("equity"),
+        "cash": state.get("cash"), "peak_equity": state.get("peak_equity"),
+        "cycles_total": state.get("cycles_total"),
+        "rebalances_total": state.get("rebalances_total"),
+        "funding_paid_total": state.get("funding_paid_total"),
+        "fees_paid_total": state.get("fees_paid_total"),
+        "cb_state": state.get("cb_state"),
+        "last_rebalance_ts": state.get("last_rebalance_ts"),
+        "longs": longs, "shorts": shorts, "positions": positions,
+    }
+
+
+def _read_xsectional_trades(instance: str, limit: int = 50) -> List[Dict[str, Any]]:
+    if not CARRY_INSTANCE_NAME_RE.match(instance):
+        raise ValueError(f"invalid xsectional instance: {instance!r}")
+    trades_path = XSECTIONAL_STATE_DIR / instance / "trades.log"
+    limit = max(1, min(int(limit or 50), 500))
+    return list(reversed(_read_jsonl_file(trades_path, max_lines=limit)))
+
+
 def _unit_allowed(unit: str) -> bool:
     if unit in CONTROLLABLE_SERVICES:
         return True
@@ -1148,6 +1203,41 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     })
                 else:
                     self._send_json({"error": "unknown carry resource"}, 404)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path == "/api/xsectional/instances":
+            try:
+                self._send_json({"instances": _list_xsectional_instances()})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+
+        elif path.startswith("/api/xsectional/"):
+            # Per-instance: /api/xsectional/<instance>/{health,state,trades}
+            try:
+                parts = path[len("/api/xsectional/"):].split("/")
+                if len(parts) != 2:
+                    self._send_json({"error": "not found"}, 404)
+                    return
+                instance, resource = parts
+                if not CARRY_INSTANCE_NAME_RE.match(instance):
+                    raise ValueError(f"invalid xsectional instance: {instance!r}")
+                if resource == "health":
+                    h = _read_json_file(XSECTIONAL_STATE_DIR / instance / "health.json", None)
+                    self._send_json(h if h else {"error": "no health.json"}, 200 if h else 404)
+                elif resource == "state":
+                    self._send_json(_read_xsectional_state_summary(instance))
+                elif resource == "trades":
+                    try:
+                        limit = int(q.get("limit", "50"))
+                    except (TypeError, ValueError):
+                        limit = 50
+                    self._send_json({"instance": instance,
+                                     "trades": _read_xsectional_trades(instance, limit=limit)})
+                else:
+                    self._send_json({"error": "unknown xsectional resource"}, 404)
             except ValueError as e:
                 self._send_json({"error": str(e)}, 400)
             except Exception as e:
