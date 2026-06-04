@@ -133,5 +133,66 @@ class TestSimExecution(unittest.TestCase):
         self.assertEqual(s.positions["A"].entry_price, 100.0)   # untouched
 
 
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestAcceptPostTradeEquity(unittest.TestCase):
+    A = staticmethod(R.HLXSRunner._accept_post_trade_equity) if HAVE_SDK else None
+    REBAL_OK = {"action": "rebalance", "execution": "live", "complete": True}
+    REBAL_FAIL = {"action": "rebalance", "execution": "live", "complete": False}
+
+    def test_completed_live_low_read_rejected_as_transient(self):
+        self.assertFalse(self.A(1000.0, 300.0, self.REBAL_OK))     # 30% of pre = settlement artifact
+
+    def test_completed_live_normal_read_accepted(self):
+        self.assertTrue(self.A(1000.0, 990.0, self.REBAL_OK))
+
+    def test_incomplete_rebalance_low_read_accepted_as_real(self):
+        # a failed/flattened book IS the realistic >50%-loss case -> must record it
+        self.assertTrue(self.A(1000.0, 300.0, self.REBAL_FAIL))
+
+    def test_noop_cycle_low_read_accepted(self):
+        # no trade just happened -> a low read is real drift/loss, never a transient
+        self.assertTrue(self.A(1000.0, 300.0, {"action": "noop"}))
+
+    def test_sim_rebalance_not_treated_as_transient(self):
+        self.assertTrue(self.A(1000.0, 300.0, {"action": "rebalance", "execution": "sim"}))
+
+    def test_none_read_rejected(self):
+        self.assertFalse(self.A(1000.0, None, self.REBAL_OK))
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestHealthLivePositions(unittest.TestCase):
+    def _stub(self, tmp, live, book):
+        adapter = types.SimpleNamespace(wallet=object(), address="0xMaster",
+                                        book_notional=lambda: book, MIN_ORDER_USD=10.0)
+        return types.SimpleNamespace(cfg=R.HLXSConfig(), mode="TESTNET",
+                                     live_trading=live, adapter=adapter,
+                                     health_path=tmp / "health.json")
+
+    def _write_and_read(self, stub, s):
+        import json
+        R.HLXSRunner.write_health(stub, s, {"last_action": "rebalance"})
+        return json.loads((stub.health_path).read_text())
+
+    def test_live_n_positions_from_venue_book(self):
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        book = {"A": 330.0, "B": 330.0, "C": -330.0, "D": -330.0, "E": -330.0, "F": 330.0}
+        stub = self._stub(tmp, True, book)              # s.positions empty, but 6 live legs
+        s = XSState(cash=990.0, equity=990.0, peak_equity=990.0)
+        h = self._write_and_read(stub, s)
+        self.assertEqual(h["n_positions"], 6)           # NOT 0 (the bug the audit caught)
+
+    def test_dry_mode_n_positions_from_state(self):
+        import tempfile
+        from xs_runner import Position
+        tmp = Path(tempfile.mkdtemp())
+        stub = self._stub(tmp, False, {})               # not live -> use sim dict
+        s = XSState(cash=5000.0, equity=5000.0, peak_equity=5000.0)
+        s.positions = {"A": Position(side=1, notional=1.0, entry_price=1.0, entered_ts="x")}
+        h = self._write_and_read(stub, s)
+        self.assertEqual(h["n_positions"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -286,6 +286,16 @@ class HLXSRunner:
     # -- health ------------------------------------------------------------
     def write_health(self, s: XSState, extra: dict) -> None:
         dd = (s.peak_equity - s.equity) / s.peak_equity if s.peak_equity > 0 else 0.0
+        # In live mode the book lives on-venue (s.positions is only the sim dict),
+        # so report the real held-leg count — the dashboard must not show 0 legs
+        # while real money is deployed.
+        n_positions = len(s.positions)
+        if self.live_trading:
+            try:
+                n_positions = len([c for c, v in self.adapter.book_notional().items()
+                                   if abs(v) > self.adapter.MIN_ORDER_USD])
+            except Exception:
+                pass
         h = {"ts": _utcnow().isoformat(), "instance": self.cfg.instance_name,
              "mode": self.mode, "venue": "hyperliquid", "live_trading": self.live_trading,
              "have_wallet": self.adapter.wallet is not None,
@@ -293,7 +303,7 @@ class HLXSRunner:
              "cycles_total": s.cycles_total, "rebalances_total": s.rebalances_total,
              "skips_total": s.skips_total, "equity": round(s.equity, 2),
              "peak_equity": round(s.peak_equity, 2), "drawdown_pct": round(dd * 100, 2),
-             "cb_state": s.cb_state, "n_positions": len(s.positions),
+             "cb_state": s.cb_state, "n_positions": n_positions,
              "fees_paid_total": round(s.fees_paid_total, 2),
              "last_rebalance_ts": s.last_rebalance_ts, "last_reconcile_ok": s.last_reconcile_ok,
              "config": {"lookback_days": self.cfg.lookback_days, "rebal_days": self.cfg.rebal_days,
@@ -308,6 +318,27 @@ class HLXSRunner:
             return True
         last = datetime.fromisoformat(s.last_rebalance_ts)
         return (now - last).total_seconds() >= self.cfg.rebal_days * 86400 - 3600
+
+    @staticmethod
+    def _accept_post_trade_equity(prev_equity: float, eq2: Optional[float],
+                                  result: dict) -> bool:
+        """Whether to record a freshly-read post-rebalance equity. Right after a
+        CLEANLY-COMPLETED live rebalance the venue's spot/perp collateral split
+        can momentarily under-report (settles in ~1s); a read <50% of the
+        pre-rebalance equity is then a settlement artifact → reject it (keep the
+        settled value). If the rebalance did NOT complete (a leg failed / the book
+        was flattened) a low read is REAL → accept it so the drawdown breaker sees
+        the loss. Non-rebalance cycles (no trade just happened) always accept.
+        Note the breaker itself always re-reads settled top-of-cycle equity, so a
+        suppressed read can only delay a halt by one cycle, never hide it."""
+        if eq2 is None:
+            return False
+        completed_live = (result.get("action") == "rebalance"
+                          and result.get("execution") == "live"
+                          and result.get("complete") is True)
+        if completed_live and prev_equity > 0 and eq2 < 0.5 * prev_equity:
+            return False
+        return True
 
     # -- one cycle ---------------------------------------------------------
     def run_once(self) -> dict:
@@ -386,12 +417,7 @@ class HLXSRunner:
             self.log(result)
 
         eq2 = self.equity(s, mids)
-        # Guard a TRANSIENT post-trade read: right after fills the venue's
-        # spot/perp collateral split can momentarily under-report (settles in
-        # ~1s). A single rebalance cannot really lose >50%, so treat such a read
-        # as transient and keep the (settled) pre-rebalance equity — never let it
-        # poison peak_equity / the drawdown breaker.
-        if eq2 is not None and not (s.equity > 0 and eq2 < 0.5 * s.equity):
+        if self._accept_post_trade_equity(s.equity, eq2, result):
             s.equity = eq2
             s.peak_equity = max(s.peak_equity, s.equity)
         rec = self.reconcile(s, targets)

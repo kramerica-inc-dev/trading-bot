@@ -109,10 +109,11 @@ class TestParseOrder(unittest.TestCase):
 
 class _FakeInfo:
     """Network-free stand-in exposing the two reads account_value uses."""
-    def __init__(self, perp=None, spot=None, raise_perp=False):
+    def __init__(self, perp=None, spot=None, raise_perp=False, raise_spot=False):
         self._perp = perp or {}
         self._spot = spot or {}
         self._raise_perp = raise_perp
+        self._raise_spot = raise_spot
 
     def user_state(self, addr):
         if self._raise_perp:
@@ -120,6 +121,8 @@ class _FakeInfo:
         return self._perp
 
     def spot_user_state(self, addr):
+        if self._raise_spot:
+            raise RuntimeError("spot endpoint outage")
         return self._spot
 
 
@@ -146,8 +149,10 @@ class TestAccountValue(unittest.TestCase):
         self.assertAlmostEqual(_adapter_with(info).account_value(), 999.0)
 
     def test_unified_mode_with_positions_sums_perp_and_free_spot(self):
-        # the held spot USDC (197.99) is mirrored in perp accountValue (198.85);
-        # equity = 198.85 + (990.01 - 197.99) = 990.87  (no double-count)
+        # empirically-observed unified-with-positions shape: equity = perp AV +
+        # free spot (total-hold) = 198.85 + (990.01-197.99) = 990.87. Subtracting
+        # `hold` removes the margin that unified mode also counts in perp AV;
+        # NOT subtracting it would wrongly give 1188 on a ~991 account.
         info = _FakeInfo(
             perp={"marginSummary": {"accountValue": "198.85"}},
             spot={"balances": [{"coin": "USDC", "total": "990.01", "hold": "197.99"}]})
@@ -157,6 +162,20 @@ class TestAccountValue(unittest.TestCase):
         info = _FakeInfo(perp={"marginSummary": {"accountValue": "0.0"}},
                          spot={"balances": [{"coin": "USDC", "total": "0.0", "hold": "0.0"}]})
         self.assertEqual(_adapter_with(info).account_value(), 0.0)
+
+    def test_spot_outage_perp_funded_uses_perp(self):
+        # a perp-funded (standard-mode) account must NOT skip on a spot outage
+        import hl_adapter
+        with unittest.mock.patch.object(hl_adapter.time, "sleep", lambda *_: None):
+            info = _FakeInfo(perp={"marginSummary": {"accountValue": "750.0"}}, raise_spot=True)
+            self.assertAlmostEqual(_adapter_with(info).account_value(), 750.0)
+
+    def test_spot_outage_no_perp_returns_none(self):
+        # perp ~0 + spot unreadable → genuinely undeterminable → None (skip, no halt)
+        import hl_adapter
+        with unittest.mock.patch.object(hl_adapter.time, "sleep", lambda *_: None):
+            info = _FakeInfo(perp={"marginSummary": {"accountValue": "0.0"}}, raise_spot=True)
+            self.assertIsNone(_adapter_with(info).account_value())
 
     def test_no_address_returns_zero(self):
         self.assertEqual(_adapter_with(_FakeInfo(), address=None).account_value(), 0.0)

@@ -132,11 +132,13 @@ class HLAdapter:
         return out
 
     def _spot_usdc_free(self) -> Optional[float]:
-        """FREE (un-held) USDC in the spot clearinghouse state. In a UNIFIED
-        account (HL default) this is the spot-side collateral not yet earmarked
-        as perp margin; the earmarked part is mirrored in the perp
-        marginSummary.accountValue (so summing the two never double-counts).
-        None on a read failure."""
+        """FREE (un-held) USDC in the spot clearinghouse: total − hold. `hold` is
+        spot USDC that is reserved — in a UNIFIED account the perp-margin earmark
+        (which is ALSO counted in perp marginSummary.accountValue), plus any
+        resting spot orders / pending transfers. Subtracting it is exactly what
+        stops `account_value` double-counting the margin once positions are open.
+        Empirically verified on-chain: perp_av 198.85 + free 792.02 = 990.87 on a
+        ~991 account (vs 1188 if `hold` were NOT removed). None on a read failure."""
         try:
             ss = self.info.spot_user_state(self.address)
             for b in ss.get("balances", []) or []:
@@ -173,6 +175,12 @@ class HLAdapter:
                 perp_av = float(ms["accountValue"])
                 spot_free = self._spot_usdc_free()
                 if spot_free is None:
+                    # Spot-endpoint hiccup. A perp-FUNDED (standard-mode) account
+                    # doesn't need the spot read — mark off perp alone rather than
+                    # skipping the whole cycle. If perp is ~0 the funds may be
+                    # unified in spot, so we genuinely can't tell → retry/None.
+                    if perp_av > 1e-9:
+                        return perp_av
                     time.sleep(0.4 * (i + 1)); continue
                 return perp_av + spot_free
             except Exception:

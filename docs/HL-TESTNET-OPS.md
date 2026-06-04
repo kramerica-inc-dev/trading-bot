@@ -114,6 +114,36 @@ oracle exclusion, (4) marketable `slippage` 0.05→0.02.
   bool — strings are rejected) AND env `HL_CONFIRM_LIVE=YES`. Real money is never
   reachable by accident.
 
+## Pre-mainnet soak agenda (from the 2026-06-04 adversarial audit)
+A 4-lens adversarial audit (code-correctness / live-state / secret-hygiene /
+completeness) passed the testnet deployment with **no blockers**. Four code items
+it flagged are **already fixed** (commit after 895a24a): the post-trade transient
+guard now gates on a completed+clean rebalance (`_accept_post_trade_equity`, not a
+bare magnitude threshold) so a real >50% loss on a failed/one-legged book is
+recorded; `account_value` no longer skips a perp-funded account on a spot-endpoint
+outage; `health.json n_positions` reflects the live venue book in live mode (was
+structurally 0); the equity docstring is corrected. **Close these during the soak,
+before any mainnet capital:**
+- [ ] **Turnover rebalance** — force a close-some/open-others rotation on testnet
+  (shorten `rebal_days` or hand-edit `last_rebalance_ts` back >5d) and confirm a
+  clean transition (the validated run was a from-flat open; stage-1 closed nothing).
+- [ ] **Drift / resize** — the live path never resizes a held-correct-side leg, so
+  dollar-neutrality can erode between rebalances (verify tolerates 0.5x–∞). Add
+  resize-to-target in `_execute_live`; watch L/S skew across multiple held cycles.
+- [ ] **op_halt recovery** — trip it on testnet; write + verify the operator
+  recovery steps (currently terminal until a hand-edit of `state.json` cb_state).
+- [ ] **Funding** — DRY/sim omits the ~6%/yr funding drag (paper P&L too rosy);
+  confirm on-chain equity accrues funding over the soak; decide whether to model it
+  in DRY for comparability.
+- [ ] **Data staleness guard** — port `xs_runner`'s `data_staleness_hours`; the HL
+  path never checks recency of the newest closed bar.
+- [ ] **min_assets headroom** — at 6 assets / min_assets 6, losing one asset's data
+  freezes the open book indefinitely (skip, no flatten). Decide freeze-vs-flatten.
+- [ ] **Slippage / fill quality** — log realized avgPx vs mid per leg; check the 2%
+  cap never causes a non-fill on thin books; compare to the 0.00045 sim assumption.
+- [ ] **Crash-mid-rebalance / overlap** — kill between stage-1 closes and stage-2
+  opens, confirm clean restart recovery; no lock guards overlapping `run_once`.
+
 ## Mainnet (real money) — NOT yet
 Only after testnet validates AND your legal/tax review of using an EU-unregulated
 DEX as an NL resident (grey area — see docs/VENUE-ACCESS-RESEARCH.md). Then:
