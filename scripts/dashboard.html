@@ -419,7 +419,7 @@
   <div class="tab-content active" id="tab-hyperliquid">
     <div style="display:flex;align-items:center;gap:14px;padding:10px 14px;margin-bottom:10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-family:var(--font);font-size:12px">
       <span style="color:var(--text-dim)">Instance</span>
-      <span id="hl-instance" style="color:var(--text);font-weight:600">main</span>
+      <select id="hlInstanceSelect" onchange="switchHlInstance(this.value)" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-family:var(--font);font-size:12px;font-weight:600;cursor:pointer"></select>
       <span id="hl-mode-pill" class="pill pill-accent">MAINNET_DRY</span>
       <span id="hl-live-pill" class="pill pill-dim">paper</span>
       <span id="hl-cb-pill" style="display:none" class="pill pill-red">HALTED</span>
@@ -1353,12 +1353,25 @@ const STRATEGY_BRIEF_HTML =
     '<li><strong>Net:</strong> uncertain, regime-dependent, modest expected value — <em>not</em> a reliable money-maker on current evidence. Hence PAPER (testnet + mainnet-DRY) until out-of-bull robustness; real money gated on that + a legal/tax sign-off.</li>' +
   '</ul>';
 const HL_MODE_STYLE = { MAINNET_DRY: 'pill-accent', TESTNET: 'pill-amber', MAINNET_LIVE: 'pill-red' };
+let _hlInstance = localStorage.getItem('hl-instance') || 'main';
+function switchHlInstance(name) {
+  _hlInstance = name;
+  localStorage.setItem('hl-instance', name);
+  fetchHyperliquid();
+}
 async function fetchHyperliquid() {
-  let inst = 'main', health = null, state = {}, trades = [];
+  let inst = _hlInstance, health = null, state = {}, trades = [];
   try {
     const il = await (await fetch('/api/hl_xsectional/instances')).json();
-    if (il.instances && il.instances[0]) inst = il.instances[0].instance;
-    document.getElementById('hl-instance').textContent = inst;
+    const insts = il.instances || [];
+    if (insts.length && !insts.some(i => i.instance === _hlInstance)) _hlInstance = insts[0].instance;
+    inst = _hlInstance;
+    const _hlSel = document.getElementById('hlInstanceSelect');
+    if (_hlSel && insts.length) {
+      _hlSel.innerHTML = insts.map(i => '<option value="' + i.instance + '">' + i.instance +
+        (i.mode ? ' · ' + i.mode : '') + '</option>').join('');
+      _hlSel.value = _hlInstance;
+    }
     const [h, s, t] = await Promise.all([
       fetch('/api/hl_xsectional/' + encodeURIComponent(inst) + '/health'),
       fetch('/api/hl_xsectional/' + encodeURIComponent(inst) + '/state'),
