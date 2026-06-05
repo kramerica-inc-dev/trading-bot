@@ -1,4 +1,4 @@
-# Quick Start Guide - Blofin Trading Bot
+# Quick Start Guide - Crypto Trader
 
 ## 1. Get API Credentials
 

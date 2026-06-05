@@ -1,11 +1,11 @@
 ---
 name: blofin-trader
-description: Automated cryptocurrency trading bot for Blofin exchange. Use when Michiel wants to set up, monitor, configure, or manage automated trading on Blofin. Supports multiple strategies (RSI mean reversion, EMA trend following, grid trading), risk management, position monitoring, and trade logging. Handles API authentication, order execution, and market analysis.
+description: Crypto Trader, an automated cryptocurrency trading system. Use when Michiel wants to set up, monitor, configure, or manage automated trading. Supports multiple strategies (RSI mean reversion, EMA trend following, grid trading), risk management, position monitoring, and trade logging. Handles API authentication, order execution, and market analysis.
 ---
 
-# Blofin Trading Bot
+# Crypto Trader
 
-Automated trading bot for Blofin cryptocurrency exchange with multiple strategies and risk management.
+Automated cryptocurrency trading system with multiple strategies and risk management.
 
 ## Features
 
@@ -61,7 +61,7 @@ cd scripts
 python3 blofin_api.py
 ```
 
-### 4. Run Bot
+### 4. Run Crypto Trader
 
 **Dry run mode (recommended first!):**
 ```bash
@@ -186,7 +186,7 @@ print(balance)
 - Minimum: 0.1 contracts (0.0001 BTC for BTC-USDT)
 - Increase balance or reduce risk percentage
 
-### Bot not trading
+### Crypto Trader not trading
 
 - Check `min_confidence` threshold
 - Review strategy parameters (RSI levels, EMA periods)

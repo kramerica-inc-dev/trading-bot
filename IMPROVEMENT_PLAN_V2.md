@@ -1,4 +1,4 @@
-# Blofin Trader — Verbeterplan V2.1: Drie Parallelle Structural-Premium Lanes (+ Sham-control)
+# Crypto Trader — Verbeterplan V2.1: Drie Parallelle Structural-Premium Lanes (+ Sham-control)
 
 > **Opvolger van `IMPROVEMENT_PLAN.md`** (v1, 2026-05-12, COMPLETE met verdict NO-GO).
 > V1 probeerde de bestaande prijs-directionele 'advanced' strategie te verbeteren

@@ -1,4 +1,4 @@
-# Blofin Trader — Verbeterplan: Alpha vs. Buy-and-Hold
+# Crypto Trader — Verbeterplan: Alpha vs. Buy-and-Hold
 
 > Gebaseerd op de v2-analyse (na correctie van overstatement in v1).
 > Doel: meetbaar betere risk-adjusted performance dan BTC buy-and-hold,
@@ -13,7 +13,7 @@
 ## Fase 0 — Voorbereiding en scope
 
 Twee items uit de v2-analyse (`signal_sign` flip, ML classifier diagnose) zijn
-specifiek voor de kramerica trading-bot — niet van toepassing op blofin-trader.
+specifiek voor de kramerica trading-bot — niet van toepassing op Crypto Trader.
 Laten vallen. Zes items blijven over en mappen op de bestaande roadmap.
 
 **Doorlopende principes** (gelden voor élke fase):
@@ -428,5 +428,5 @@ Op deze momenten expliciet stoppen en beslissen of door te gaan:
   over `signal_sign`, LightGBM-upgrade, asymmetrische multipliers
 - **v2** (correctie na review): hypothese-status erkend, methodologische
   punten toegevoegd (lookahead audit, multiple-testing, risk-adjusted metrics)
-- **dit plan**: v2-prioriteiten geadapteerd voor blofin-trader v2.7, met
+- **dit plan**: v2-prioriteiten geadapteerd voor Crypto Trader v2.7, met
   expliciete beslismomenten en fallback-discipline

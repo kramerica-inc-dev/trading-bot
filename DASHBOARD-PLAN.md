@@ -1,4 +1,4 @@
-# Trading Bot Dashboard - Implementation Plan
+# Crypto Trader Dashboard - Implementation Plan
 
 **Created:** 2026-02-15  
 **Status:** Planning Phase  
@@ -193,7 +193,7 @@ Token stored in config.json, required for all API calls.
 
 ```
 ┌─────────────────────────────────────────┐
-│  🦀 Trading Bot Dashboard               │
+│  🦀 Crypto Trader Dashboard             │
 ├─────────────────────────────────────────┤
 │                                         │
 │  STATUS                                 │

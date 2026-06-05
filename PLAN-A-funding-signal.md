@@ -9,7 +9,7 @@
 
 ## Goal
 
-Introduce funding rate as a **new information source** for the trading bot. The
+Introduce funding rate as a **new information source** for Crypto Trader. The
 AUC 0.503 diagnostic on the existing seven-feature set proved the current
 predictor has no measurable edge on forward returns. Funding rate is one of
 the few retail-accessible signals with consistently documented predictive

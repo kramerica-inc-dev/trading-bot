@@ -1,6 +1,6 @@
 # Proxmox LXC Deployment Guide
 
-Deploy the Blofin Trading Bot to a Proxmox LXC container for 24/7 operation.
+Deploy Crypto Trader to a Proxmox LXC container for 24/7 operation.
 
 ## Prerequisites
 

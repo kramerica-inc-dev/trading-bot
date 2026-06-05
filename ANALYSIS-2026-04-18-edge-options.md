@@ -1,4 +1,4 @@
-# Analysis — Where the Bot's Next Edge Comes From
+# Analysis — Where Crypto Trader's Next Edge Comes From
 
 **Date:** 2026-04-18
 **Trigger:** ML Pattern Finder (competition round 2, agent #7) ran a logistic
