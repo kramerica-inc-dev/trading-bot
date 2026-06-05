@@ -435,6 +435,21 @@ class TestRunSafetyOnce(unittest.TestCase):
         self.assertFalse(stub._flat_calls)             # sim never places venue orders
         self.assertEqual(stub._rebal_calls, [])
 
+    def test_transient_book_read_failure_does_not_flatten(self):
+        # Regression (2026-06-05): a transient venue-read failure (e.g. a 502
+        # Bad Gateway) during reconcile must NOT flatten + op_halt the live book.
+        # It's transient -> hold + retry; a persistent outage is the watchdog's job.
+        stub = self._runner(live=True, equity=1000.0)  # equity fine -> no breaker
+        def boom():
+            raise RuntimeError("(502, 'Bad Gateway')")
+        stub.adapter.book_notional = boom
+        r = stub.run_safety_once()
+        self.assertEqual(r["action"], "safety")        # ran, did not halt
+        self.assertFalse(r["reconcile_ok"])            # reconcile reported the read error
+        self.assertFalse(stub._flat_calls)             # but the book was NOT flattened
+        saved = XSState.from_json(json.loads(stub.state_path.read_text()))
+        self.assertEqual(saved.cb_state, "normal")     # and NOT op_halted
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -300,8 +300,12 @@ class HLXSRunner:
             try:
                 book = self.adapter.book_notional()
             except Exception as e:
+                # A transient venue-read failure (5xx / network blip) is NOT a bad
+                # book — flag it so callers HOLD + retry instead of flattening +
+                # halting. A persistent outage is caught by the external watchdog
+                # (health goes stale), not by churning the live book.
                 s.last_reconcile_ok = False
-                return {"ok": False, "errors": [f"book read failed: {e}"]}
+                return {"ok": False, "transient": True, "errors": [f"book read failed: {e}"]}
             ln = sum(v for v in book.values() if v > 0)
             sn = -sum(v for v in book.values() if v < 0)
             g = ln + sn
@@ -565,7 +569,7 @@ class HLXSRunner:
         rec = self.reconcile(s, None)
         if not rec["ok"]:
             self.log({"action": "reconcile", **rec})
-            if self.live_trading and s.cb_state == "normal":
+            if self.live_trading and s.cb_state == "normal" and not rec.get("transient"):
                 flat = self.flatten_all()
                 s.cb_state = "op_halt"
                 self.log({"action": "reconcile_halt", "flattened": flat, "errors": rec["errors"]})
@@ -623,8 +627,9 @@ class HLXSRunner:
         rec = self.reconcile(s, targets)
         if not rec["ok"]:
             self.log({"action": "reconcile", **rec})
-            if self.live_trading and s.cb_state == "normal":
-                # safety net: a non-neutral / over-legged live book -> flatten + halt
+            if self.live_trading and s.cb_state == "normal" and not rec.get("transient"):
+                # safety net: a CONFIRMED non-neutral / over-legged live book -> flatten
+                # + halt. A transient book-read failure is NOT a bad book (hold + retry).
                 flat = self.flatten_all()
                 s.cb_state = "op_halt"
                 self.log({"action": "reconcile_halt", "flattened": flat, "errors": rec["errors"]})
