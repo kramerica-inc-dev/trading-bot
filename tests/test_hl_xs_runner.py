@@ -225,5 +225,63 @@ class TestHealthLivePositions(unittest.TestCase):
         self.assertEqual(h["n_positions"], 1)
 
 
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestInsightNetBetaDry(unittest.TestCase):
+    """The net-beta gauge + per-leg book must be published in sim/DRY too — not
+    only in live mode — so the pro-cyclical-tilt risk is visible during the
+    MAINNET_DRY forward-paper window (the gap the leaderboard analysis surfaced).
+    """
+
+    @staticmethod
+    def _varying(syms, n=200):
+        t = np.arange(n, dtype=float)
+        return {sym: 100.0 + 5.0 * np.sin((t + i * 7) / 9.0) + 0.02 * t
+                for i, sym in enumerate(syms)}
+
+    def _stub(self):
+        stub = types.SimpleNamespace(
+            cfg=R.HLXSConfig(lookback_days=120),
+            live_trading=False,
+            adapter=types.SimpleNamespace(daily_closes=lambda syms, n: {}),
+        )
+        # _build_insight calls self._book_snapshot / self._net_beta — bind the
+        # real implementations so the unbound-method test path exercises them.
+        stub._book_snapshot = types.MethodType(R.HLXSRunner._book_snapshot, stub)
+        stub._net_beta = types.MethodType(R.HLXSRunner._net_beta, stub)
+        return stub
+
+    def test_net_beta_and_book_published_in_dry(self):
+        from xs_runner import Position
+        stub = self._stub()
+        closes = self._varying(["BTC", "ETH", "SOL"])
+        s = XSState(cash=5000.0, equity=5000.0, peak_equity=5000.0)
+        s.positions = {
+            "ETH": Position(side=1, notional=1000.0,
+                            entry_price=float(closes["ETH"][-1]), entered_ts="x"),
+            "SOL": Position(side=-1, notional=1000.0,
+                            entry_price=float(closes["SOL"][-1]), entered_ts="x"),
+        }
+        mids = {"ETH": float(closes["ETH"][-1]), "SOL": float(closes["SOL"][-1])}
+        out = R.HLXSRunner._build_insight(stub, s, closes, mids, 5000.0)
+        self.assertIn("momentum", out)
+        self.assertEqual(out.get("book_source"), "sim")     # from the sim basket
+        self.assertEqual(len(out["book"]), 2)
+        self.assertIn("net_beta", out)                      # the gauge, lit in DRY
+        self.assertIsInstance(out["net_beta"], float)
+        # signed notionals: long ETH positive, short SOL negative
+        by = {b["coin"]: b for b in out["book"]}
+        self.assertGreater(by["ETH"]["notional"], 0)
+        self.assertLess(by["SOL"]["notional"], 0)
+
+    def test_no_positions_no_book_no_crash(self):
+        stub = self._stub()
+        closes = self._varying(["BTC", "ETH", "SOL"])
+        s = XSState(cash=5000.0, equity=5000.0, peak_equity=5000.0)
+        out = R.HLXSRunner._build_insight(stub, s, closes, {}, 5000.0)
+        self.assertIn("momentum", out)
+        self.assertNotIn("book", out)
+        self.assertNotIn("net_beta", out)
+
+
 if __name__ == "__main__":
     unittest.main()

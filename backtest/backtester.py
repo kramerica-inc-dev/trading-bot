@@ -386,6 +386,100 @@ def conditional_metrics(equity_curve, timestamps, regimes,
     return out
 
 
+def period_concentration(equity_curve, timestamps, top_n: int = 5) -> Dict:
+    """PnL-concentration diagnostics: how much of the total PnL comes from the
+    best few calendar periods, and what fraction of periods were positive.
+
+    A genuine, broad edge spreads its PnL across many weeks/months and wins a
+    decent fraction of them; an over-fit or lucky edge piles its entire PnL into
+    a handful of periods (top-N share near or above 100%) while losing most of
+    the rest.  This is the "few lucky periods" flag that complements the
+    random-entry null and the deflated-Sharpe / multiple-testing discipline.
+
+    Args:
+        equity_curve: 1-D sequence of equity values (currency).
+        timestamps:   matching datetimes, one per equity point.
+        top_n:        how many best periods define the concentration ratio.
+
+    Returns a dict (plain floats / ints):
+        weeks, months:                 number of calendar periods covered
+        pct_positive_weeks / _months:  % of periods with PnL > 0
+        top_n:                         N used for the ratios
+        top_n_week_share_pct:          top-N weeks' PnL / net total PnL * 100
+                                       (None when net PnL <= 0 — ratio undefined)
+        top_n_week_gain_share_pct:     top-N weeks' gains / sum of all positive-
+                                       week gains * 100 (always 0..100, sign-safe)
+        top_n_month_share_pct / _month_gain_share_pct: monthly analogues
+
+    A top-N *share* near/above 100% with a low *pct_positive* is the classic
+    "a few lucky periods carried it" signature.  Empty / single-point inputs
+    collapse to a zero/None result.
+    """
+    empty = {
+        'weeks': 0, 'months': 0,
+        'pct_positive_weeks': 0.0, 'pct_positive_months': 0.0,
+        'top_n': int(top_n),
+        'top_n_week_share_pct': None, 'top_n_week_gain_share_pct': 0.0,
+        'top_n_month_share_pct': None, 'top_n_month_gain_share_pct': 0.0,
+    }
+    eq = list(equity_curve) if equity_curve is not None else []
+    ts = list(timestamps) if timestamps is not None else []
+    if len(eq) < 2 or len(ts) != len(eq):
+        return empty
+    try:
+        idx = pd.DatetimeIndex(pd.to_datetime(ts))
+    except Exception:
+        return empty
+    series = pd.Series(np.asarray(eq, dtype=float), index=idx).sort_index()
+    if series.empty:
+        return empty
+    initial = float(series.iloc[0])
+
+    def _period_pnls(rule: str, alt: str) -> List[float]:
+        # 'ME' (month-end) on pandas >= 2.2; fall back to 'M' on older pandas.
+        end = None
+        for r in (rule, alt):
+            try:
+                end = series.resample(r).last().dropna()
+                break
+            except (ValueError, TypeError):
+                end = None
+        if end is None or end.empty:
+            return []
+        pnl = end.diff()
+        # First period measured from the very first equity point so the opening
+        # partial period is counted, not dropped.
+        pnl.iloc[0] = float(end.iloc[0]) - initial
+        return [float(x) for x in pnl.tolist()]
+
+    def _stats(pnls: List[float]):
+        arr = np.asarray(pnls, dtype=float)
+        k = int(arr.size)
+        if k == 0:
+            return 0, 0.0, None, 0.0
+        n = max(1, int(top_n))
+        pct_pos = float(np.mean(arr > 0)) * 100.0
+        order = np.sort(arr)[::-1]
+        topn = float(np.sum(order[:n]))
+        net = float(np.sum(arr))
+        share = (topn / net * 100.0) if net > 0 else None
+        pos = arr[arr > 0]
+        gains = float(np.sum(pos))
+        topn_gain = float(np.sum(np.sort(pos)[::-1][:n]))
+        gain_share = (topn_gain / gains * 100.0) if gains > 0 else 0.0
+        return k, pct_pos, share, gain_share
+
+    wk, wk_pos, wk_share, wk_gain = _stats(_period_pnls('W', 'W'))
+    mo, mo_pos, mo_share, mo_gain = _stats(_period_pnls('ME', 'M'))
+    return {
+        'weeks': wk, 'months': mo,
+        'pct_positive_weeks': wk_pos, 'pct_positive_months': mo_pos,
+        'top_n': int(top_n),
+        'top_n_week_share_pct': wk_share, 'top_n_week_gain_share_pct': wk_gain,
+        'top_n_month_share_pct': mo_share, 'top_n_month_gain_share_pct': mo_gain,
+    }
+
+
 @dataclass
 class BacktestTrade:
     """Record of a single completed trade"""
@@ -585,6 +679,12 @@ class BacktestResult:
             for r in ('bull', 'bear', 'sideways')
         }
 
+        # --- PnL concentration (the "few lucky periods" overfitting flag) ---
+        # Top-N week/month share of total PnL + % of positive periods.  A high
+        # top-N share with a low %-positive is the signature of an apparent edge
+        # that is really a handful of lucky periods.
+        self.pnl_concentration = period_concentration(eq, ts, top_n=5)
+
     def _finalize_alpha(self):
         """Strategy-vs-benchmark alpha.  Needs sharpe_ratio to already be set."""
         bench_ret = self.benchmark.get('total_return_pct', 0.0)
@@ -690,6 +790,16 @@ class BacktestResult:
             f"Time Under Water: {self.time_under_water_pct:.1f}%",
         ]
 
+        # PnL-concentration line (few-lucky-periods flag).
+        pc = getattr(self, 'pnl_concentration', {}) or {}
+        _ws = pc.get('top_n_week_share_pct')
+        _ws_str = f"{_ws:.0f}%" if _ws is not None else "n/a (net<=0)"
+        lines.append(
+            f"PnL Concentration: top-{pc.get('top_n', 5)} wks {_ws_str} of net "
+            f"({pc.get('top_n_week_gain_share_pct', 0.0):.0f}% of gains)  |  "
+            f"{pc.get('pct_positive_weeks', 0.0):.0f}% weeks +, "
+            f"{pc.get('pct_positive_months', 0.0):.0f}% months +")
+
         # Benchmark + alpha block
         b = self.benchmark
         bull_cnt = self.regime_bar_counts.get('bull', 0)
@@ -785,6 +895,7 @@ class BacktestResult:
             'alpha_sharpe': self.alpha_sharpe,
             'regime_bar_counts': self.regime_bar_counts,
             'conditional_metrics': self.conditional_metrics,
+            'pnl_concentration': self.pnl_concentration,
         }
 
     def equity_series(self) -> List[Dict]:

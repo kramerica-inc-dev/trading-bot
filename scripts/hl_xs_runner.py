@@ -341,9 +341,17 @@ class HLXSRunner:
         tmp.replace(self.health_path)
 
     # -- insight (dashboard observability only; never affects trading) ------
-    def _build_insight(self, closes: Dict[str, np.ndarray], equity: float) -> dict:
-        """The momentum ranking that drives selection + the live venue book +
-        a net-beta gauge, for the dashboard. Best-effort; pure observability."""
+    def _build_insight(self, s: XSState, closes: Dict[str, np.ndarray],
+                       mids: Dict[str, float], equity: float) -> dict:
+        """The momentum ranking that drives selection + the current basket book +
+        a net-beta gauge, for the dashboard. Best-effort; pure observability,
+        never affects trading.
+
+        Computed in BOTH live and sim/DRY modes: the book is read from the live
+        venue when trading for real, else from the simulated basket (s.positions).
+        That keeps the pro-cyclical-tilt net-beta gauge visible during the
+        MAINNET_DRY forward-paper window — exactly the period where the basket's
+        regime / hidden-beta risk is being evaluated (docs/XS-BETA-STUDY.md)."""
         out: dict = {}
         lb = self.cfg.lookback_days
         mom = []
@@ -352,23 +360,38 @@ class HLXSRunner:
                 mom.append({"coin": c, "trail_ret_pct": round((float(cl[-1]) / float(cl[-1 - lb]) - 1) * 100, 1)})
         mom.sort(key=lambda x: x["trail_ret_pct"], reverse=True)
         out["momentum"] = mom
-        if not self.live_trading:
-            return out
         try:
-            mids = self.adapter.all_mids()
-            book = []
-            for coin, p in self.adapter.positions().items():
-                mk = mids.get(coin) or p.get("entry_px") or 0.0
-                book.append({"coin": coin, "side": int(np.sign(p["szi"])),
-                             "notional": round(p["szi"] * mk, 2),
-                             "upnl": round(float(p.get("unrealized_pnl", 0.0)), 2)})
-            out["book"] = sorted(book, key=lambda x: -x["notional"])
-            nb = self._net_beta(closes, out["book"], equity)
-            if nb is not None:
-                out["net_beta"] = nb
+            book = self._book_snapshot(s, mids)
+            if book:
+                out["book"] = sorted(book, key=lambda x: -x["notional"])
+                out["book_source"] = "venue" if self.live_trading else "sim"
+                nb = self._net_beta(closes, out["book"], equity)
+                if nb is not None:
+                    out["net_beta"] = nb
         except Exception:
             pass
         return out
+
+    def _book_snapshot(self, s: XSState, mids: Dict[str, float]) -> list:
+        """Per-leg book as [{coin, side, notional(signed $), upnl}] — from the
+        live venue when live_trading, else from the simulated basket (s.positions)
+        so the dashboard book + net-beta gauge are populated in DRY/paper too."""
+        book = []
+        if self.live_trading:
+            for coin, p in self.adapter.positions().items():
+                mk = (mids or {}).get(coin) or p.get("entry_px") or 0.0
+                book.append({"coin": coin, "side": int(np.sign(p["szi"])),
+                             "notional": round(p["szi"] * mk, 2),
+                             "upnl": round(float(p.get("unrealized_pnl", 0.0)), 2)})
+        else:
+            for sym, p in s.positions.items():
+                mk = (mids or {}).get(sym) or p.entry_price or 0.0
+                upnl = (p.side * p.notional * (mk / p.entry_price - 1.0)
+                        if p.entry_price > 0 else 0.0)
+                book.append({"coin": sym, "side": p.side,
+                             "notional": round(p.side * p.notional, 2),
+                             "upnl": round(upnl, 2)})
+        return book
 
     def _net_beta(self, closes, book, equity: float, win: int = 90):
         """Realized net BTC-beta of the live book (Σ wᵢ·βᵢ, wᵢ=notionalᵢ/equity,
@@ -510,7 +533,7 @@ class HLXSRunner:
                 flat = self.flatten_all()
                 s.cb_state = "op_halt"
                 self.log({"action": "reconcile_halt", "flattened": flat, "errors": rec["errors"]})
-        insight = self._build_insight(closes, s.equity)
+        insight = self._build_insight(s, closes, mids, s.equity)
         self.save_state(s)
         self.write_health(s, {"last_action": result["action"], "n_assets": len(closes),
                               "reconcile_ok": rec["ok"], **insight})

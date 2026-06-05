@@ -19,6 +19,7 @@ from backtest.backtester import (
     classify_regimes,
     compute_benchmark,
     conditional_metrics,
+    period_concentration,
 )
 
 
@@ -210,6 +211,69 @@ class BacktestResultWiringTests(unittest.TestCase):
         self.assertGreater(res.time_under_water_pct, 0.0)
         # benchmark flat -> calmar 0, alpha == strategy return.
         self.assertEqual(res.benchmark['total_return_pct'], 0.0)
+
+
+class PeriodConcentrationTests(unittest.TestCase):
+    def test_concentrated_in_one_week(self):
+        # Flat equity for ~10 weeks except a single +100 step in one week.
+        # The entire net PnL comes from that one week -> top-N share == 100%,
+        # very few positive weeks: the "few lucky periods" signature.
+        n = 70
+        ts = _daily_ts(n)
+        equity = [1000.0 if i < 32 else 1100.0 for i in range(n)]
+        pc = period_concentration(equity, ts, top_n=5)
+        self.assertGreaterEqual(pc['weeks'], 9)
+        self.assertIsNotNone(pc['top_n_week_share_pct'])
+        self.assertAlmostEqual(pc['top_n_week_share_pct'], 100.0, places=3)
+        self.assertAlmostEqual(pc['top_n_week_gain_share_pct'], 100.0, places=3)
+        self.assertLess(pc['pct_positive_weeks'], 20.0)   # only ~1 of ~10 weeks
+
+    def test_broad_steady_gainer(self):
+        # Compounding a little every day -> every week positive, PnL spread
+        # across all of them -> top-N share well below 100, 100% positive weeks.
+        n = 140
+        ts = _daily_ts(n)
+        equity = [1000.0 * (1.002 ** i) for i in range(n)]
+        pc = period_concentration(equity, ts, top_n=5)
+        self.assertGreaterEqual(pc['weeks'], 18)
+        self.assertAlmostEqual(pc['pct_positive_weeks'], 100.0, places=6)
+        self.assertIsNotNone(pc['top_n_week_share_pct'])
+        self.assertLess(pc['top_n_week_share_pct'], 60.0)
+        self.assertGreater(pc['top_n_week_share_pct'], 0.0)
+
+    def test_net_loss_share_is_none_but_safe(self):
+        # Monotone decline -> net PnL <= 0 -> headline share undefined (None),
+        # gain-share 0, no positive periods, and no crash.
+        n = 70
+        ts = _daily_ts(n)
+        equity = [1000.0 - 2.0 * i for i in range(n)]
+        pc = period_concentration(equity, ts, top_n=5)
+        self.assertIsNone(pc['top_n_week_share_pct'])
+        self.assertEqual(pc['top_n_week_gain_share_pct'], 0.0)
+        self.assertEqual(pc['pct_positive_weeks'], 0.0)
+
+    def test_empty_and_single_point(self):
+        empty = period_concentration([], [], top_n=5)
+        self.assertEqual(empty['weeks'], 0)
+        self.assertIsNone(empty['top_n_week_share_pct'])
+        single = period_concentration([1000.0], [datetime(2024, 1, 1)], top_n=5)
+        self.assertEqual(single['weeks'], 0)
+        self.assertIsNone(single['top_n_week_share_pct'])
+
+    def test_backtest_result_exposes_concentration(self):
+        # Wired into BacktestResult.to_dict() + summary(), present even for a
+        # zero-trade run (computed off the equity curve).
+        n = 70
+        ts = _daily_ts(n)
+        closes = [100.0] * n
+        equity = [1000.0 if i < 32 else 1100.0 for i in range(n)]
+        res = BacktestResult([], equity, ts,
+                             BacktestConfig(initial_balance=1000.0), closes=closes)
+        d = res.to_dict()
+        self.assertIn('pnl_concentration', d)
+        self.assertAlmostEqual(d['pnl_concentration']['top_n_week_share_pct'],
+                               100.0, places=3)
+        self.assertIn('PnL Concentration', res.summary())
 
 
 if __name__ == '__main__':
