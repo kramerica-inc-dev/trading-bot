@@ -340,6 +340,61 @@ class HLXSRunner:
         tmp.write_text(json.dumps(h, indent=2))
         tmp.replace(self.health_path)
 
+    # -- insight (dashboard observability only; never affects trading) ------
+    def _build_insight(self, closes: Dict[str, np.ndarray], equity: float) -> dict:
+        """The momentum ranking that drives selection + the live venue book +
+        a net-beta gauge, for the dashboard. Best-effort; pure observability."""
+        out: dict = {}
+        lb = self.cfg.lookback_days
+        mom = []
+        for c, cl in closes.items():
+            if len(cl) > lb and cl[-1 - lb] > 0:
+                mom.append({"coin": c, "trail_ret_pct": round((float(cl[-1]) / float(cl[-1 - lb]) - 1) * 100, 1)})
+        mom.sort(key=lambda x: x["trail_ret_pct"], reverse=True)
+        out["momentum"] = mom
+        if not self.live_trading:
+            return out
+        try:
+            mids = self.adapter.all_mids()
+            book = []
+            for coin, p in self.adapter.positions().items():
+                mk = mids.get(coin) or p.get("entry_px") or 0.0
+                book.append({"coin": coin, "side": int(np.sign(p["szi"])),
+                             "notional": round(p["szi"] * mk, 2),
+                             "upnl": round(float(p.get("unrealized_pnl", 0.0)), 2)})
+            out["book"] = sorted(book, key=lambda x: -x["notional"])
+            nb = self._net_beta(closes, out["book"], equity)
+            if nb is not None:
+                out["net_beta"] = nb
+        except Exception:
+            pass
+        return out
+
+    def _net_beta(self, closes, book, equity: float, win: int = 90):
+        """Realized net BTC-beta of the live book (Σ wᵢ·βᵢ, wᵢ=notionalᵢ/equity,
+        βᵢ=90d rolling beta vs BTC) — the pro-cyclical-tilt risk gauge. None if no data."""
+        if equity <= 0 or not book:
+            return None
+        btc = closes.get("BTC")
+        if btc is None:
+            btc = self.adapter.daily_closes(["BTC"], win + 5).get("BTC")
+        if btc is None or len(btc) < win + 2:
+            return None
+        br = (btc[1:] / btc[:-1] - 1.0)[-win:]
+        if float(np.var(br, ddof=1)) <= 1e-12:
+            return None
+        nb = 0.0
+        for leg in book:
+            cl = closes.get(leg["coin"]) if closes.get(leg["coin"]) is not None else \
+                self.adapter.daily_closes([leg["coin"]], win + 5).get(leg["coin"])
+            if cl is None or len(cl) < win + 2:
+                continue
+            r = (cl[1:] / cl[:-1] - 1.0)[-win:]
+            n = min(len(r), len(br))
+            beta = float(np.cov(r[-n:], br[-n:], ddof=1)[0, 1] / np.var(br[-n:], ddof=1))
+            nb += (leg["notional"] / equity) * beta
+        return round(nb, 3)
+
     def _should_rebalance(self, s: XSState, now: datetime) -> bool:
         if s.last_rebalance_ts is None:
             return True
@@ -455,9 +510,10 @@ class HLXSRunner:
                 flat = self.flatten_all()
                 s.cb_state = "op_halt"
                 self.log({"action": "reconcile_halt", "flattened": flat, "errors": rec["errors"]})
+        insight = self._build_insight(closes, s.equity)
         self.save_state(s)
         self.write_health(s, {"last_action": result["action"], "n_assets": len(closes),
-                              "reconcile_ok": rec["ok"]})
+                              "reconcile_ok": rec["ok"], **insight})
         return {**result, "equity": round(s.equity, 2), "reconcile_ok": rec["ok"]}
 
     def run_loop(self, interval_sec: int = 3600) -> None:
