@@ -157,22 +157,19 @@
 
 <!-- Tabs -->
 <div class="tabs">
-  <button class="tab active" data-tab="overview">Overview</button>
-  <button class="tab" data-tab="trades">Rebalances</button>
-  <button class="tab" data-tab="strategy">Strategy</button>
-  <button class="tab" data-tab="risk">Risk &amp; Config</button>
-  <button class="tab" data-tab="logs">Logs</button>
-  <button class="tab" data-tab="compare">Compare</button>
-  <button class="tab" data-tab="sweep">OKX Sweep</button>
+  <button class="tab active" data-tab="hyperliquid">Hyperliquid</button>
   <button class="tab" data-tab="xsectional">X-Sectional</button>
-  <button class="tab" data-tab="hyperliquid">Hyperliquid</button>
+  <button class="tab" data-tab="sweep">OKX Sweep</button>
   <button class="tab" data-tab="carry">OKX Carry</button>
+  <button class="tab" data-tab="overview">Plan E</button>
+  <button class="tab" data-tab="trades">Rebalances</button>
+  <button class="tab" data-tab="compare">Compare</button>
 </div>
 
 <div class="content">
 
   <!-- ═══ OVERVIEW ═══ -->
-  <div class="tab-content active" id="tab-overview">
+  <div class="tab-content" id="tab-overview">
     <!-- Paper-mode banner -->
     <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;margin-bottom:12px;background:rgba(34,211,238,0.06);border:1px solid rgba(34,211,238,0.2);border-radius:6px;font-family:var(--font);font-size:12px;color:var(--text-muted)">
       <span style="font-size:14px">📄</span>
@@ -419,7 +416,7 @@
   </div>
 
   <!-- ═══ HYPERLIQUID (momentum on the executable venue) ═══ -->
-  <div class="tab-content" id="tab-hyperliquid">
+  <div class="tab-content active" id="tab-hyperliquid">
     <div style="display:flex;align-items:center;gap:14px;padding:10px 14px;margin-bottom:10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-family:var(--font);font-size:12px">
       <span style="color:var(--text-dim)">Instance</span>
       <span id="hl-instance" style="color:var(--text);font-weight:600">main</span>
@@ -1341,6 +1338,20 @@ async function fetchXsectional() {
 }
 
 // ═══ Hyperliquid (momentum on the executable venue) tab ═══
+const STRATEGY_BRIEF_HTML =
+  '<div style="color:var(--accent);font-weight:600;margin:2px 0 4px">Considerations &amp; analysis</div>' +
+  '<ul style="margin:0 0 8px 16px;padding:0;line-height:1.55;color:var(--text-muted)">' +
+    '<li><strong>Loop:</strong> rank the universe by 120d trailing return; long top-3 / short bottom-3, dollar-neutral (~2× gross); rebalance every 5 days (fixed clock — verified, dynamic triggers add no edge); resize drift + reconcile neutrality each cycle; atomic-or-flatten + drawdown circuit-breaker as safety.</li>' +
+    '<li><strong>Edge is real but in WHICH assets, not WHEN:</strong> the momentum ranking beats a random dollar-neutral basket even at zero cost.</li>' +
+    '<li><strong>Hidden pro-cyclical BTC-beta</strong> (net-long in bulls, short in bears; ~15% of historical P&amp;L). Shown live as <em>net β</em> above; kept as a risk gauge — neutralising it lowers returns, so we don\'t.</li>' +
+    '<li><strong>Regime-concentrated:</strong> almost all the historical edge sits in the 2023 bull; the continuous 2024-25 holdout is ~flat-to-negative.</li>' +
+  '</ul>' +
+  '<div style="color:var(--accent);font-weight:600;margin:6px 0 4px">Prognosis</div>' +
+  '<ul style="margin:0 0 0 16px;padding:0;line-height:1.55;color:var(--text-muted)">' +
+    '<li><strong>Trend / bull:</strong> modest positive expected (the cross-sectional edge + the pro-cyclical beta tailwind).</li>' +
+    '<li><strong>Chop / bear:</strong> ~flat to slightly negative — the out-of-sample reality since 2024.</li>' +
+    '<li><strong>Net:</strong> uncertain, regime-dependent, modest expected value — <em>not</em> a reliable money-maker on current evidence. Hence PAPER (testnet + mainnet-DRY) until out-of-bull robustness; real money gated on that + a legal/tax sign-off.</li>' +
+  '</ul>';
 const HL_MODE_STYLE = { MAINNET_DRY: 'pill-accent', TESTNET: 'pill-amber', MAINNET_LIVE: 'pill-red' };
 async function fetchHyperliquid() {
   let inst = 'main', health = null, state = {}, trades = [];
@@ -1371,11 +1382,32 @@ async function fetchHyperliquid() {
   document.getElementById('hl-cb-pill').style.display = (health.cb_state === 'halted') ? 'inline-flex' : 'none';
   set('hl-equity', usd(health.equity));
   set('hl-dd', 'drawdown ' + (health.drawdown_pct != null ? health.drawdown_pct : 0) + '% · peak ' + usd(health.peak_equity));
-  const longs = state.longs || [], shorts = state.shorts || [];
+  // real venue book + net-beta gauge + the momentum ranking that selected the legs
+  const book = health.book || [];
+  const nb = health.net_beta;
+  const mom = health.momentum || [];
+  const sideTag = sgn => sgn > 0 ? '<span style="color:var(--green)">▲ LONG</span>' : '<span style="color:var(--red)">▼ SHORT</span>';
+  const bookRows = book.length
+    ? book.map(b => '<tr><td style="padding:2px 0">' + esc(b.coin) + '</td><td>' + sideTag(b.side) + '</td>' +
+        '<td style="text-align:right">' + usd(Math.abs(b.notional)) + '</td>' +
+        '<td style="text-align:right;color:' + (b.upnl >= 0 ? 'var(--green)' : 'var(--red)') + '">' + (b.upnl >= 0 ? '+' : '') + b.upnl + '</td></tr>').join('')
+    : '<tr><td colspan="4" style="color:var(--text-dim);padding:4px 0">' + (health.n_positions || 0) + ' positions · per-leg detail only when live (paper/DRY)</td></tr>';
+  const nbTxt = (nb == null) ? 'n/a' : ((nb > 0 ? '+' : '') + nb);
+  const nbCol = (nb == null) ? 'var(--text-dim)' : (Math.abs(nb) < 0.15 ? 'var(--green)' : 'var(--amber)');
+  const momRows = mom.map((m, i) => {
+    const role = i < 3 ? '<span style="color:var(--green)">long</span>'
+      : (i >= mom.length - 3 ? '<span style="color:var(--red)">short</span>' : '<span style="color:var(--text-dim)">·</span>');
+    return '<tr><td style="padding:1px 0">' + esc(m.coin) + '</td><td style="text-align:right;color:' +
+      (m.trail_ret_pct >= 0 ? 'var(--green)' : 'var(--red)') + '">' + m.trail_ret_pct + '%</td><td style="text-align:right">' + role + '</td></tr>';
+  }).join('');
   document.getElementById('hl-book').innerHTML =
-    '<div><span style="color:var(--green)">▲ long</span> ' + longs.map(esc).join(', ') + '</div>' +
-    '<div style="margin-top:4px"><span style="color:var(--red)">▼ short</span> ' + shorts.map(esc).join(', ') + '</div>' +
-    '<div style="margin-top:6px;color:var(--text-dim)">' + (health.n_positions || 0) + ' positions</div>';
+    '<div style="font-size:12px;margin-bottom:4px">Live book · net β <strong style="color:' + nbCol + '">' + nbTxt + '</strong> ' +
+      '<span style="color:var(--text-dim)" title="Σ w·β vs BTC (90d) — the pro-cyclical tilt; near 0 = market-neutral">(BTC-beta tilt)</span></div>' +
+    '<table style="width:100%;border-collapse:collapse">' +
+      '<thead><tr style="color:var(--text-dim)"><th style="text-align:left">leg</th><th>side</th><th style="text-align:right">notional</th><th style="text-align:right">uPnL</th></tr></thead>' +
+      '<tbody>' + bookRows + '</tbody></table>' +
+    '<div style="font-size:12px;margin:8px 0 2px;color:var(--text-muted)">Why these legs — momentum rank (' + (health.config ? health.config.lookback_days : 120) + 'd trailing return; top 3 long / bottom 3 short):</div>' +
+    '<table style="width:100%;border-collapse:collapse"><tbody>' + momRows + '</tbody></table>';
   const acct = health.account ? (String(health.account).slice(0, 6) + '…' + String(health.account).slice(-4)) : null;
   document.getElementById('hl-walletinfo').innerHTML =
     '<div>wallet: ' + (health.have_wallet ? '<span style="color:var(--green)">' + esc(acct) + '</span>' : '<span style="color:var(--text-dim)">none (dry)</span>') + '</div>' +
@@ -1395,6 +1427,13 @@ async function fetchHyperliquid() {
     return '<div style="font-family:var(--font);font-size:11px;padding:3px 0;color:var(--text-dim)">' + esc(t.action) + ' ' + when + '</div>';
   }).join('') : '<div style="color:var(--text-dim);font-family:var(--font);font-size:11px">No rebalances yet.</div>';
   document.getElementById('hl-raw-health').textContent = JSON.stringify(health, null, 2);
+  // analysis & prognosis card (created once, appended to the HL tab)
+  let hb = document.getElementById('hl-brief');
+  if (!hb) {
+    hb = document.createElement('div'); hb.id = 'hl-brief'; hb.className = 'card'; hb.style.marginTop = '12px';
+    const host = document.getElementById('tab-hyperliquid'); if (host) host.appendChild(hb);
+  }
+  hb.innerHTML = '<div class="label">Strategy — considerations, analysis &amp; prognosis</div>' + STRATEGY_BRIEF_HTML;
 }
 
 // ═══ OKX Carry tab ═══
