@@ -127,7 +127,8 @@ class XSState:
     cycles_total: int = 0
     funding_paid_total: float = 0.0     # cumulative net funding outflow (USD)
     fees_paid_total: float = 0.0
-    cb_state: str = "normal"            # normal | halted
+    cb_state: str = "normal"            # normal | halted | op_halt | catastrophe_halt
+    last_settled_equity: Optional[float] = None   # last accepted settled equity (intracycle-drop ref)
     started_ts: Optional[str] = None
     last_rebalance_ts: Optional[str] = None
     last_cycle_ts: Optional[str] = None

@@ -1,0 +1,31 @@
+[Unit]
+Description=External watchdog for the Hyperliquid momentum runner (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+# Optional per-instance env: HL_PRIVATE_KEY (+ HL_ACCOUNT_ADDRESS) are ONLY
+# needed for the opt-in --flatten-on-stale path. Alert-only (the default) needs
+# no credentials — it just reads health.json and appends to watchdog.events.jsonl.
+EnvironmentFile=-/etc/trading-bot/hl-watchdog-%i.env
+# Default is ALERT-ONLY (no --flatten-on-stale). Tune --min-equity-usd to the
+# real-money floor for this instance. Add --flatten-on-stale only after review.
+ExecStart=/usr/bin/python3 -m scripts.hl_watchdog --instance %i --stale-after-sec 900 --min-equity-usd 40
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hl-watchdog-%i
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot
+
+[Install]
+WantedBy=multi-user.target

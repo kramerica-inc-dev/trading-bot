@@ -5,7 +5,9 @@ and the testnet _execute_live proof; these cover target-building and the
 simulated rebalance accounting without constructing the (networked) adapter.
 """
 
+import json
 import sys
+import tempfile
 import types
 import unittest
 from datetime import datetime, timezone
@@ -281,6 +283,157 @@ class TestInsightNetBetaDry(unittest.TestCase):
         self.assertIn("momentum", out)
         self.assertNotIn("book", out)
         self.assertNotIn("net_beta", out)
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestCatastropheBreaker(unittest.TestCase):
+    """(B) the terminal catastrophe breaker: fires at threshold, does NOT
+    auto-resume, and a transient None / settling-low read can't trip it."""
+
+    def _stub(self, live, **over):
+        cfg = R.HLXSConfig(halt_drawdown_pct=0.25, catastrophe_drawdown_pct=0.12,
+                           catastrophe_intracycle_pct=0.08, **over)
+        tmp = Path(tempfile.mkdtemp())
+        flat_calls = []
+        stub = types.SimpleNamespace(
+            cfg=cfg, live_trading=live, mode="MAINNET_LIVE" if live else "MAINNET_DRY",
+            health_path=tmp / "health.json", state_path=tmp / "state.json",
+            adapter=types.SimpleNamespace(wallet=object(), address="0xM",
+                                          book_notional=lambda: {}, MIN_ORDER_USD=10.0),
+            _flat_calls=flat_calls, _logs=[])
+        stub.flatten_all = lambda: (flat_calls.append(True) or [{"act": "flatten"}])
+        stub.log = lambda e: stub._logs.append(e)
+        stub.equity = lambda st, mids: st.equity        # echo the seeded settled equity
+        stub.skips_total = 0
+        stub.save_state = types.MethodType(R.HLXSRunner.save_state, stub)
+        stub.write_health = types.MethodType(R.HLXSRunner.write_health, stub)
+        return stub
+
+    def _cb(self, stub, s, dd):
+        return R.HLXSRunner._apply_circuit_breaker(stub, s, dd)
+
+    def test_catastrophe_drawdown_fires_and_flattens(self):
+        stub = self._stub(live=True)
+        s = XSState(cash=880.0, equity=880.0, peak_equity=1000.0)   # 12% dd
+        res = self._cb(stub, s, dd=0.12)
+        self.assertEqual(s.cb_state, "catastrophe_halt")
+        self.assertEqual(res["cb_state"], "catastrophe_halt")
+        self.assertTrue(stub._flat_calls)                          # flattened
+        self.assertTrue(any(l.get("action") == "catastrophe_halt" for l in stub._logs))
+
+    def test_catastrophe_does_not_auto_resume(self):
+        # once terminal, even a full recovery (dd→0) must NOT clear it
+        stub = self._stub(live=True)
+        s = XSState(cash=1000.0, equity=1000.0, peak_equity=1000.0, cb_state="catastrophe_halt")
+        res = self._cb(stub, s, dd=0.0)
+        self.assertEqual(s.cb_state, "catastrophe_halt")           # still terminal
+        self.assertEqual(res["action"], "halted")
+
+    def test_intracycle_drop_fires(self):
+        stub = self._stub(live=True)
+        s = XSState(cash=910.0, equity=910.0, peak_equity=1000.0)  # only 9% dd-from-peak
+        s.last_settled_equity = 1000.0                             # but a 9% drop this cycle
+        res = self._cb(stub, s, dd=0.09)
+        self.assertEqual(s.cb_state, "catastrophe_halt")
+        self.assertEqual(res["cb_state"], "catastrophe_halt")
+
+    def test_below_threshold_does_not_fire(self):
+        stub = self._stub(live=True)
+        s = XSState(cash=950.0, equity=950.0, peak_equity=1000.0)  # 5% dd
+        s.last_settled_equity = 970.0                              # ~2% intracycle
+        res = self._cb(stub, s, dd=0.05)
+        self.assertIsNone(res)
+        self.assertEqual(s.cb_state, "normal")
+        self.assertFalse(stub._flat_calls)
+        self.assertEqual(s.last_settled_equity, 950.0)            # recorded the accepted equity
+
+    def test_transient_none_read_does_not_trip(self):
+        # _read_equity must reject a None equity BEFORE the breaker ever sees it
+        stub = self._stub(live=True)
+        s = XSState(cash=1000.0, equity=1000.0, peak_equity=1000.0)
+        s.cycles_total = 5
+        stub.equity = lambda st, mids: None
+        stub.skips_total = 0
+        dd, sc = R.HLXSRunner._read_equity(stub, s, {})
+        self.assertIsNone(dd)
+        self.assertEqual(sc["action"], "skip")
+        self.assertNotEqual(s.cb_state, "catastrophe_halt")
+
+    def test_settling_low_read_via_accept_guard_not_recorded(self):
+        # the post-rebalance settlement artifact is filtered by _accept_post_trade_equity,
+        # so a transient <50% read never updates settled equity / fabricates a drop
+        A = R.HLXSRunner._accept_post_trade_equity
+        self.assertFalse(A(1000.0, 300.0, {"action": "rebalance", "execution": "live",
+                                            "complete": True}))
+
+    def test_first_cycle_no_false_catastrophe(self):
+        # cycle 1: no prior settled equity, peak anchored to current -> no trip
+        stub = self._stub(live=True)
+        s = XSState(cash=57.0, equity=57.0, peak_equity=57.0)      # the ~$57 live book
+        s.cycles_total = 1
+        s.last_settled_equity = None
+        dd, sc = R.HLXSRunner._read_equity(stub, s, {})
+        self.assertEqual(dd, 0.0)
+        self.assertIsNone(sc)
+        self.assertIsNone(self._cb(stub, s, dd))
+        self.assertEqual(s.cb_state, "normal")
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestRunSafetyOnce(unittest.TestCase):
+    """(A) run_safety_once checks equity/CB/reconcile WITHOUT rebalancing and
+    flattens on a breaker; sim/flat books no-op cleanly."""
+
+    def _runner(self, live, equity, peak=1000.0, **over):
+        cfg = R.HLXSConfig(catastrophe_drawdown_pct=0.12, **over)
+        tmp = Path(tempfile.mkdtemp())
+        flat_calls = []
+        stub = types.SimpleNamespace(
+            cfg=cfg, live_trading=live, mode="MAINNET_LIVE" if live else "MAINNET_DRY",
+            dir=tmp, health_path=tmp / "health.json", state_path=tmp / "state.json",
+            trades_path=tmp / "trades.log",
+            adapter=types.SimpleNamespace(wallet=object(), address="0xM",
+                                          all_mids=lambda: {}, book_notional=lambda: {},
+                                          MIN_ORDER_USD=10.0),
+            _flat_calls=flat_calls, _rebal_calls=[])
+        stub.flatten_all = lambda: (flat_calls.append(True) or [{"act": "flatten"}])
+        stub.equity = lambda st, mids: equity
+        # seed persisted state at the given equity/peak (cycles_total>0 so the
+        # cycle-1 peak-anchor doesn't reset our seeded peak)
+        s0 = XSState(cash=equity, equity=equity, peak_equity=peak, cycles_total=3,
+                     started_ts="x", dry_run=not live)
+        stub.load_state = lambda: XSState.from_json(json.loads(json.dumps(s0.to_json()))) \
+            if stub.state_path.exists() else s0
+        # bind the real methods under test
+        for name in ("run_safety_once", "_read_equity", "_apply_circuit_breaker",
+                     "reconcile", "save_state", "write_health", "log"):
+            setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
+        # tripwire: rebalance/order paths must NOT be touched by the safety cycle
+        stub._execute_live = lambda *a, **k: stub._rebal_calls.append("live")
+        stub._execute_sim = lambda *a, **k: stub._rebal_calls.append("sim")
+        return stub
+
+    def test_safety_no_rebalance_on_normal_book(self):
+        stub = self._runner(live=True, equity=1000.0)
+        r = stub.run_safety_once()
+        self.assertEqual(r["action"], "safety")
+        self.assertEqual(stub._rebal_calls, [])        # never rebalanced
+        self.assertFalse(stub._flat_calls)             # nothing tripped
+
+    def test_safety_flattens_on_catastrophe(self):
+        stub = self._runner(live=True, equity=850.0, peak=1000.0)   # 15% dd > 12%
+        r = stub.run_safety_once()
+        self.assertEqual(r["action"], "halted")
+        self.assertEqual(r["cb_state"], "catastrophe_halt")
+        self.assertTrue(stub._flat_calls)              # flattened on breaker
+        self.assertEqual(stub._rebal_calls, [])        # still no rebalance
+
+    def test_safety_sim_mode_no_orders(self):
+        stub = self._runner(live=False, equity=850.0, peak=1000.0)  # breaker, but sim
+        r = stub.run_safety_once()
+        self.assertEqual(r["cb_state"], "catastrophe_halt")
+        self.assertFalse(stub._flat_calls)             # sim never places venue orders
+        self.assertEqual(stub._rebal_calls, [])
 
 
 if __name__ == "__main__":

@@ -65,6 +65,15 @@ class HLXSConfig:
     resize_threshold: float = 0.10      # min drift (fraction of target $) to resize a held leg
     min_assets: int = 6
     halt_drawdown_pct: float = 0.25
+    # catastrophe backstop: a TERMINAL, non-auto-resuming halt distinct from the
+    # 25% auto-resuming "halted" — fires on a deep drawdown-from-peak OR a single
+    # settled-equity drop in one cycle, flattens the live book, and clears only
+    # via the manual op_halt path.
+    catastrophe_drawdown_pct: float = 0.12
+    catastrophe_intracycle_pct: float = 0.08
+    # fast safety cadence: how often run_safety_once() checks equity/CB/reconcile
+    # between the (slow) rebalances — so a live book isn't only seen hourly.
+    safety_interval_sec: int = 300
     network: str = "mainnet"            # 'mainnet' (DRY default) or 'testnet'
     allow_live: bool = False            # mainnet real-money gate
 
@@ -445,6 +454,125 @@ class HLXSRunner:
             return False
         return True
 
+    # -- shared safety: equity read + circuit breakers ---------------------
+    #   Both run_once (full, with rebalance) and run_safety_once (fast, no
+    #   rebalance) funnel through these so the money-path CB logic lives in ONE
+    #   place. _read_equity returns (dd, short_circuit_result|None); a non-None
+    #   result means the cycle must stop now (transient/unfunded skip). The
+    #   helpers never place a venue order EXCEPT a flatten when a breaker trips.
+    def _read_equity(self, s: XSState, mids: Dict[str, float]):
+        """Read settled equity, apply the transient/unfunded guards, update
+        peak + drawdown. Returns (dd, short_circuit_result|None)."""
+        eq = self.equity(s, mids)
+        if eq is None:                               # TRANSIENT account read — skip, never halt
+            s.skips_total += 1
+            self.save_state(s)
+            self.write_health(s, {"last_action": "skip", "reason": "account read transient"})
+            return None, {"action": "skip", "reason": "transient account read failure"}
+        s.equity = eq
+        if s.cycles_total == 1:                       # anchor peak to true starting equity
+            s.peak_equity = s.equity
+        if self.live_trading and s.equity < 5.0:      # live account not funded yet
+            s.skips_total += 1
+            self.save_state(s)
+            self.write_health(s, {"last_action": "skip", "reason": "account unfunded"})
+            return None, {"action": "skip",
+                          "reason": f"account unfunded (eq={s.equity}); deposit USDC to {self.adapter.address}"}
+        s.peak_equity = max(s.peak_equity, s.equity)
+        dd = (s.peak_equity - s.equity) / s.peak_equity if s.peak_equity > 0 else 0.0
+        return dd, None
+
+    def _apply_circuit_breaker(self, s: XSState, dd: float):
+        """Evaluate every breaker on the freshly-settled equity. Returns a
+        short-circuit result dict if the cycle must HALT now (no rebalance),
+        else None to proceed. Trips, in priority order:
+
+          * catastrophe  — TERMINAL. dd-from-peak >= catastrophe_drawdown_pct OR a
+                            single-cycle settled-equity drop >= catastrophe_intracycle_pct.
+                            Flattens + sets cb_state="catastrophe_halt"; does NOT
+                            auto-resume (clears only via the manual op_halt path).
+          * halted       — the existing 25% drawdown breaker; auto-recovers when
+                            dd falls well below the line.
+          * op_halt      — operational failure (set elsewhere); manual clear only.
+
+        `s.last_settled_equity` carries the previous accepted settled equity for
+        the intracycle delta; it is reused for the intracycle guard so a single
+        transient/settling low read (already filtered to None / via
+        _accept_post_trade_equity) can't fabricate a drop here."""
+        cfg = self.cfg
+        prev_settled = s.last_settled_equity
+        intracycle_drop = 0.0
+        if prev_settled is not None and prev_settled > 0:
+            intracycle_drop = max(0.0, (prev_settled - s.equity) / prev_settled)
+
+        # 1. catastrophe (terminal, non-auto-resuming) — checked first.
+        if s.cb_state != "catastrophe_halt" and (
+                dd >= cfg.catastrophe_drawdown_pct
+                or intracycle_drop >= cfg.catastrophe_intracycle_pct):
+            trigger = ("drawdown" if dd >= cfg.catastrophe_drawdown_pct else "intracycle")
+            s.cb_state = "catastrophe_halt"
+            flat = self.flatten_all() if self.live_trading else []
+            self.log({"action": "catastrophe_halt", "trigger": trigger,
+                      "drawdown_pct": round(dd * 100, 2),
+                      "intracycle_drop_pct": round(intracycle_drop * 100, 2),
+                      "flattened": flat})
+
+        # 2. the auto-resuming 25% drawdown breaker. On a NEW halt, FLATTEN.
+        if dd >= cfg.halt_drawdown_pct and s.cb_state not in (
+                "halted", "op_halt", "catastrophe_halt"):
+            s.cb_state = "halted"
+            flat = self.flatten_all() if self.live_trading else []
+            self.log({"action": "circuit_breaker_halt", "drawdown_pct": round(dd * 100, 2),
+                      "flattened": flat})
+
+        # 3. any active halt: auto-resume only the "halted" state; the terminal
+        #    states (op_halt / catastrophe_halt) keep the book flat + short-circuit.
+        if s.cb_state in ("halted", "op_halt", "catastrophe_halt"):
+            if s.cb_state == "halted" and dd < cfg.halt_drawdown_pct * 0.5:
+                s.cb_state = "normal"
+                self.log({"action": "circuit_breaker_resume", "drawdown_pct": round(dd * 100, 2)})
+            else:
+                if self.live_trading:                 # keep the book flat while halted
+                    self.flatten_all()
+                self.save_state(s)
+                self.write_health(s, {"last_action": "halted", "cb_state": s.cb_state,
+                                      "drawdown_pct": round(dd * 100, 2)})
+                return {"action": "halted", "cb_state": s.cb_state,
+                        "drawdown_pct": round(dd * 100, 2)}
+        s.last_settled_equity = s.equity              # record the accepted settled equity
+        return None
+
+    # -- fast safety cycle (no rebalance) ----------------------------------
+    def run_safety_once(self) -> dict:
+        """The fast cadence: equity-read → drawdown/catastrophe/terminal breaker
+        → reconcile, WITHOUT rebalancing. Run every `safety_interval_sec` between
+        the (slow) full rebalances so a live book is checked far more often than
+        hourly. Places NO venue order except a flatten when a breaker trips."""
+        cfg = self.cfg
+        s = self.load_state()
+        now = _utcnow()
+        s.cycles_total += 1
+        s.last_cycle_ts = now.isoformat()
+
+        mids = self.adapter.all_mids()
+        dd, sc = self._read_equity(s, mids)
+        if sc is not None:
+            return sc
+        sc = self._apply_circuit_breaker(s, dd)
+        if sc is not None:
+            return sc
+
+        rec = self.reconcile(s, None)
+        if not rec["ok"]:
+            self.log({"action": "reconcile", **rec})
+            if self.live_trading and s.cb_state == "normal":
+                flat = self.flatten_all()
+                s.cb_state = "op_halt"
+                self.log({"action": "reconcile_halt", "flattened": flat, "errors": rec["errors"]})
+        self.save_state(s)
+        self.write_health(s, {"last_action": "safety", "reconcile_ok": rec["ok"]})
+        return {"action": "safety", "equity": round(s.equity, 2), "reconcile_ok": rec["ok"]}
+
     # -- one cycle ---------------------------------------------------------
     def run_once(self) -> dict:
         cfg = self.cfg
@@ -461,45 +589,12 @@ class HLXSRunner:
             return {"action": "skip", "reason": f"insufficient data ({len(closes)} assets)"}
         mids = self.adapter.all_mids()
 
-        eq = self.equity(s, mids)
-        if eq is None:                               # TRANSIENT account read — skip, never halt
-            s.skips_total += 1
-            self.save_state(s)
-            self.write_health(s, {"last_action": "skip", "reason": "account read transient"})
-            return {"action": "skip", "reason": "transient account read failure"}
-        s.equity = eq
-        if s.cycles_total == 1:                       # anchor peak to true starting equity
-            s.peak_equity = s.equity
-        if self.live_trading and s.equity < 5.0:      # live account not funded yet
-            s.skips_total += 1
-            self.save_state(s)
-            self.write_health(s, {"last_action": "skip", "reason": "account unfunded"})
-            return {"action": "skip",
-                    "reason": f"account unfunded (eq={s.equity}); deposit USDC to {self.adapter.address}"}
-        s.peak_equity = max(s.peak_equity, s.equity)
-        dd = (s.peak_equity - s.equity) / s.peak_equity if s.peak_equity > 0 else 0.0
-
-        # Circuit breaker. Two halt states: "halted" = drawdown breaker
-        # (auto-recovers when dd falls well below the line); "op_halt" =
-        # operational failure (failed rebalance / reconcile divergence — manual
-        # clear only). On a NEW drawdown halt, FLATTEN the live book (de-risk).
-        if dd >= cfg.halt_drawdown_pct and s.cb_state not in ("halted", "op_halt"):
-            s.cb_state = "halted"
-            flat = self.flatten_all() if self.live_trading else []
-            self.log({"action": "circuit_breaker_halt", "drawdown_pct": round(dd * 100, 2),
-                      "flattened": flat})
-        if s.cb_state in ("halted", "op_halt"):
-            if s.cb_state == "halted" and dd < cfg.halt_drawdown_pct * 0.5:
-                s.cb_state = "normal"
-                self.log({"action": "circuit_breaker_resume", "drawdown_pct": round(dd * 100, 2)})
-            else:
-                if self.live_trading:                 # keep the book flat while halted
-                    self.flatten_all()
-                self.save_state(s)
-                self.write_health(s, {"last_action": "halted", "cb_state": s.cb_state,
-                                      "drawdown_pct": round(dd * 100, 2)})
-                return {"action": "halted", "cb_state": s.cb_state,
-                        "drawdown_pct": round(dd * 100, 2)}
+        dd, sc = self._read_equity(s, mids)
+        if sc is not None:
+            return sc
+        sc = self._apply_circuit_breaker(s, dd)
+        if sc is not None:
+            return sc
 
         result = {"action": "noop"}
         targets = None
@@ -540,18 +635,32 @@ class HLXSRunner:
         return {**result, "equity": round(s.equity, 2), "reconcile_ok": rec["ok"]}
 
     def run_loop(self, interval_sec: int = 3600) -> None:
+        """Decoupled cadence: the FULL run_once (equity + breaker + reconcile +
+        rebalance) fires every `interval_sec`; the fast run_safety_once (equity +
+        breaker + reconcile, NO rebalance) fires every `safety_interval_sec` in
+        between, so a live book is checked far more often than the slow rebalance
+        cadence. run_once advances the rebalance clock itself (_should_rebalance),
+        so a full tick whose rebalance isn't due is just a no-trade full cycle."""
+        safety_sec = max(1, int(self.cfg.safety_interval_sec))
+        full_sec = max(safety_sec, int(interval_sec))
         print(f"[hl_xs_runner] {self.cfg.instance_name} mode={self.mode} "
               f"live_trading={self.live_trading} lb={self.cfg.lookback_days} "
-              f"rebal={self.cfg.rebal_days} m={self.cfg.m} universe={len(self.cfg.universe)}")
+              f"rebal={self.cfg.rebal_days} m={self.cfg.m} universe={len(self.cfg.universe)} "
+              f"full={full_sec}s safety={safety_sec}s")
+        import time
+        next_full = 0.0                               # run a full cycle immediately on start
         while True:
             try:
-                r = self.run_once()
+                if time.monotonic() >= next_full:
+                    r = self.run_once()
+                    next_full = time.monotonic() + full_sec
+                else:
+                    r = self.run_safety_once()
                 print(f"[{_utcnow().isoformat()}] {r.get('action')} eq={r.get('equity')} "
                       f"reconcile_ok={r.get('reconcile_ok')}")
             except Exception as e:
                 print(f"[hl_xs_runner] cycle error: {e}", file=sys.stderr)
-            import time
-            time.sleep(interval_sec)
+            time.sleep(safety_sec)
 
 
 def main() -> int:

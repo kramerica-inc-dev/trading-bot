@@ -1,0 +1,13 @@
+[Unit]
+Description=Drive the Hyperliquid runner watchdog (%i) on a fast cadence
+
+[Timer]
+# Fast, independent of the runner's own cadence: catch a dead/wedged runner or
+# a sub-floor account within a few minutes. AccuracySec keeps it punctual.
+OnBootSec=120s
+OnUnitActiveSec=300s
+AccuracySec=10s
+Unit=hl-watchdog@%i.service
+
+[Install]
+WantedBy=timers.target
