@@ -1391,9 +1391,12 @@ async function fetchHyperliquid() {
     ? book.map(b => '<tr><td style="padding:2px 0">' + esc(b.coin) + '</td><td>' + sideTag(b.side) + '</td>' +
         '<td style="text-align:right">' + usd(Math.abs(b.notional)) + '</td>' +
         '<td style="text-align:right;color:' + (b.upnl >= 0 ? 'var(--green)' : 'var(--red)') + '">' + (b.upnl >= 0 ? '+' : '') + b.upnl + '</td></tr>').join('')
-    : '<tr><td colspan="4" style="color:var(--text-dim);padding:4px 0">' + (health.n_positions || 0) + ' positions · per-leg detail only when live (paper/DRY)</td></tr>';
+    : '<tr><td colspan="4" style="color:var(--text-dim);padding:4px 0">' + (health.n_positions || 0) + ' positions · per-leg book not reported this cycle</td></tr>';
   const nbTxt = (nb == null) ? 'n/a' : ((nb > 0 ? '+' : '') + nb);
   const nbCol = (nb == null) ? 'var(--text-dim)' : (Math.abs(nb) < 0.15 ? 'var(--green)' : 'var(--amber)');
+  // venue book when live (TESTNET/MAINNET), simulated basket in MAINNET_DRY
+  const bookLbl = (health.book_source === 'sim') ? 'Sim book (DRY)'
+    : (health.book_source === 'venue') ? 'Live book' : 'Book';
   const momRows = mom.map((m, i) => {
     const role = i < 3 ? '<span style="color:var(--green)">long</span>'
       : (i >= mom.length - 3 ? '<span style="color:var(--red)">short</span>' : '<span style="color:var(--text-dim)">·</span>');
@@ -1401,7 +1404,7 @@ async function fetchHyperliquid() {
       (m.trail_ret_pct >= 0 ? 'var(--green)' : 'var(--red)') + '">' + m.trail_ret_pct + '%</td><td style="text-align:right">' + role + '</td></tr>';
   }).join('');
   document.getElementById('hl-book').innerHTML =
-    '<div style="font-size:12px;margin-bottom:4px">Live book · net β <strong style="color:' + nbCol + '">' + nbTxt + '</strong> ' +
+    '<div style="font-size:12px;margin-bottom:4px">' + bookLbl + ' · net β <strong style="color:' + nbCol + '">' + nbTxt + '</strong> ' +
       '<span style="color:var(--text-dim)" title="Σ w·β vs BTC (90d) — the pro-cyclical tilt; near 0 = market-neutral">(BTC-beta tilt)</span></div>' +
     '<table style="width:100%;border-collapse:collapse">' +
       '<thead><tr style="color:var(--text-dim)"><th style="text-align:left">leg</th><th>side</th><th style="text-align:right">notional</th><th style="text-align:right">uPnL</th></tr></thead>' +
