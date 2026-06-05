@@ -1,5 +1,5 @@
 [Unit]
-Description=Blofin Trading Bot
+Description=Crypto Trader — retired single-asset bot (kept for reference; masked in prod)
 After=network.target
 Wants=network-online.target
 
