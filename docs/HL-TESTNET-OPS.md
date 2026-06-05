@@ -185,20 +185,35 @@ in chat). Agent validated read-only: derives to the approved agent "Agent Trader
 (`extraAgents`), `account_value` reads the real $57.52. It forward-papers on real
 mainnet prices alongside the testnet soak. Both run independently.
 
-### Go-live — the one-flag flip (do NOT do until the gates clear)
-**Gates:** testnet soak green + your **legal/tax sign-off** (EU-unregulated DEX as
-an NL resident — grey area, see docs/VENUE-ACCESS-RESEARCH.md) + consider a funding
-top-up (at $57 a 6-leg basket is ~$19/leg, just above HL's $10 min — thin). Then:
+### Go-live — the flip (EXECUTED 2026-06-05 — see DECISIONS.md)
+**Gates (cleared 2026-06-05):** testnet soak green + your **legal/tax sign-off** (EU-
+unregulated DEX as an NL resident — grey area, see docs/VENUE-ACCESS-RESEARCH.md). At
+$57 a 6-leg basket is ~$19/leg (= equity/m; gross = 2× equity), just above HL's $10
+min — thin but valid; max loss = the wallet margin (DEX, no clawback).
+
+**CRITICAL — reset the instance state FIRST.** MAINNET_DRY tracks a *simulated*
+equity from `initial_capital` ($5000), so `state.json` carries a `peak_equity` ~$5200
++ phantom sim-positions. Flip the flag WITHOUT resetting and cycle 1 reads the real
+~$57, computes a ~99% drawdown vs the sim peak, and **instantly trips the circuit
+breaker → flatten + halt, never trades.** Reset so peak re-anchors to the real equity
+on `cycles_total==1`:
 ```bash
-# 1. arm: flip the flag + add the out-of-band confirm env var
+# 0. stop + RESET state (kills the sim peak + phantom positions)
+systemctl stop hl-xsectional@mainnet
+cd /opt/trading-bot/state/hl_xsectional/mainnet
+cp -f state.json  state.json.dryrun-bak-$(date -u +%Y%m%d-%H%M%S)
+cp -f health.json health.json.dryrun-bak-$(date -u +%Y%m%d-%H%M%S)
+rm -f state.json health.json     # fresh state -> peak anchors to real equity on cycle 1
+# 1. arm: flip the flag (LXC config ONLY — repo stays allow_live:false) + out-of-band confirm
 python3 -c "import json,pathlib; p=pathlib.Path('/opt/trading-bot/configs/hl-xsectional-mainnet.json'); c=json.loads(p.read_text()); c['allow_live']=True; p.write_text(json.dumps(c,indent=2)+'\n')"
 printf 'HL_CONFIRM_LIVE=YES\n' >> /etc/trading-bot/hl-xsectional-mainnet.env
-# 2. restart -> mode=MAINNET_LIVE, live_trading=True (REAL orders)
-systemctl restart hl-xsectional@mainnet
-journalctl -u hl-xsectional@mainnet -n 6 --no-pager   # expect mode=MAINNET_LIVE
+# 2. start -> mode=MAINNET_LIVE, live_trading=True (REAL orders); fresh state rebalances immediately
+systemctl start hl-xsectional@mainnet
+journalctl -u hl-xsectional@mainnet -n 8 --no-pager   # expect mode=MAINNET_LIVE + a rebalance
 ```
-Then watch the first live rebalance on the dashboard, start **small**, and review
-the open soak items (funding modeling, staleness, slippage) first.
+Then verify on the dashboard: `book_source=venue`, n_positions=6, reconcile_ok,
+cb_state=normal, equity ≈ the wallet. Review the open soak items (funding modeling,
+staleness, slippage) and the **catastrophe backstop** before adding capital.
 
 ## Op note: dashboard restart
 `systemctl restart trading-dashboard` can leave an orphan on :8080 on this LXC

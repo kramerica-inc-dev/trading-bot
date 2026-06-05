@@ -229,3 +229,15 @@ Probed the OKX EU API directly (with the working demo creds) to see what could b
 **Decision.** Execution path is **validated**: a clean 6-leg dollar-neutral basket held (net ~$0, neutrality skew 0.0%, reconcile_ok), correct equity (990), CB normal; and the atomic-or-flatten safety fired correctly when a leg rejected (flatten + op_halt, no one-legged book). The bot runs live on **testnet** mock money under the agent key (key in `/etc/trading-bot/hl-xsectional-main.env`, 600, never logged — verified no leak). **Mainnet (real money) remains gated** on: testnet soak + the user's legal/tax green light + `allow_live:true` + `HL_CONFIRM_LIVE=YES`. Remaining money-path items before real capital: live-position count in health (cosmetic), resize-on-drift, and a real-money risk review.
 
 ---
+
+## 2026-06-05 — Hyperliquid momentum LIVE on mainnet (real money)
+
+**Context.** Testnet soak closed (turnover / drift-resize / op_halt all validated) and three offline studies (trigger, beta, breadth) all converge on the same config — keep **U10, m=3, lb=120, rebal=5** — and the same open risk: out-of-bull regime robustness, which more breadth or legs does not fix (U20 makes it worse). The user gave the go: *"enable live trade — only $57, risk negligible."* The legal/tax call (NL resident, EU-unregulated DEX) is the user's; **this is not legal/tax advice.**
+
+**What shipped.** `hl-xsectional@mainnet` flipped MAINNET_DRY → **MAINNET_LIVE** (real orders) on agent wallet `0x70Cb…4c89`. Required a **state reset first**: the DRY instance carried a *simulated* `peak_equity` ~$5,231 + phantom positions; flipping without resetting would compute a ~99% drawdown vs the real $57 and instantly trip the circuit-breaker (flatten + halt, never trade). Resetting `state.json`/`health.json` re-anchors peak to the real equity on `cycles_total==1`. The documented go-live was missing this step — `docs/HL-TESTNET-OPS.md` corrected. The flip is **LXC-only** (`allow_live=true` in the LXC config + `HL_CONFIRM_LIVE=YES` env); the **repo config stays `allow_live:false`** — the real gate is the out-of-band env var, which never lives in git.
+
+**First live rebalance (11:15:26 UTC) — clean.** 6-leg dollar-neutral basket: L **BNB/BTC/LINK**, S **ADA/DOT/SOL**; all legs filled ok; L/S = $57/$58 (1.7% skew); $114 gross = **2× leverage** on $57.47 margin (~$19/leg, above HL's $10 floor); `reconcile_ok`, `cb_state=normal`, `book_source=venue`, net_beta −0.091, drawdown 0.09%. **Max loss = the wallet margin** (DEX, no clawback); the 25% drawdown breaker flattens ≈ −$14.
+
+**Open before scaling capital (non-blocking at $57).** A bot-side **catastrophe backstop** (currently only the hourly 25% CB + per-cycle reconcile guard the live book) — a fast safety cycle + a terminal (non-auto-resume) breaker + an external watchdog are being built. Plus the soak items: funding modeling in DRY paper, staleness guard, realized-slippage measurement. Testnet `@main`, plan-e 10/10, and xsectional@okx (DRY) untouched.
+
+---
