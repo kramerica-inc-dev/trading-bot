@@ -77,23 +77,26 @@ _TEMPLATE_UNIT_RE = re.compile(r"^(plan-e|carry|xsectional|hl-xsectional)@[a-z0-
 # ---------------------------------------------------------------------------
 SWEEP_ROUTE = {
     "route": "OKX strategy sweep (V3) — paper-only, lighter regime",
-    "updated": "2026-06-04",
-    "summary": ("Price-directional lanes are dead even on fresh OKX data; two "
-                "candidates clear the random-entry null — cross-sectional "
-                "momentum and VRP short-vol. VRP was deepened with a faithful "
-                "option-replication model."),
+    "updated": "2026-06-05",
+    "summary": ("Price-directional lanes are dead even on fresh OKX data. Momentum "
+                "is now LIVE-on-Hyperliquid (paper): testnet soak + mainnet-DRY "
+                "staged. Trigger + beta studies qualified the edge — fixed clock "
+                "stays (dynamic triggers add no edge), it's regime-concentrated "
+                "(2023 bull) and ~flat/negative out-of-sample. VRP parked at the "
+                "research boundary."),
     "candidates": [
         {
             "name": "Cross-sectional momentum",
-            "venue": "OKX perp long-short",
-            "status": "LEAD",
-            "verdict": "PARTIAL — paper-candidate (OOS-surviving, modest)",
-            "metrics": ["config lb=120 / rebal=5 / m=3",
-                        "OOS holdout 97.4th pct, IC 0.119 (p=0.047)",
-                        "~4%/yr funding headwind (~5x margin)",
-                        "needs perp access (acctLv>=2)"],
-            "note": ("Market-neutral, simple. Honest expectation ~ single- to "
-                     "low-double-digit %/yr, not the +242% full-sample."),
+            "venue": "Hyperliquid perp long-short (edge is venue-independent, OKX≈HL)",
+            "status": "LIVE-PAPER — HL testnet soak + mainnet-DRY staged (1 flag from live)",
+            "verdict": "executable on HL; edge real but regime-concentrated + thin OOS",
+            "metrics": ["config lb=120 / rebal=5 / m=3 (fixed clock — dynamic triggers add no edge)",
+                        "edge concentrated in 2023 bull; continuous 2024-25 holdout ~flat/negative",
+                        "~20% of historical P&L was disguised pro-cyclical BTC-beta (corr +0.51); 80% idiosyncratic",
+                        "live: hl-xsectional@main (TESTNET) + @mainnet (MAINNET_DRY)"],
+            "note": ("Market-neutral, simple, EXECUTABLE on HL now. The open risk "
+                     "before real money is regime-robustness (the OOS/2024-25 "
+                     "weakness), NOT the rebalance trigger. See docs/XS-TRIGGER-STUDY.md."),
         },
         {
             "name": "VRP short-vol",
