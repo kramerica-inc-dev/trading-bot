@@ -1450,21 +1450,50 @@ async function fetchHyperliquid() {
       const lev = account.gross_leverage_on_equity;
       const sUsd = v => (v == null ? '—' : (v >= 0 ? '+' : '−') + '$' +
         Math.abs(Number(v)).toLocaleString(undefined, { maximumFractionDigits: 2 }));
+      // liquidation distance: mark = notional/|size|; dist% = |mark − liq| / mark.
+      // null liq (e.g. well-collateralized longs) = no liq price → "safe".
+      const liqDist = p => {
+        if (p.liq == null) return null;
+        const sz = Math.abs(Number(p.size) || 0);
+        const mark = sz > 0 ? Number(p.notional) / sz : null;
+        if (!mark || !isFinite(mark)) return null;
+        return Math.abs(mark - Number(p.liq)) / mark * 100;
+      };
+      const distColor = d => d == null ? 'var(--text-dim)'
+        : (d < 15 ? 'var(--red)' : (d < 30 ? 'var(--amber)' : 'var(--green)'));
+      let worst = null, worstCoin = null;
+      (account.positions || []).forEach(p => {
+        const d = liqDist(p);
+        if (d != null && (worst == null || d < worst)) { worst = d; worstCoin = p.coin; }
+      });
       const prow = (account.positions || []).map(p => {
         const liq = (p.liq == null) ? '—' : Number(p.liq).toLocaleString(undefined, { maximumSignificantDigits: 4 });
+        const d = liqDist(p);
+        const dTxt = d == null ? 'safe' : d.toFixed(1) + '%';
         const sc = p.side === 'LONG' ? 'var(--green)' : 'var(--red)';
         return '<tr><td style="padding:2px 0">' + esc(p.coin) + '</td>' +
           '<td style="color:' + sc + '">' + esc(p.side) + '</td>' +
           '<td style="text-align:right">' + usd(p.notional) + '</td>' +
           '<td style="text-align:right;color:' + (p.upnl >= 0 ? 'var(--green)' : 'var(--red)') + '">' +
             (p.upnl >= 0 ? '+' : '') + Number(p.upnl).toFixed(2) + '</td>' +
-          '<td style="text-align:right;color:var(--text-dim)">' + liq + '</td></tr>';
+          '<td style="text-align:right;color:var(--text-dim)">' + liq + '</td>' +
+          '<td style="text-align:right;color:' + distColor(d) + '">' + dTxt + '</td></tr>';
       }).join('');
+      // liquidation-distance warning banner (closest position within threshold)
+      let warn = '';
+      if (worst != null && worst < 30) {
+        const red = worst < 15;
+        warn = '<div style="margin-bottom:8px;padding:6px 10px;border-radius:4px;font-size:11px;' +
+          'background:' + (red ? 'rgba(248,113,113,0.12)' : 'rgba(251,191,36,0.10)') + ';' +
+          'border:1px solid ' + (red ? 'var(--red)' : 'var(--amber)') + ';color:' + (red ? 'var(--red)' : 'var(--amber)') + '">' +
+          (red ? '⚠ LIQUIDATIE-RISICO' : '⚠ Let op') + ': ' + esc(worstCoin) +
+          ' staat ' + worst.toFixed(1) + '% van zijn liquidatieprijs.</div>';
+      }
       const cell = (lbl, big, sub, col) =>
         '<div><div style="color:var(--text-dim);font-size:10px">' + lbl + '</div>' +
         '<div style="font-size:14px;color:' + (col || 'var(--text)') + '">' + big + '</div>' +
         (sub ? '<div style="color:var(--text-dim);font-size:10px">' + sub + '</div>' : '') + '</div>';
-      acctEl.innerHTML =
+      acctEl.innerHTML = warn +
         '<div style="display:flex;flex-wrap:wrap;gap:18px;margin-bottom:8px">' +
           cell('EQUITY', usd(account.equity), 'perp ' + usd(account.perp_account_value) + ' + spot ' + usd(account.spot_usdc_free)) +
           cell('GROSS NOTIONAL', usd(account.gross_notional), (lev == null ? '' : Number(lev).toFixed(2) + '× of equity')) +
@@ -1473,7 +1502,8 @@ async function fetchHyperliquid() {
         '</div>' +
         '<table style="width:100%;border-collapse:collapse">' +
           '<thead><tr style="color:var(--text-dim)"><th style="text-align:left">coin</th><th style="text-align:left">side</th>' +
-          '<th style="text-align:right">notional</th><th style="text-align:right">uPnL</th><th style="text-align:right">liq</th></tr></thead>' +
+          '<th style="text-align:right">notional</th><th style="text-align:right">uPnL</th><th style="text-align:right">liq</th>' +
+          '<th style="text-align:right">liq dist</th></tr></thead>' +
           '<tbody>' + prow + '</tbody></table>';
     }
   }
