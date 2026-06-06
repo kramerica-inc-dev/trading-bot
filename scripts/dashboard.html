@@ -431,7 +431,7 @@
       <span style="color:var(--text-dim)">Last rebal</span><span id="hl-last-rebal" style="color:var(--text)">—</span>
     </div>
     <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;margin-bottom:10px;background:rgba(34,211,238,0.06);border:1px solid rgba(34,211,238,0.2);border-radius:6px;font-family:var(--font);font-size:11px;color:var(--text-muted)">
-      <span><strong style="color:var(--accent)">EXECUTABLE VENUE</strong> · cross-sectional momentum on Hyperliquid (NL-accessible perp DEX, edge validated on HL data). Same lead (long top-3 / short bottom-3, lb=120 / rebal=5d, dollar-neutral). <strong>MAINNET_DRY</strong> = forward-paper on real HL prices, no wallet/orders; testnet/live needs an API/agent-wallet. Grey-area venue — see docs/VENUE-ACCESS-RESEARCH.md.</span>
+      <span><strong style="color:var(--accent)">EXECUTABLE VENUE</strong> · cross-sectional momentum on Hyperliquid (NL-accessible perp DEX, edge validated on HL data). Same lead (long top-3 / short bottom-3, lb=120 / rebal=5d, dollar-neutral). <strong style="color:var(--red)">@mainnet runs LIVE</strong> with an agent wallet (real funds); <strong>@main</strong> is testnet; <strong>MAINNET_DRY</strong> = forward-paper with no wallet. Grey-area venue — see docs/VENUE-ACCESS-RESEARCH.md.</span>
     </div>
     <div class="grid grid-3" style="margin-bottom:12px">
       <div class="card" id="hl-equity-card">
@@ -447,6 +447,12 @@
         <div class="label">Wallet &amp; health</div>
         <div id="hl-walletinfo" style="margin-top:6px;font-family:var(--font);font-size:12px">—</div>
       </div>
+    </div>
+    <div class="card" id="hl-account-card" style="margin-bottom:12px">
+      <div class="label">Live account (venue truth)
+        <span style="color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:0.04em;text-transform:none"> — Hyperliquid public API · what's really on-chain</span>
+      </div>
+      <div id="hl-account" style="margin-top:8px;font-family:var(--font);font-size:12px;color:var(--text-dim)">—</div>
     </div>
     <div class="card" style="margin-bottom:12px">
       <div class="label">Recent rebalances
@@ -1360,7 +1366,7 @@ function switchHlInstance(name) {
   fetchHyperliquid();
 }
 async function fetchHyperliquid() {
-  let inst = _hlInstance, health = null, state = {}, trades = [];
+  let inst = _hlInstance, health = null, state = {}, trades = [], account = {};
   try {
     const il = await (await fetch('/api/hl_xsectional/instances')).json();
     const insts = il.instances || [];
@@ -1372,12 +1378,14 @@ async function fetchHyperliquid() {
         (i.mode ? ' · ' + i.mode : '') + '</option>').join('');
       _hlSel.value = _hlInstance;
     }
-    const [h, s, t] = await Promise.all([
+    const [h, s, t, a] = await Promise.all([
       fetch('/api/hl_xsectional/' + encodeURIComponent(inst) + '/health'),
       fetch('/api/hl_xsectional/' + encodeURIComponent(inst) + '/state'),
       fetch('/api/hl_xsectional/' + encodeURIComponent(inst) + '/trades?limit=30'),
+      fetch('/api/hl_xsectional/' + encodeURIComponent(inst) + '/account'),
     ]);
     health = await h.json(); state = await s.json(); trades = (await t.json()).trades || [];
+    try { account = await a.json(); } catch (e) { account = {}; }
   } catch (e) { return; }
   if (!health || health.error) return;
   const esc = v => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -1429,6 +1437,46 @@ async function fetchHyperliquid() {
     '<div>wallet: ' + (health.have_wallet ? '<span style="color:var(--green)">' + esc(acct) + '</span>' : '<span style="color:var(--text-dim)">none (dry)</span>') + '</div>' +
     '<div style="margin-top:4px">fees: <span style="color:var(--amber)">' + usd(state.fees_paid_total || 0) + '</span></div>' +
     '<div style="margin-top:6px;color:var(--text-dim)">reconcile: ' + (health.last_reconcile_ok ? 'ok' : 'ERRORS') + '</div>';
+  // live venue account (real on-chain balance / positions / PnL) — /account endpoint
+  const acctEl = document.getElementById('hl-account');
+  if (acctEl) {
+    if (!account || account.configured === false) {
+      acctEl.innerHTML = '<span style="color:var(--text-dim)">' +
+        esc((account && account.reason) || 'no live account (paper / DRY mode)') + '</span>';
+    } else if (account.error) {
+      acctEl.innerHTML = '<span style="color:var(--amber)">venue read failed — retrying… ' +
+        '<span style="color:var(--text-dim)">(' + esc(account.error) + ')</span></span>';
+    } else {
+      const lev = account.gross_leverage_on_equity;
+      const sUsd = v => (v == null ? '—' : (v >= 0 ? '+' : '−') + '$' +
+        Math.abs(Number(v)).toLocaleString(undefined, { maximumFractionDigits: 2 }));
+      const prow = (account.positions || []).map(p => {
+        const liq = (p.liq == null) ? '—' : Number(p.liq).toLocaleString(undefined, { maximumSignificantDigits: 4 });
+        const sc = p.side === 'LONG' ? 'var(--green)' : 'var(--red)';
+        return '<tr><td style="padding:2px 0">' + esc(p.coin) + '</td>' +
+          '<td style="color:' + sc + '">' + esc(p.side) + '</td>' +
+          '<td style="text-align:right">' + usd(p.notional) + '</td>' +
+          '<td style="text-align:right;color:' + (p.upnl >= 0 ? 'var(--green)' : 'var(--red)') + '">' +
+            (p.upnl >= 0 ? '+' : '') + Number(p.upnl).toFixed(2) + '</td>' +
+          '<td style="text-align:right;color:var(--text-dim)">' + liq + '</td></tr>';
+      }).join('');
+      const cell = (lbl, big, sub, col) =>
+        '<div><div style="color:var(--text-dim);font-size:10px">' + lbl + '</div>' +
+        '<div style="font-size:14px;color:' + (col || 'var(--text)') + '">' + big + '</div>' +
+        (sub ? '<div style="color:var(--text-dim);font-size:10px">' + sub + '</div>' : '') + '</div>';
+      acctEl.innerHTML =
+        '<div style="display:flex;flex-wrap:wrap;gap:18px;margin-bottom:8px">' +
+          cell('EQUITY', usd(account.equity), 'perp ' + usd(account.perp_account_value) + ' + spot ' + usd(account.spot_usdc_free)) +
+          cell('GROSS NOTIONAL', usd(account.gross_notional), (lev == null ? '' : Number(lev).toFixed(2) + '× of equity')) +
+          cell('NET uPnL', sUsd(account.net_upnl), '', account.net_upnl >= 0 ? 'var(--green)' : 'var(--red)') +
+          cell('MAINT. BUFFER', usd(account.maintenance_buffer), 'margin used ' + usd(account.maintenance_margin)) +
+        '</div>' +
+        '<table style="width:100%;border-collapse:collapse">' +
+          '<thead><tr style="color:var(--text-dim)"><th style="text-align:left">coin</th><th style="text-align:left">side</th>' +
+          '<th style="text-align:right">notional</th><th style="text-align:right">uPnL</th><th style="text-align:right">liq</th></tr></thead>' +
+          '<tbody>' + prow + '</tbody></table>';
+    }
+  }
   const rows = trades.filter(t => ['rebalance', 'circuit_breaker_halt', 'reconcile', 'skip'].includes(t.action)).slice(0, 12);
   document.getElementById('hl-recent').innerHTML = rows.length ? rows.map(t => {
     const when = t.ts ? relTime(t.ts) : '';

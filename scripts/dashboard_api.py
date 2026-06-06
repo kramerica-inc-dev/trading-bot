@@ -1025,6 +1025,53 @@ def _read_hl_xsectional_trades(instance: str, limit: int = 50) -> List[Dict[str,
     return list(reversed(_read_jsonl_file(trades_path, max_lines=limit)))
 
 
+_HL_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_HL_ACCOUNT_CACHE_TTL = 8.0   # gentle on the public venue API (dashboard polls ~10s)
+
+
+def _resolve_hl_address(instance: str, override: Optional[str]) -> Optional[str]:
+    """Public account address for an HL instance: an explicit ?address= override,
+    else the runner's health.json `account_full`, else the HL_ACCOUNT_ADDRESS env.
+    None (→ 'not configured') when no wallet-backed instance is running."""
+    if override and _HL_ADDR_RE.match(override):
+        return override
+    h = _read_json_file(HL_XSECTIONAL_STATE_DIR / instance / "health.json", {}) or {}
+    addr = h.get("account_full")
+    if addr and _HL_ADDR_RE.match(addr):
+        return addr
+    env = os.environ.get("HL_ACCOUNT_ADDRESS")
+    return env if (env and _HL_ADDR_RE.match(env)) else None
+
+
+def _hl_live_account(instance: str, override: Optional[str] = None) -> Dict[str, Any]:
+    """Live venue truth (balance / positions / PnL) from Hyperliquid's PUBLIC API
+    via scripts/hl_status.fetch(). Briefly cached so dashboard polling doesn't
+    hammer the venue. {configured: False} when no live wallet is set (paper/DRY)."""
+    if not CARRY_INSTANCE_NAME_RE.match(instance):
+        raise ValueError(f"invalid hl_xsectional instance: {instance!r}")
+    addr = _resolve_hl_address(instance, override)
+    if not addr:
+        return {"configured": False,
+                "reason": "no wallet-backed instance (paper / MAINNET_DRY) — no live account"}
+    key = f"hl_account:{addr}"
+    now = time.time()
+    with _cache_lock:
+        if key in _cache and (now - _cache_ts.get(key, 0)) < _HL_ACCOUNT_CACHE_TTL:
+            return _cache[key]
+    try:
+        import hl_status   # lazy import: keep the dashboard import-safe
+        snap = hl_status.fetch(addr)
+        snap["configured"] = True
+        snap["instance"] = instance
+    except Exception as e:   # noqa: BLE001 — surface as a soft error, never 500 the tab
+        return {"configured": True, "address": addr, "instance": instance,
+                "error": f"venue fetch failed: {e}"}
+    with _cache_lock:
+        _cache[key] = snap
+        _cache_ts[key] = now
+    return snap
+
+
 def _unit_allowed(unit: str) -> bool:
     if unit in CONTROLLABLE_SERVICES:
         return True
@@ -1332,6 +1379,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         limit = 50
                     self._send_json({"instance": instance,
                                      "trades": _read_hl_xsectional_trades(instance, limit=limit)})
+                elif resource == "account":
+                    # Live venue truth from the PUBLIC API (balance/positions/PnL).
+                    self._send_json(_hl_live_account(instance, q.get("address")))
                 else:
                     self._send_json({"error": "unknown hl_xsectional resource"}, 404)
             except ValueError as e:

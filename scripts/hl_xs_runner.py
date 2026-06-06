@@ -341,6 +341,9 @@ class HLXSRunner:
              "mode": self.mode, "venue": "hyperliquid", "live_trading": self.live_trading,
              "have_wallet": self.adapter.wallet is not None,
              "account": (_mask(self.adapter.address) if self.adapter.wallet else None),
+             # Full PUBLIC address (never the key) so the dashboard can query the
+             # venue's public API for a live account view. None in no-wallet modes.
+             "account_full": (self.adapter.address if self.adapter.wallet else None),
              "cycles_total": s.cycles_total, "rebalances_total": s.rebalances_total,
              "skips_total": s.skips_total, "equity": round(s.equity, 2),
              "peak_equity": round(s.peak_equity, 2), "drawdown_pct": round(dd * 100, 2),
