@@ -451,5 +451,30 @@ class TestRunSafetyOnce(unittest.TestCase):
         self.assertEqual(saved.cb_state, "normal")     # and NOT op_halted
 
 
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestForceRebalance(unittest.TestCase):
+    """--force-rebalance overrides the rebal_days timer for a one-shot operator
+    rebalance, without affecting the normal cadence when unset."""
+
+    def _sr(self, force, last_ts, now):
+        stub = types.SimpleNamespace(cfg=R.HLXSConfig(rebal_days=5),
+                                     _force_rebalance=force)
+        s = XSState(cash=1.0, equity=1.0, peak_equity=1.0)
+        s.last_rebalance_ts = last_ts
+        return types.MethodType(R.HLXSRunner._should_rebalance, stub)(s, now)
+
+    def test_force_overrides_recent_rebalance(self):
+        now = datetime(2026, 6, 6, 12, 0, tzinfo=timezone.utc)
+        recent = datetime(2026, 6, 5, 11, 15, tzinfo=timezone.utc).isoformat()  # ~1d ago
+        self.assertFalse(self._sr(False, recent, now))   # not due, no override
+        self.assertTrue(self._sr(True, recent, now))     # forced -> rebalance now
+
+    def test_unset_force_keeps_timer(self):
+        now = datetime(2026, 6, 6, 12, 0, tzinfo=timezone.utc)
+        old = datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc).isoformat()        # >5d ago
+        self.assertTrue(self._sr(False, old, now))       # genuinely due
+        self.assertTrue(self._sr(False, None, now))      # first-ever rebalance
+
+
 if __name__ == "__main__":
     unittest.main()

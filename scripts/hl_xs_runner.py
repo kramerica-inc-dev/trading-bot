@@ -104,6 +104,7 @@ class HLXSRunner:
         # We place real orders only with a wallet AND in a trade-enabled mode.
         self.live_trading = (self.mode in (MODE_TESTNET, MODE_MAINNET_LIVE)
                              and self.adapter.exchange is not None)
+        self._force_rebalance = False        # set via --force-rebalance for a one-shot
         self.dir = STATE_ROOT / cfg.instance_name
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.dir / "state.json"
@@ -432,6 +433,8 @@ class HLXSRunner:
         return round(nb, 3)
 
     def _should_rebalance(self, s: XSState, now: datetime) -> bool:
+        if self._force_rebalance:          # one-shot operator override (--force-rebalance)
+            return True
         if s.last_rebalance_ts is None:
             return True
         last = datetime.fromisoformat(s.last_rebalance_ts)
@@ -674,9 +677,13 @@ def main() -> int:
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--interval-sec", type=int, default=3600)
+    ap.add_argument("--force-rebalance", action="store_true",
+                    help="force a one-shot rebalance now, ignoring the rebal_days "
+                         "timer (operator override; use with --once)")
     args = ap.parse_args()
     cfg = load_config(args.config) if Path(args.config).exists() else HLXSConfig()
     runner = HLXSRunner(cfg)
+    runner._force_rebalance = args.force_rebalance
     if args.loop:
         runner.run_loop(args.interval_sec)
         return 0
