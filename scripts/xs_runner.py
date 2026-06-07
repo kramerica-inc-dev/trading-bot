@@ -129,6 +129,8 @@ class XSState:
     fees_paid_total: float = 0.0
     cb_state: str = "normal"            # normal | halted | op_halt | catastrophe_halt
     last_settled_equity: Optional[float] = None   # last accepted settled equity (intracycle-drop ref)
+    last_funding_ts: Optional[str] = None         # last sim-funding accrual (HL runner)
+    data_outage_streak: int = 0                   # consecutive insufficient/stale-data cycles
     started_ts: Optional[str] = None
     last_rebalance_ts: Optional[str] = None
     last_cycle_ts: Optional[str] = None

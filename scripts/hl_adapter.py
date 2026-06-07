@@ -95,6 +95,9 @@ class HLAdapter:
         return {u["name"]: int(u["szDecimals"]) for u in self.meta()["universe"]}
 
     def all_mids(self) -> Dict[str, float]:
+        """Current mid prices. An EMPTY dict means the feed is unavailable/degraded
+        (HL always serves a non-empty book), so callers must treat {} as "no data"
+        and NOT size/close on it — never as a genuine empty market."""
         out: Dict[str, float] = {}
         try:
             for k, v in (self.info.all_mids() or {}).items():
@@ -106,29 +109,53 @@ class HLAdapter:
             pass
         return out
 
-    def daily_closes(self, coins: List[str], lookback: int, *, pad: int = 12
-                     ) -> Dict[str, np.ndarray]:
+    def daily_closes(self, coins: List[str], lookback: int, *, pad: int = 12,
+                     return_latest_ms: bool = False):
         """Recent CLOSED daily closes per coin (oldest→newest) for the momentum
         signal. Public (no wallet). Drops the in-progress bar (T > now). A
-        malformed response for one coin is skipped, never aborts the universe."""
+        malformed response for one coin is skipped, never aborts the universe.
+        With return_latest_ms=True also returns the newest closed-bar timestamp
+        (ms) across the universe for the staleness guard — None if no data."""
         need = lookback + pad
         now_ms = int(time.time() * 1000)
         start = now_ms - (need + 3) * 86_400_000
         out: Dict[str, np.ndarray] = {}
+        latest_ms: Optional[int] = None
         for c in coins:
             try:
                 data = self.info.post("/info", {"type": "candleSnapshot", "req": {
                     "coin": c, "interval": "1d", "startTime": start, "endTime": now_ms}})
                 if not isinstance(data, list):
                     continue
-                closed = [float(d["c"]) for d in data
-                          if isinstance(d, dict) and "c" in d and "T" in d
-                          and int(d["T"]) <= now_ms]
+                rows = [(int(d["T"]), float(d["c"])) for d in data
+                        if isinstance(d, dict) and "c" in d and "T" in d
+                        and int(d["T"]) <= now_ms]
             except Exception:
                 continue
-            if len(closed) >= lookback + 1:
-                out[c] = np.asarray(closed, dtype=float)
+            if len(rows) >= lookback + 1:
+                rows.sort(key=lambda r: r[0])            # guarantee oldest→newest
+                out[c] = np.asarray([r[1] for r in rows], dtype=float)
+                latest_ms = max(latest_ms or 0, rows[-1][0])
             time.sleep(0.05)
+        return (out, latest_ms) if return_latest_ms else out
+
+    def funding_daily(self, coins: List[str]) -> Dict[str, float]:
+        """Current predicted DAILY funding rate per coin (HL funding settles
+        hourly → ×24). Best-effort; returns {} on any failure so a caller can fall
+        back to a flat rate. For honest SIM P&L only — live funding is already
+        reflected in account_value()."""
+        out: Dict[str, float] = {}
+        try:
+            meta, ctxs = self.info.meta_and_asset_ctxs()
+            names = [u["name"] for u in meta.get("universe", [])]
+            for name, ctx in zip(names, ctxs):
+                if name in coins and isinstance(ctx, dict) and "funding" in ctx:
+                    try:
+                        out[name] = float(ctx["funding"]) * 24.0
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            pass
         return out
 
     def _spot_usdc_free(self) -> Optional[float]:
@@ -227,6 +254,19 @@ class HLAdapter:
     def _round_sz(self, coin: str, sz: float) -> float:
         d = self.sz_decimals().get(coin, 4)
         return float(round(sz, d))
+
+    def set_leverage(self, coin: str, leverage: int, *, is_cross: bool = True) -> dict:
+        """Pin per-coin leverage (cross by default) so a position can't inherit
+        HL's per-coin MAXIMUM leverage (e.g. 40x BTC). Returns {ok, raw|error};
+        a no-op (ok=False) without a signing wallet or in MAINNET_DRY."""
+        if self.exchange is None or self.mode == MODE_MAINNET_DRY:
+            return {"ok": False, "error": "not live (no wallet / MAINNET_DRY)"}
+        try:
+            raw = self.exchange.update_leverage(int(leverage), coin, is_cross)
+            ok = isinstance(raw, dict) and raw.get("status") == "ok"
+            return {"ok": ok, "raw": raw, "error": None if ok else str(raw)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     # ----------------------------------------------------------------- orders
     MIN_ORDER_USD = 10.0   # Hyperliquid minimum order value

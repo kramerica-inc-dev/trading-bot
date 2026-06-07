@@ -31,6 +31,7 @@ import json
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +75,21 @@ class HLXSConfig:
     # fast safety cadence: how often run_safety_once() checks equity/CB/reconcile
     # between the (slow) rebalances — so a live book isn't only seen hourly.
     safety_interval_sec: int = 300
+    # --- P0 safety caps (live) ---
+    # Pin per-coin cross leverage so a position can't inherit HL's per-coin MAX
+    # (e.g. 40x BTC). The neutral basket only needs ~2x; 5x leaves headroom while
+    # capping the liquidation tail.
+    max_leverage: int = 5
+    # Absolute USD ceilings on the basket, independent of the equity read — a guard
+    # against an over-stated equity scaling the book unchecked. None = disabled
+    # (set these in the live mainnet config to the real account's risk budget).
+    max_gross_usd: Optional[float] = None    # cap on Σ|leg notional|
+    max_net_usd: Optional[float] = None      # cap on |Σ leg notional| (net directional)
+    # Stale/insufficient-data handling: skip the rebalance when the newest daily
+    # bar is older than this; after this many consecutive bad-data cycles, flatten
+    # an open live book rather than holding it blind.
+    data_staleness_hours: int = 36
+    max_data_outage_cycles: int = 3
     network: str = "mainnet"            # 'mainnet' (DRY default) or 'testnet'
     allow_live: bool = False            # mainnet real-money gate
 
@@ -105,6 +121,7 @@ class HLXSRunner:
         self.live_trading = (self.mode in (MODE_TESTNET, MODE_MAINNET_LIVE)
                              and self.adapter.exchange is not None)
         self._force_rebalance = False        # set via --force-rebalance for a one-shot
+        self._leverage_set = False           # per-process idempotent leverage pin
         self.dir = STATE_ROOT / cfg.instance_name
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.dir / "state.json"
@@ -152,11 +169,78 @@ class HLXSRunner:
             return self.adapter.account_value()      # float, 0.0 (unfunded), or None
         return self._sim_mark(s, mids)
 
+    # -- leverage pin (live) -----------------------------------------------
+    def _ensure_leverage(self, s: XSState) -> None:
+        """Pin per-coin cross leverage once per process (idempotent), so a live
+        position can't inherit HL's per-coin MAX leverage (P0 #1). Best-effort;
+        logs failures but never blocks a cycle. No-op in sim/DRY."""
+        if self._leverage_set or not self.live_trading or self.cfg.max_leverage <= 0:
+            return
+        results = {c: self.adapter.set_leverage(c, self.cfg.max_leverage).get("ok", False)
+                   for c in self.cfg.universe}
+        self._leverage_set = True
+        self.log({"action": "set_leverage", "leverage": self.cfg.max_leverage,
+                  "ok_count": sum(1 for v in results.values() if v),
+                  "failed": [c for c, ok in results.items() if not ok]})
+
+    # -- sim funding (paper honesty) ---------------------------------------
+    def _accrue_sim_funding(self, s: XSState, now: datetime) -> float:
+        """SIM-only: accrue per-asset funding (HL predicted rate, flat fallback) on
+        the held paper legs since the last accrual, so MAINNET_DRY paper P&L isn't
+        optimistic (P0 #6). No-op when live_trading — real funding is already in
+        account_value()."""
+        if self.live_trading or not s.positions:
+            return 0.0
+        ref = s.last_funding_ts or s.started_ts
+        s.last_funding_ts = now.isoformat()
+        if not ref:
+            return 0.0
+        try:
+            elapsed_days = max(0.0, (now - datetime.fromisoformat(ref)).total_seconds() / 86400.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if elapsed_days <= 0:
+            return 0.0
+        rates = self.adapter.funding_daily(list(s.positions.keys()))
+        flat_daily = self.cfg.flat_funding_annual / 365.0
+        total = 0.0
+        for sym, p in s.positions.items():
+            rate = rates.get(sym)
+            if rate is None:
+                rate = flat_daily
+            # long pays funding when rate>0, short receives → pnl = -side*notional*rate
+            total += -p.side * p.notional * rate * elapsed_days
+        s.cash += total
+        s.funding_paid_total += -total
+        return total
+
     # -- targets -----------------------------------------------------------
     def _targets(self, closes, equity) -> Dict[str, float]:
         w = compute_target_weights(closes, self.cfg.lookback_days, self.cfg.m)
         gross_book = equity * self.cfg.gross_exposure
-        return {c: wt * gross_book for c, wt in w.items() if wt != 0.0}
+        targets = {c: wt * gross_book for c, wt in w.items() if wt != 0.0}
+        return self._apply_exposure_caps(targets)
+
+    def _apply_exposure_caps(self, targets: Dict[str, float]) -> Dict[str, float]:
+        """Scale the basket down to the absolute USD ceilings (P0 #1/#11) — a guard
+        so an over-stated equity read can't size the book unchecked. Scaling is
+        uniform, so dollar-neutrality is preserved. No-op when the caps are unset."""
+        if not targets:
+            return targets
+        gross = sum(abs(v) for v in targets.values())
+        net = abs(sum(targets.values()))
+        scale = 1.0
+        if self.cfg.max_gross_usd is not None and self.cfg.max_gross_usd > 0 and gross > self.cfg.max_gross_usd:
+            scale = min(scale, self.cfg.max_gross_usd / gross)
+        if self.cfg.max_net_usd is not None and self.cfg.max_net_usd > 0 and net > self.cfg.max_net_usd:
+            scale = min(scale, self.cfg.max_net_usd / net)
+        if scale < 1.0:
+            targets = {c: v * scale for c, v in targets.items()}
+            self.log({"action": "exposure_capped", "scale": round(scale, 4),
+                      "gross_before": round(gross, 2), "net_before": round(net, 2),
+                      "max_gross_usd": self.cfg.max_gross_usd,
+                      "max_net_usd": self.cfg.max_net_usd})
+        return targets
 
     # -- live book verification / remediation ------------------------------
     def _verify_book(self, targets: Dict[str, float]):
@@ -178,15 +262,40 @@ class HLXSRunner:
         return ok, missing, f"missing={list(missing)} extra={extra} L/S={ln:.0f}/{sn:.0f}"
 
     def flatten_all(self) -> list:
-        """Close every live position (drawdown halt / failed-rebalance safety)."""
-        try:
-            coins = list(self.adapter.positions().keys())
-        except Exception as e:
-            return [{"act": "flatten", "ok": False, "err": f"positions read: {e}"}]
+        """Close every live position (drawdown halt / failed-rebalance safety).
+        Hardened (P0 #8): retry the positions read, then VERIFY the book is flat and
+        re-close any straggler, so a breaker can never report a benign-looking
+        'flattened' while a read failure actually left real positions open."""
+        coins = None
+        last_err = None
+        for i in range(3):
+            try:
+                coins = list(self.adapter.positions().keys())
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(0.4 * (i + 1))
+        if coins is None:
+            # could not even read the book — do NOT pretend we flattened
+            return [{"act": "flatten", "ok": False, "verified_flat": False,
+                     "err": f"positions read failed (UNCONFIRMED flatten): {last_err}"}]
         out = []
         for coin in coins:
             r = self.adapter.close(coin)
             out.append({"act": "flatten", "coin": coin, "ok": r.ok, "err": r.error})
+        # verify flat; re-close any straggler once more, then report verified_flat
+        try:
+            remaining = list(self.adapter.positions().keys())
+            for coin in remaining:
+                r = self.adapter.close(coin)
+                out.append({"act": "flatten_retry", "coin": coin, "ok": r.ok, "err": r.error})
+            if remaining:
+                remaining = list(self.adapter.positions().keys())
+            out.append({"act": "flatten_verify", "verified_flat": not remaining,
+                        "remaining": remaining})
+        except Exception as e:
+            out.append({"act": "flatten_verify", "verified_flat": False,
+                        "err": f"verify read failed: {e}"})
         return out
 
     @staticmethod
@@ -589,6 +698,43 @@ class HLXSRunner:
         self.write_health(s, {"last_action": "safety", "reconcile_ok": rec["ok"]})
         return {"action": "safety", "equity": round(s.equity, 2), "reconcile_ok": rec["ok"]}
 
+    # -- data-outage handling ---------------------------------------------
+    def _handle_data_outage(self, s: XSState, closes: dict, stale_h: Optional[float],
+                            mids: dict) -> dict:
+        """Insufficient/stale data (or a degraded live mid feed). The equity read +
+        circuit breaker have ALREADY run this cycle (B1), so the book stays
+        monitored. Track a streak; after max_data_outage_cycles consecutive bad
+        cycles, FLATTEN an open live book rather than holding it blind (P0 #4/#5);
+        otherwise skip the rebalance."""
+        s.data_outage_streak += 1
+        n = len(closes)
+        if stale_h is not None and stale_h > self.cfg.data_staleness_hours:
+            reason = f"stale data ({stale_h:.1f}h)"
+        elif self.live_trading and not mids:
+            reason = "mid feed degraded (empty)"
+        else:
+            reason = f"insufficient data ({n} assets)"
+        action = "skip"
+        if (self.live_trading and s.cb_state == "normal"
+                and s.data_outage_streak >= self.cfg.max_data_outage_cycles):
+            try:
+                has_book = any(abs(v) > self.adapter.MIN_ORDER_USD
+                               for v in self.adapter.book_notional().values())
+            except Exception:
+                has_book = False
+            if has_book:
+                flat = self.flatten_all()
+                s.cb_state = "op_halt"
+                action = "data_outage_flatten"
+                self.log({"action": action, "streak": s.data_outage_streak,
+                          "reason": reason, "flattened": flat})
+        s.skips_total += 1
+        self.save_state(s)
+        self.write_health(s, {"last_action": action, "reason": reason,
+                              "data_outage_streak": s.data_outage_streak})
+        return {"action": action, "reason": reason,
+                "data_outage_streak": s.data_outage_streak}
+
     # -- one cycle ---------------------------------------------------------
     def run_once(self) -> dict:
         cfg = self.cfg
@@ -597,20 +743,34 @@ class HLXSRunner:
         s.cycles_total += 1
         s.last_cycle_ts = now.isoformat()
 
-        closes = self.adapter.daily_closes(cfg.universe, cfg.lookback_days)
-        if len(closes) < cfg.min_assets:
-            s.skips_total += 1
-            self.save_state(s)
-            self.write_health(s, {"last_action": "skip", "reason": f"{len(closes)} assets"})
-            return {"action": "skip", "reason": f"insufficient data ({len(closes)} assets)"}
-        mids = self.adapter.all_mids()
+        # SIM-only funding accrual so paper P&L isn't optimistic (A1) — before the
+        # equity read so the headwind flows into equity + drawdown.
+        funding = self._accrue_sim_funding(s, now)
 
+        # B1: monitor the live book FIRST. The equity read + circuit breaker run on
+        # EVERY cycle, BEFORE any data-sufficiency gate, so a data outage can never
+        # leave an open live book unmonitored by the breakers. Live equity comes
+        # from the account (no mids needed); sim marks off mids.
+        mids = self.adapter.all_mids()
         dd, sc = self._read_equity(s, mids)
         if sc is not None:
             return sc
         sc = self._apply_circuit_breaker(s, dd)
         if sc is not None:
             return sc
+
+        # Pin leverage before any order can be placed (B2), then gate on data quality.
+        self._ensure_leverage(s)
+        closes, latest_ms = self.adapter.daily_closes(
+            cfg.universe, cfg.lookback_days, return_latest_ms=True)
+        stale_h = ((now.timestamp() * 1000 - latest_ms) / 3.6e6
+                   if latest_ms is not None else None)
+        data_bad = (len(closes) < cfg.min_assets
+                    or (stale_h is not None and stale_h > cfg.data_staleness_hours)
+                    or (self.live_trading and not mids))      # A2: degraded mid feed
+        if data_bad:
+            return self._handle_data_outage(s, closes, stale_h, mids)
+        s.data_outage_streak = 0
 
         result = {"action": "noop"}
         targets = None
@@ -648,7 +808,7 @@ class HLXSRunner:
         insight = self._build_insight(s, closes, mids, s.equity)
         self.save_state(s)
         self.write_health(s, {"last_action": result["action"], "n_assets": len(closes),
-                              "reconcile_ok": rec["ok"], **insight})
+                              "reconcile_ok": rec["ok"], "funding": round(funding, 4), **insight})
         return {**result, "equity": round(s.equity, 2), "reconcile_ok": rec["ok"]}
 
     def run_loop(self, interval_sec: int = 3600) -> None:

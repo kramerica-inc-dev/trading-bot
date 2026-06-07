@@ -1,0 +1,24 @@
+# Dashboard service control (P0 D1) — least-privilege replacement for the broad
+# `botuser ALL=(ALL) NOPASSWD: ALL` grant.
+#
+# The dashboard (runs as botuser, network-reachable over Tailscale) controls the
+# runner services via `sudo -n systemctl <action> <unit>` (scripts/dashboard_api.py
+# _do_service_control, gated by an allowlist + token + cooldown). It only ever
+# needs start/stop/restart on the runner families it manages — NOT full root.
+#
+# The action verb is pinned literally and only the instance suffix is wildcarded,
+# so a single argument can never expand to a different command. The plan-e-runner
+# singleton is covered by 10-plan-e-dashboard. Install 0440 root:root; validate
+# with `visudo -cf`.
+
+Cmnd_Alias DASHBOARD_SVCCTL = \
+    /usr/bin/systemctl start plan-e@*,         /usr/bin/systemctl stop plan-e@*,         /usr/bin/systemctl restart plan-e@*, \
+    /usr/bin/systemctl start carry@*,          /usr/bin/systemctl stop carry@*,          /usr/bin/systemctl restart carry@*, \
+    /usr/bin/systemctl start xsectional@*,     /usr/bin/systemctl stop xsectional@*,     /usr/bin/systemctl restart xsectional@*, \
+    /usr/bin/systemctl start hl-xsectional@*,  /usr/bin/systemctl stop hl-xsectional@*,  /usr/bin/systemctl restart hl-xsectional@*, \
+    /bin/systemctl start plan-e@*,             /bin/systemctl stop plan-e@*,             /bin/systemctl restart plan-e@*, \
+    /bin/systemctl start carry@*,              /bin/systemctl stop carry@*,              /bin/systemctl restart carry@*, \
+    /bin/systemctl start xsectional@*,         /bin/systemctl stop xsectional@*,         /bin/systemctl restart xsectional@*, \
+    /bin/systemctl start hl-xsectional@*,      /bin/systemctl stop hl-xsectional@*,      /bin/systemctl restart hl-xsectional@*
+
+botuser ALL=(root) NOPASSWD: DASHBOARD_SVCCTL

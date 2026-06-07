@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -89,7 +90,10 @@ class TestTargets(unittest.TestCase):
     def _stub(self, **over):
         cfg = R.HLXSConfig(lookback_days=120, m=2, gross_exposure=1.0,
                            cost_rate=0.0005, **over)
-        return types.SimpleNamespace(cfg=cfg, mode="MAINNET_DRY")
+        stub = types.SimpleNamespace(cfg=cfg, mode="MAINNET_DRY", _logs=[])
+        stub.log = lambda e: stub._logs.append(e)
+        stub._apply_exposure_caps = types.MethodType(R.HLXSRunner._apply_exposure_caps, stub)
+        return stub
 
     def test_targets_dollar_neutral(self):
         stub = self._stub()
@@ -474,6 +478,227 @@ class TestForceRebalance(unittest.TestCase):
         old = datetime(2026, 6, 1, 0, 0, tzinfo=timezone.utc).isoformat()        # >5d ago
         self.assertTrue(self._sr(False, old, now))       # genuinely due
         self.assertTrue(self._sr(False, None, now))      # first-ever rebalance
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestExposureCaps(unittest.TestCase):
+    """B2: absolute USD ceilings scale the basket down, preserving neutrality."""
+
+    def _stub(self, **over):
+        stub = types.SimpleNamespace(cfg=R.HLXSConfig(**over), _logs=[])
+        stub.log = lambda e: stub._logs.append(e)
+        stub._apply_exposure_caps = types.MethodType(R.HLXSRunner._apply_exposure_caps, stub)
+        return stub
+
+    def test_no_caps_is_noop(self):
+        stub = self._stub()                      # max_gross_usd/max_net_usd default None
+        t = {"A": 1000.0, "B": 1000.0, "C": -1000.0, "D": -1000.0}
+        out = stub._apply_exposure_caps(dict(t))
+        self.assertEqual(out, t)
+        self.assertEqual(stub._logs, [])         # nothing capped → nothing logged
+
+    def test_gross_cap_scales_and_preserves_neutrality(self):
+        stub = self._stub(max_gross_usd=1000.0)
+        t = {"A": 1000.0, "B": 1000.0, "C": -1000.0, "D": -1000.0}   # gross 4000
+        out = stub._apply_exposure_caps(t)
+        self.assertAlmostEqual(sum(abs(v) for v in out.values()), 1000.0, places=6)
+        self.assertAlmostEqual(sum(out.values()), 0.0, places=6)     # still neutral
+        self.assertTrue(any(l.get("action") == "exposure_capped" for l in stub._logs))
+
+    def test_net_cap_bounds_directional(self):
+        stub = self._stub(max_net_usd=100.0)
+        t = {"A": 1000.0, "B": -500.0}           # net 500, gross 1500
+        out = stub._apply_exposure_caps(t)
+        self.assertAlmostEqual(abs(sum(out.values())), 100.0, places=6)
+
+    def test_cap_not_triggered_when_under(self):
+        stub = self._stub(max_gross_usd=10000.0)
+        t = {"A": 1000.0, "B": -1000.0}          # gross 2000 < 10000
+        out = stub._apply_exposure_caps(dict(t))
+        self.assertEqual(out, t)
+        self.assertEqual(stub._logs, [])
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestSimFunding(unittest.TestCase):
+    """A1: MAINNET_DRY paper P&L accrues funding so it isn't optimistic."""
+
+    def _stub(self, live, rates=None):
+        stub = types.SimpleNamespace(
+            live_trading=live, cfg=R.HLXSConfig(flat_funding_annual=0.0365),
+            adapter=types.SimpleNamespace(funding_daily=lambda coins: (rates or {})))
+        stub._accrue_sim_funding = types.MethodType(R.HLXSRunner._accrue_sim_funding, stub)
+        return stub
+
+    def _state_with_long(self):
+        from xs_runner import Position
+        s = XSState(cash=5000.0, equity=5000.0, peak_equity=5000.0,
+                    started_ts="2026-06-01T00:00:00+00:00")
+        s.positions = {"BTC": Position(side=1, notional=1000.0, entry_price=100.0, entered_ts="x")}
+        s.last_funding_ts = "2026-06-05T00:00:00+00:00"
+        return s
+
+    def test_funding_charged_on_held_long(self):
+        stub = self._stub(live=False)            # flat fallback 0.0365/yr → 0.0001/day
+        s = self._state_with_long()
+        now = datetime(2026, 6, 6, 0, 0, tzinfo=timezone.utc)   # 1 day since last accrual
+        f = stub._accrue_sim_funding(s, now)
+        self.assertAlmostEqual(f, -1000.0 * (0.0365 / 365.0) * 1.0, places=6)  # long pays
+        self.assertLess(s.cash, 5000.0)
+        self.assertGreater(s.funding_paid_total, 0.0)
+        self.assertEqual(s.last_funding_ts, now.isoformat())
+
+    def test_live_mode_is_noop(self):
+        stub = self._stub(live=True)
+        s = self._state_with_long()
+        self.assertEqual(stub._accrue_sim_funding(s, datetime(2026, 6, 6, tzinfo=timezone.utc)), 0.0)
+        self.assertEqual(s.cash, 5000.0)         # live funding is in account_value, not here
+
+    def test_no_positions_is_noop(self):
+        stub = self._stub(live=False)
+        s = XSState(cash=5000.0, equity=5000.0, peak_equity=5000.0, started_ts="x")
+        self.assertEqual(stub._accrue_sim_funding(s, datetime(2026, 6, 6, tzinfo=timezone.utc)), 0.0)
+
+    def test_per_asset_rate_used_over_flat(self):
+        stub = self._stub(live=False, rates={"BTC": 0.01})   # 1%/day predicted
+        s = self._state_with_long()
+        now = datetime(2026, 6, 6, 0, 0, tzinfo=timezone.utc)
+        f = stub._accrue_sim_funding(s, now)
+        self.assertAlmostEqual(f, -1000.0 * 0.01 * 1.0, places=6)   # uses per-asset, not flat
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestFlattenAllHardened(unittest.TestCase):
+    """A3: flatten_all retries the read and VERIFIES flat — never a benign-looking
+    'flattened' while a read failure left positions open."""
+
+    class _Adapter:
+        def __init__(self, snaps):
+            self._snaps = list(snaps)
+            self.closed = []
+        def positions(self):
+            snap = self._snaps.pop(0) if self._snaps else {}
+            if isinstance(snap, Exception):
+                raise snap
+            return snap
+        def close(self, coin):
+            self.closed.append(coin)
+            return types.SimpleNamespace(ok=True, error=None)
+
+    def _stub(self, adapter):
+        return types.SimpleNamespace(adapter=adapter)
+
+    def test_unconfirmed_when_read_always_fails(self):
+        ad = self._Adapter([RuntimeError("502")] * 3)
+        stub = self._stub(ad)
+        with unittest.mock.patch.object(R.time, "sleep", lambda *_: None):
+            out = R.HLXSRunner.flatten_all(stub)
+        self.assertFalse(out[0]["ok"])
+        self.assertFalse(out[0]["verified_flat"])
+        self.assertIn("UNCONFIRMED", out[0]["err"])
+
+    def test_verified_flat_after_close(self):
+        ad = self._Adapter([{"BTC": {}, "ETH": {}}, {}])   # read, then empty on verify
+        out = R.HLXSRunner.flatten_all(self._stub(ad))
+        self.assertEqual(sorted(ad.closed), ["BTC", "ETH"])
+        self.assertTrue(out[-1]["verified_flat"])
+
+    def test_straggler_reclosed(self):
+        ad = self._Adapter([{"BTC": {}}, {"BTC": {}}, {}])  # still there on 1st verify
+        out = R.HLXSRunner.flatten_all(self._stub(ad))
+        self.assertTrue(any(o.get("act") == "flatten_retry" for o in out))
+        self.assertTrue(out[-1]["verified_flat"])
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestEnsureLeverage(unittest.TestCase):
+    """B2: per-coin leverage pinned once per process; no-op in sim."""
+
+    def _stub(self, live):
+        calls = []
+        stub = types.SimpleNamespace(
+            _leverage_set=False, live_trading=live,
+            cfg=R.HLXSConfig(max_leverage=5, universe=["BTC", "ETH"]), _logs=[], _calls=calls,
+            adapter=types.SimpleNamespace(
+                set_leverage=lambda c, lev: (calls.append((c, lev)) or {"ok": True})))
+        stub.log = lambda e: stub._logs.append(e)
+        stub._ensure_leverage = types.MethodType(R.HLXSRunner._ensure_leverage, stub)
+        return stub
+
+    def test_pins_once_then_idempotent(self):
+        stub = self._stub(live=True)
+        stub._ensure_leverage(None)
+        self.assertEqual(stub._calls, [("BTC", 5), ("ETH", 5)])
+        self.assertTrue(stub._leverage_set)
+        stub._ensure_leverage(None)               # second call no-op
+        self.assertEqual(len(stub._calls), 2)
+
+    def test_sim_mode_no_leverage_calls(self):
+        stub = self._stub(live=False)
+        stub._ensure_leverage(None)
+        self.assertEqual(stub._calls, [])
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestDataOutage(unittest.TestCase):
+    """B1/A2: a data outage increments a streak and skips; after the threshold an
+    open live book is flattened rather than held blind; sim never places orders."""
+
+    def _stub(self, live, *, book=None, cb="normal", max_cycles=3):
+        tmp = Path(tempfile.mkdtemp())
+        flat = []
+        stub = types.SimpleNamespace(
+            cfg=R.HLXSConfig(max_data_outage_cycles=max_cycles, data_staleness_hours=36),
+            live_trading=live, mode="MAINNET_LIVE" if live else "MAINNET_DRY",
+            dir=tmp, state_path=tmp / "state.json", health_path=tmp / "health.json",
+            trades_path=tmp / "trades.log", _flat=flat,
+            adapter=types.SimpleNamespace(book_notional=lambda: (book or {}),
+                                          MIN_ORDER_USD=10.0, wallet=object(), address="0xM"))
+        stub.flatten_all = lambda: (flat.append(True) or [{"act": "flatten"}])
+        for name in ("_handle_data_outage", "save_state", "write_health", "log"):
+            setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
+        return stub
+
+    def _state(self, streak=0, cb="normal"):
+        return XSState(cash=900.0, equity=900.0, peak_equity=1000.0,
+                       cycles_total=4, started_ts="x", cb_state=cb, data_outage_streak=streak)
+
+    def test_below_threshold_skips_no_flatten(self):
+        stub = self._stub(live=True, book={"BTC": 500.0})
+        s = self._state(streak=0)
+        r = stub._handle_data_outage(s, {}, None, {})
+        self.assertEqual(r["action"], "skip")
+        self.assertEqual(s.data_outage_streak, 1)
+        self.assertFalse(stub._flat)
+
+    def test_threshold_with_live_book_flattens_and_halts(self):
+        stub = self._stub(live=True, book={"BTC": 500.0, "ETH": -500.0})
+        s = self._state(streak=2)                 # this call makes it 3 == threshold
+        r = stub._handle_data_outage(s, {}, None, {})
+        self.assertEqual(r["action"], "data_outage_flatten")
+        self.assertEqual(s.cb_state, "op_halt")
+        self.assertTrue(stub._flat)
+
+    def test_threshold_but_no_book_does_not_flatten(self):
+        stub = self._stub(live=True, book={})      # no open positions
+        s = self._state(streak=2)
+        r = stub._handle_data_outage(s, {}, None, {})
+        self.assertEqual(r["action"], "skip")
+        self.assertFalse(stub._flat)
+        self.assertEqual(s.cb_state, "normal")
+
+    def test_sim_mode_never_flattens(self):
+        stub = self._stub(live=False, book={"BTC": 500.0})
+        s = self._state(streak=5)
+        r = stub._handle_data_outage(s, {}, None, {})
+        self.assertEqual(r["action"], "skip")
+        self.assertFalse(stub._flat)
+
+    def test_stale_reason_reported(self):
+        stub = self._stub(live=True, book={})
+        s = self._state(streak=0)
+        r = stub._handle_data_outage(s, {"BTC": np.ones(200)}, 50.0, {"BTC": 1.0})
+        self.assertIn("stale", r["reason"])
 
 
 if __name__ == "__main__":
