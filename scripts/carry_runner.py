@@ -651,6 +651,12 @@ class CarryRunner:
         tmp.replace(self.state_path)
 
     def append_log(self, entry: Dict[str, Any]) -> None:
+        # Rotate to <name>.1 at 10MB so the append-only log can't fill the LXC disk.
+        try:
+            if self.log_path.exists() and self.log_path.stat().st_size > 10 * 1024 * 1024:
+                self.log_path.replace(self.log_path.parent / (self.log_path.name + ".1"))
+        except OSError:
+            pass
         with open(self.log_path, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
 
@@ -1337,6 +1343,12 @@ class CarryRunner:
 # =========================  CLI  =========================
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Guarantee live journald output regardless of PYTHONUNBUFFERED in the unit.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None,
                     help="JSON config; defaults if omitted")

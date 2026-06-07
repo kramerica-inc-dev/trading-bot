@@ -109,6 +109,9 @@ class Watchdog:
         line = json.dumps(rec)
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
+            # Rotate to <name>.1 at 10MB so the event log can't fill the LXC disk.
+            if self.events_path.exists() and self.events_path.stat().st_size > 10 * 1024 * 1024:
+                self.events_path.replace(self.events_path.parent / (self.events_path.name + ".1"))
             with open(self.events_path, "a") as f:
                 f.write(line + "\n")
         except OSError:
@@ -175,6 +178,12 @@ class Watchdog:
 
 
 def main() -> int:
+    # Guarantee live journald output regardless of PYTHONUNBUFFERED in the unit.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--instance", required=True, help="runner instance name (e.g. mainnet)")
     ap.add_argument("--stale-after-sec", type=float, default=900.0)

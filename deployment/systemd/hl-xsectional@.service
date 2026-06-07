@@ -17,6 +17,14 @@ ExecStart=/usr/bin/python3 -m scripts.hl_xs_runner --loop --config /opt/trading-
 Restart=on-failure
 RestartSec=30
 
+# Cap RAM so one runaway process is cgroup-killed instead of OOM-reaping the
+# whole LXC (the 512MB container previously crashlooped). MemoryHigh throttles
+# + reclaims first; MemoryMax is the hard kill ceiling. Generous here — this is
+# the LIVE money runner (numpy-only, ~70-100MB steady), so a transient spike
+# must never wrongly kill it mid-cycle.
+MemoryHigh=256M
+MemoryMax=384M
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hl-xsectional-%i

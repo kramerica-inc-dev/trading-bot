@@ -306,35 +306,12 @@ def _read_dhcp_status() -> Dict[str, Any]:
 
 
 def _bot_service_status() -> Dict:
-    """Check systemd service status."""
-    try:
-        result = subprocess.run(
-            ["systemctl", "is-active", "trading-bot"],
-            capture_output=True, text=True, timeout=5)
-        active = result.stdout.strip()
-    except Exception:
-        active = "unknown"
-    uptime = ""
-    try:
-        result = subprocess.run(
-            ["systemctl", "show", "trading-bot", "--property=ActiveEnterTimestamp"],
-            capture_output=True, text=True, timeout=5)
-        ts_str = result.stdout.strip().split("=", 1)[-1].strip()
-        if ts_str:
-            # Parse systemd timestamp
-            from email.utils import parsedate_to_datetime
-            try:
-                started = datetime.fromisoformat(ts_str)
-            except Exception:
-                started = None
-            if started:
-                delta = datetime.now(timezone.utc) - started.astimezone(timezone.utc)
-                hours = int(delta.total_seconds() // 3600)
-                minutes = int((delta.total_seconds() % 3600) // 60)
-                uptime = f"{hours}h {minutes}m"
-    except Exception:
-        pass
-    return {"status": active, "uptime": uptime}
+    """Status of the legacy single-asset bot unit (cached, single-fork).
+
+    Delegates to _service_status so it shares the TTL cache and the single
+    `systemctl show` path instead of forking is-active + show on every poll.
+    """
+    return _service_status("trading-bot")
 
 
 # ---------------------------------------------------------------------------
@@ -513,31 +490,53 @@ def _next_rebalance_ts(rebalance_hour_utc: int) -> str:
     return candidate.isoformat()
 
 
+_SERVICE_STATUS_TTL = 8.0  # systemctl forks are costly on the LXC; dashboard polls ~10s
+
+
 def _service_status(unit: str) -> Dict[str, Any]:
-    """systemctl is-active + ActiveEnterTimestamp for a unit."""
-    try:
-        r = subprocess.run(
-            ["systemctl", "is-active", unit],
-            capture_output=True, text=True, timeout=5)
-        active = r.stdout.strip() or r.stderr.strip() or "unknown"
-    except Exception:
-        active = "unknown"
+    """systemd ActiveState + uptime for a unit — cached, single-fork.
+
+    One `systemctl show` per uncached call (not is-active + show), with an 8s
+    TTL so concurrent polls and multiple endpoints don't each fork systemctl.
+    That per-request fork storm (2 forks x N instances) was a steady CPU/journald
+    load on the container.
+    """
+    key = f"svc:{unit}"
+    now = time.time()
+    with _cache_lock:
+        if key in _cache and (now - _cache_ts.get(key, 0)) < _SERVICE_STATUS_TTL:
+            return _cache[key]
+    status = "unknown"
     uptime = ""
     try:
         r = subprocess.run(
-            ["systemctl", "show", unit, "--property=ActiveEnterTimestamp"],
+            ["systemctl", "show", unit,
+             "--property=ActiveState,ActiveEnterTimestamp"],
             capture_output=True, text=True, timeout=5)
-        ts_str = r.stdout.strip().split("=", 1)[-1].strip()
+        props: Dict[str, str] = {}
+        for line in r.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                props[k.strip()] = v.strip()
+        status = props.get("ActiveState") or "unknown"
+        ts_str = props.get("ActiveEnterTimestamp", "")
         if ts_str and ts_str != "0":
-            started = datetime.strptime(ts_str, "%a %Y-%m-%d %H:%M:%S %Z")
-            started = started.replace(tzinfo=timezone.utc)
-            delta = datetime.now(timezone.utc) - started
-            h = int(delta.total_seconds() // 3600)
-            m = int((delta.total_seconds() % 3600) // 60)
-            uptime = f"{h}h {m}m"
+            try:
+                started = datetime.strptime(ts_str, "%a %Y-%m-%d %H:%M:%S %Z")
+                started = started.replace(tzinfo=timezone.utc)
+                delta = datetime.now(timezone.utc) - started
+                h = int(delta.total_seconds() // 3600)
+                m = int((delta.total_seconds() % 3600) // 60)
+                uptime = f"{h}h {m}m"
+            except Exception:
+                pass
     except Exception:
-        pass
-    return {"status": active, "uptime": uptime}
+        status = "unknown"
+    result = {"status": status, "uptime": uptime}
+    with _cache_lock:
+        _cache[key] = result
+        _cache_ts[key] = now
+    return result
 
 
 def _list_instances() -> List[str]:
@@ -1439,6 +1438,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
 
 def main():
+    # Guarantee live journald output regardless of PYTHONUNBUFFERED in the unit.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     port = int(os.environ.get("DASHBOARD_PORT", API_PORT))
     server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
     server.daemon_threads = True

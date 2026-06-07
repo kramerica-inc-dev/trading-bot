@@ -263,6 +263,12 @@ class XSRunner:
 
     def log(self, event: dict) -> None:
         event = {"ts": _utcnow().isoformat(), **event}
+        # Rotate to <name>.1 at 10MB so the append-only log can't fill the LXC disk.
+        try:
+            if self.trades_path.exists() and self.trades_path.stat().st_size > 10 * 1024 * 1024:
+                self.trades_path.replace(self.trades_path.parent / (self.trades_path.name + ".1"))
+        except OSError:
+            pass
         with open(self.trades_path, "a") as f:
             f.write(json.dumps(event) + "\n")
 
@@ -498,6 +504,12 @@ class XSRunner:
 
 
 def main() -> int:
+    # Guarantee live journald output regardless of PYTHONUNBUFFERED in the unit.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "xsectional-okx.json"))
     ap.add_argument("--once", action="store_true", help="run a single cycle and exit")

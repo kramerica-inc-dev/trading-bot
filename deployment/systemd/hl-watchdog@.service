@@ -17,6 +17,9 @@ EnvironmentFile=-/etc/trading-bot/hl-watchdog-%i.env
 # real-money floor for this instance. Add --flatten-on-stale only after review.
 ExecStart=/usr/bin/python3 -m scripts.hl_watchdog --instance %i --stale-after-sec 900 --min-equity-usd 40
 
+# Tiny oneshot (reads health.json, optional flatten). Hard cap only.
+MemoryMax=128M
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hl-watchdog-%i

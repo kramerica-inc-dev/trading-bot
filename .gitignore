@@ -62,3 +62,9 @@ scripts/models/
 backtest/results/diag_bars.csv
 # OKX-sourced backfill is already ignored above; same for Hyperliquid (regen via backtest/hyperliquid_backfill.py)
 backtest/data/hyperliquid/
+
+# graphify knowledge-graph outputs (regenereerbaar via `graphify .` — grote HTML/JSON)
+graphify-out/
+
+# Lokaal-only architectuur-audit (meta over de repo, niet publiceren)
+docs/ARCHITECTURE-AUDIT-2026-06-07.md

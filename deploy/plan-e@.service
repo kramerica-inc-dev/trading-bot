@@ -16,6 +16,12 @@ ExecStart=/usr/bin/python3 -m scripts.plan_e_runner --mode paper --loop --config
 Restart=always
 RestartSec=30
 
+# Cap RAM so one runaway process is cgroup-killed instead of OOM-reaping the
+# whole LXC. plan_e_runner imports pandas (~50-90MB RSS); with up to 10 paper
+# instances this cap is what stops one leaker from taking the container down.
+MemoryHigh=192M
+MemoryMax=256M
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=plan-e-%i

@@ -16,6 +16,11 @@ ExecStart=/usr/bin/python3 -m scripts.xs_runner --loop --config /opt/trading-bot
 Restart=on-failure
 RestartSec=30
 
+# Cap RAM so one runaway process is cgroup-killed instead of OOM-reaping the
+# whole LXC. MemoryHigh throttles+reclaims first; MemoryMax is the hard ceiling.
+MemoryHigh=192M
+MemoryMax=256M
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=xsectional-%i
