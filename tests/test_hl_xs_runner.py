@@ -701,5 +701,73 @@ class TestDataOutage(unittest.TestCase):
         self.assertIn("stale", r["reason"])
 
 
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestEquityJumpGuard(unittest.TestCase):
+    """B2 (scale-free ceiling): an account read absurdly above the last settled
+    equity is held as a likely misread; a persistent jump (real deposit) is
+    accepted after confirm cycles; normal reads pass; disabled at factor=0."""
+
+    def _stub(self, eq, **over):
+        kw = {"max_equity_jump_factor": 3.0, "equity_jump_confirm_cycles": 3, **over}
+        cfg = R.HLXSConfig(**kw)
+        tmp = Path(tempfile.mkdtemp())
+        stub = types.SimpleNamespace(
+            cfg=cfg, live_trading=True, mode="MAINNET_LIVE",
+            health_path=tmp / "health.json", state_path=tmp / "state.json",
+            adapter=types.SimpleNamespace(wallet=object(), address="0xM",
+                                          book_notional=lambda: {}, MIN_ORDER_USD=10.0))
+        stub.equity = lambda st, mids: eq
+        for name in ("_read_equity", "save_state", "write_health"):
+            setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
+        return stub
+
+    def _state(self, settled=173.0):
+        s = XSState(cash=173.0, equity=173.0, peak_equity=173.0, cycles_total=5)
+        s.last_settled_equity = settled
+        return s
+
+    def test_suspicious_jump_holds_without_sizing(self):
+        stub = self._stub(eq=5000.0)             # 5000 > 3 * 173
+        s = self._state()
+        dd, sc = stub._read_equity(s, {})
+        self.assertIsNone(dd)
+        self.assertIn("equity jump", sc["reason"])
+        self.assertEqual(s.equity_jump_streak, 1)
+        self.assertEqual(s.equity, 173.0)        # NOT updated to the suspicious read
+
+    def test_persistent_jump_confirmed_as_deposit(self):
+        stub = self._stub(eq=5000.0)
+        s = self._state()
+        self.assertIsNotNone(stub._read_equity(s, {})[1])    # hold 1
+        self.assertIsNotNone(stub._read_equity(s, {})[1])    # hold 2
+        dd, sc = stub._read_equity(s, {})                    # 3rd -> confirmed
+        self.assertIsNone(sc)
+        self.assertEqual(s.equity, 5000.0)                   # accepted real deposit
+        self.assertEqual(s.equity_jump_streak, 0)
+
+    def test_normal_read_passes(self):
+        stub = self._stub(eq=180.0)              # 180 < 3 * 173
+        s = self._state()
+        dd, sc = stub._read_equity(s, {})
+        self.assertIsNone(sc)
+        self.assertEqual(s.equity, 180.0)
+
+    def test_no_baseline_accepts(self):
+        # last_settled None (early cycles / first funding) -> no guard
+        stub = self._stub(eq=5000.0)
+        s = self._state(settled=None)
+        s.equity = 0.0
+        dd, sc = stub._read_equity(s, {})
+        self.assertIsNone(sc)
+        self.assertEqual(s.equity, 5000.0)
+
+    def test_disabled_when_factor_zero(self):
+        stub = self._stub(eq=5000.0, max_equity_jump_factor=0.0)
+        s = self._state()
+        dd, sc = stub._read_equity(s, {})
+        self.assertIsNone(sc)
+        self.assertEqual(s.equity, 5000.0)
+
+
 if __name__ == "__main__":
     unittest.main()

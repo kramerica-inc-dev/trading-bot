@@ -131,6 +131,7 @@ class XSState:
     last_settled_equity: Optional[float] = None   # last accepted settled equity (intracycle-drop ref)
     last_funding_ts: Optional[str] = None         # last sim-funding accrual (HL runner)
     data_outage_streak: int = 0                   # consecutive insufficient/stale-data cycles
+    equity_jump_streak: int = 0                   # consecutive suspicious equity-jump reads (HL runner)
     started_ts: Optional[str] = None
     last_rebalance_ts: Optional[str] = None
     last_cycle_ts: Optional[str] = None

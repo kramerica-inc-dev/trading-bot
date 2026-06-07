@@ -90,6 +90,13 @@ class HLXSConfig:
     # an open live book rather than holding it blind.
     data_staleness_hours: int = 36
     max_data_outage_cycles: int = 3
+    # Equity-jump guard: an account read this many times ABOVE the last settled
+    # equity is treated as a likely misread (not a real gain) and not sized off —
+    # a genuine deposit persists and is accepted after equity_jump_confirm_cycles
+    # consecutive reads. Scales with the account automatically (no fixed cap).
+    # 0 disables. This is the scale-free alternative to a static max_gross_usd.
+    max_equity_jump_factor: float = 3.0
+    equity_jump_confirm_cycles: int = 3
     network: str = "mainnet"            # 'mainnet' (DRY default) or 'testnet'
     allow_live: bool = False            # mainnet real-money gate
 
@@ -594,6 +601,24 @@ class HLXSRunner:
             self.save_state(s)
             self.write_health(s, {"last_action": "skip", "reason": "account read transient"})
             return None, {"action": "skip", "reason": "transient account read failure"}
+        # Equity-jump guard (P0 #1/#11): a read absurdly ABOVE the last settled
+        # equity is almost certainly a misread (unified perp/spot accounting glitch),
+        # not a real gain — never size the book off it. A genuine DEPOSIT persists,
+        # so accept once the elevated read is confirmed over consecutive cycles; a
+        # one-off glitch never is. Scale-free — no fixed dollar cap to maintain.
+        ref = s.last_settled_equity
+        if (ref is not None and ref > 0 and self.cfg.max_equity_jump_factor > 0
+                and eq > ref * self.cfg.max_equity_jump_factor):
+            s.equity_jump_streak += 1
+            if s.equity_jump_streak < self.cfg.equity_jump_confirm_cycles:
+                s.skips_total += 1
+                self.save_state(s)
+                self.write_health(s, {"last_action": "skip",
+                                      "reason": f"unconfirmed equity jump {eq:.0f} vs settled {ref:.0f}",
+                                      "equity_jump_streak": s.equity_jump_streak})
+                return None, {"action": "skip",
+                              "reason": f"suspicious equity jump ({eq:.0f} vs settled {ref:.0f}); holding"}
+        s.equity_jump_streak = 0
         s.equity = eq
         if s.cycles_total == 1:                       # anchor peak to true starting equity
             s.peak_equity = s.equity
