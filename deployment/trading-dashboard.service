@@ -22,7 +22,11 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=trading-dashboard
 
-NoNewPrivileges=true
+# The dashboard runs `sudo -n systemctl start/stop/restart <unit>` for service
+# control (POST /api/control, with an allowlist + token + cooldown). sudo is
+# setuid, so NoNewPrivileges=true would block it and break the control buttons —
+# must stay false.
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
