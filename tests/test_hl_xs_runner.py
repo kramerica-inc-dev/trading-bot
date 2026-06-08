@@ -11,6 +11,7 @@ import tempfile
 import types
 import unittest
 import unittest.mock
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -408,8 +409,9 @@ class TestRunSafetyOnce(unittest.TestCase):
                      started_ts="x", dry_run=not live)
         stub.load_state = lambda: XSState.from_json(json.loads(json.dumps(s0.to_json()))) \
             if stub.state_path.exists() else s0
-        # bind the real methods under test
-        for name in ("run_safety_once", "_read_equity", "_apply_circuit_breaker",
+        # bind the real methods under test (incl. the single-instance lock wrapper)
+        for name in ("run_safety_once", "_run_safety_once", "_cycle_lock",
+                     "_read_equity", "_apply_circuit_breaker",
                      "reconcile", "save_state", "write_health", "log"):
             setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
         # tripwire: rebalance/order paths must NOT be touched by the safety cycle
@@ -767,6 +769,128 @@ class TestEquityJumpGuard(unittest.TestCase):
         dd, sc = stub._read_equity(s, {})
         self.assertIsNone(sc)
         self.assertEqual(s.equity, 5000.0)
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestCycleLock(unittest.TestCase):
+    """C1: the single-instance lock — a held lock makes the wrapper skip; a real
+    flock is exclusive across holders of the same instance dir."""
+
+    def test_run_once_skips_when_locked(self):
+        stub = types.SimpleNamespace()
+        stub._cycle_lock = lambda: _yield(False)
+        stub._run_once = lambda: {"action": "ran"}
+        r = R.HLXSRunner.run_once(stub)
+        self.assertIn("another cycle", r["reason"])
+
+    def test_run_once_runs_when_unlocked(self):
+        stub = types.SimpleNamespace()
+        stub._cycle_lock = lambda: _yield(True)
+        stub._run_once = lambda: {"action": "ran"}
+        self.assertEqual(R.HLXSRunner.run_once(stub)["action"], "ran")
+
+    def test_safety_skips_when_locked(self):
+        stub = types.SimpleNamespace()
+        stub._cycle_lock = lambda: _yield(False)
+        stub._run_safety_once = lambda: {"action": "ran"}
+        r = R.HLXSRunner.run_safety_once(stub)
+        self.assertIn("another cycle", r["reason"])
+
+    def test_real_flock_is_exclusive_per_dir(self):
+        d = Path(tempfile.mkdtemp())
+        a = types.SimpleNamespace(dir=d); b = types.SimpleNamespace(dir=d)
+        a._cycle_lock = types.MethodType(R.HLXSRunner._cycle_lock, a)
+        b._cycle_lock = types.MethodType(R.HLXSRunner._cycle_lock, b)
+        with a._cycle_lock() as la:
+            self.assertTrue(la)
+            with b._cycle_lock() as lb:
+                self.assertFalse(lb)            # contended -> not acquired
+        with b._cycle_lock() as lb2:            # released -> now free
+            self.assertTrue(lb2)
+
+
+@contextmanager
+def _yield(v):
+    yield v
+
+
+class _FakeLiveAdapter:
+    """Minimal live-venue fake: fills orders into a book, optionally partial on the
+    FIRST order per coin, and records every order (with its cloid)."""
+    MIN_ORDER_USD = 10.0
+
+    def __init__(self, first_fill=None):
+        self.book = {}
+        self.orders = []
+        self._mid = 100.0
+        self._first_fill = dict(first_fill or {})
+
+    def make_cloid(self, seed):
+        return seed                              # use the seed string as a stand-in cloid
+
+    def positions(self):
+        return {c: {"szi": n / self._mid, "entry_px": self._mid}
+                for c, n in self.book.items() if abs(n) > 1e-9}
+
+    def all_mids(self):
+        return {c: self._mid for c in "ABCDEF"}
+
+    def book_notional(self):
+        return dict(self.book)
+
+    def close(self, coin, cloid=None):
+        self.book.pop(coin, None)
+        self.orders.append({"act": "close", "coin": coin, "cloid": cloid})
+        return types.SimpleNamespace(ok=True, error=None, filled_sz=0.0)
+
+    def market_order_usd(self, coin, is_buy, usd, slippage=0.05, cloid=None):
+        frac = self._first_fill.pop(coin, 1.0)
+        self.book[coin] = self.book.get(coin, 0.0) + (usd if is_buy else -usd) * frac
+        self.orders.append({"act": "order", "coin": coin, "usd": round(usd, 2),
+                            "is_buy": is_buy, "cloid": cloid})
+        return types.SimpleNamespace(ok=True, error=None, filled_sz=usd * frac / self._mid)
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestExecuteLiveCloidPartialFill(unittest.TestCase):
+    """C1: _execute_live tags orders with deterministic cloids and the retry tops
+    up only the REMAINING shortfall of a partially-filled leg (no overshoot)."""
+
+    def _stub(self, ad):
+        stub = types.SimpleNamespace(cfg=R.HLXSConfig(m=1, slippage=0.05,
+                                     resize_threshold=0.10, instance_name="t"),
+                                     mode="MAINNET_LIVE", adapter=ad)
+        stub._verify_book = types.MethodType(R.HLXSRunner._verify_book, stub)
+        stub._resize_order = R.HLXSRunner._resize_order
+        stub.flatten_all = types.MethodType(R.HLXSRunner.flatten_all, stub)
+        return stub
+
+    def test_retry_sends_remaining_not_full(self):
+        ad = _FakeLiveAdapter(first_fill={"A": 0.3})     # A's first open fills 30%
+        stub = self._stub(ad)
+        res = R.HLXSRunner._execute_live(stub, {"A": 1000.0, "B": -1000.0},
+                                         datetime(2026, 6, 8, tzinfo=timezone.utc))
+        a_orders = [o for o in ad.orders if o["act"] == "order" and o["coin"] == "A"]
+        self.assertEqual(round(a_orders[0]["usd"]), 1000)   # initial open (full target)
+        self.assertEqual(round(a_orders[1]["usd"]), 700)    # retry = remaining 1000-300
+        self.assertTrue(res["complete"])
+
+    def test_orders_carry_distinct_cloids(self):
+        ad = _FakeLiveAdapter(first_fill={"A": 0.3})
+        stub = self._stub(ad)
+        R.HLXSRunner._execute_live(stub, {"A": 1000.0, "B": -1000.0},
+                                   datetime(2026, 6, 8, tzinfo=timezone.utc))
+        a_orders = [o for o in ad.orders if o["act"] == "order" and o["coin"] == "A"]
+        self.assertTrue(all(o["cloid"] for o in a_orders))   # every order tagged
+        self.assertNotEqual(a_orders[0]["cloid"], a_orders[1]["cloid"])  # open != retry
+
+    def test_clean_full_fill_no_retry(self):
+        ad = _FakeLiveAdapter()                  # everything fills fully
+        stub = self._stub(ad)
+        res = R.HLXSRunner._execute_live(stub, {"A": 1000.0, "B": -1000.0},
+                                         datetime(2026, 6, 8, tzinfo=timezone.utc))
+        self.assertTrue(res["complete"])
+        self.assertFalse([o for o in ad.orders if "retry" in str(o.get("cloid"))])
 
 
 if __name__ == "__main__":

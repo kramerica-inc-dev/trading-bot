@@ -119,13 +119,23 @@ class TestWatchdogFlattenOptIn(unittest.TestCase):
         wd = W.Watchdog("mainnet", stale_after_sec=900, min_equity_usd=40,
                         flatten_on_stale=flatten, state_root=root)
         closes = []
+        remaining = dict(positions)
+        def _close(coin):
+            closes.append(coin)
+            remaining.pop(coin, None)                  # a real close removes the position
+            return types.SimpleNamespace(ok=True, error=None)
         fake_adapter = types.SimpleNamespace(
-            positions=lambda: positions,
-            close=lambda coin: (closes.append(coin) or
-                                types.SimpleNamespace(ok=True, error=None)))
+            positions=lambda: dict(remaining), close=_close)
         wd._make_adapter = lambda: fake_adapter
         wd._closed = closes
         return wd
+
+    def test_flatten_verifies_book_is_flat(self):
+        old = datetime.now(timezone.utc) - timedelta(seconds=2000)
+        wd = self._wd({"ts": _iso(old), "equity": 50.0},
+                      positions={"BTC": {"szi": 0.01}, "ETH": {"szi": -0.1}})
+        r = wd.check_once()
+        self.assertTrue(r["flatten"]["verified_flat"])      # confirmed flat after close
 
     def test_flatten_when_stale_and_positions(self):
         old = datetime.now(timezone.utc) - timedelta(seconds=2000)

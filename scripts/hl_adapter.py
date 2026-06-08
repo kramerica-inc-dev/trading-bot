@@ -31,11 +31,14 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import hashlib
+
 import eth_account
 import numpy as np
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
+from hyperliquid.utils.types import Cloid
 
 MODE_TESTNET = "TESTNET"
 MODE_MAINNET_DRY = "MAINNET_DRY"
@@ -268,14 +271,32 @@ class HLAdapter:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    @staticmethod
+    def make_cloid(seed: str) -> Cloid:
+        """Deterministic 128-bit client order id from a seed string, so a re-send of
+        the SAME intended leg carries the SAME id — a venue-level idempotency tag
+        (P0 #2). Distinct seeds (per cycle/coin/action) give distinct ids."""
+        return Cloid.from_str("0x" + hashlib.sha256(seed.encode()).hexdigest()[:32])
+
+    def order_status_by_cloid(self, cloid: Cloid) -> Optional[dict]:
+        """Query an order's status by client order id (idempotency check before a
+        re-send). None on read failure or no wallet."""
+        if not self.address:
+            return None
+        try:
+            return self.info.query_order_by_cloid(self.address, cloid)
+        except Exception:
+            return None
+
     # ----------------------------------------------------------------- orders
     MIN_ORDER_USD = 10.0   # Hyperliquid minimum order value
 
     def market_order_usd(self, coin: str, is_buy: bool, usd_notional: float, *,
-                         slippage: float = 0.05) -> HLOrderResult:
+                         slippage: float = 0.05, cloid: Optional[Cloid] = None) -> HLOrderResult:
         """Marketable IOC sized by USD notional (mid -> sz, rounded to szDecimals).
         Enforces HL's $10 min and rejects if rounding moved the notional far, so a
-        leg is never silently mis-sized or dropped to 0. Never raises."""
+        leg is never silently mis-sized or dropped to 0. Never raises. An optional
+        cloid tags the order for idempotency."""
         self._assert_can_trade()
         if usd_notional < self.MIN_ORDER_USD:
             return HLOrderResult(ok=False, raw={},
@@ -291,15 +312,16 @@ class HLAdapter:
             return HLOrderResult(ok=False, raw={},
                                  error=f"rounded notional ${rounded:.2f} off-target/below-min ({coin})")
         try:
-            raw = self.exchange.market_open(coin, is_buy, sz, None, slippage)
+            raw = self.exchange.market_open(coin, is_buy, sz, None, slippage, cloid)
         except Exception as e:
             return HLOrderResult(ok=False, raw={}, error=f"order exception: {e}")
         return self._parse_order(raw)
 
-    def close(self, coin: str, *, slippage: float = 0.05) -> HLOrderResult:
+    def close(self, coin: str, *, slippage: float = 0.05,
+              cloid: Optional[Cloid] = None) -> HLOrderResult:
         self._assert_can_trade()
         try:
-            raw = self.exchange.market_close(coin, None, None, slippage)
+            raw = self.exchange.market_close(coin, None, None, slippage, cloid)
         except Exception as e:
             return HLOrderResult(ok=False, raw={}, error=f"close exception: {e}")
         if raw is None:                          # SDK returns None when nothing to close

@@ -163,8 +163,26 @@ class Watchdog:
                             "err": getattr(r, "error", None)})
             except Exception as e:
                 out.append({"coin": coin, "ok": False, "err": str(e)})
-        self.emit({"kind": "flatten", "reason": "stale + positions present", "closed": out})
-        return {"acted": True, "closed": out}
+        # Verify flat; re-close any straggler once, so we never log a benign
+        # "flatten" while real positions remain (mirrors HLXSRunner.flatten_all).
+        verified = False
+        try:
+            remaining = list(adapter.positions().keys())
+            for coin in remaining:
+                try:
+                    r = adapter.close(coin)
+                    out.append({"coin": coin, "retry": True, "ok": getattr(r, "ok", False),
+                                "err": getattr(r, "error", None)})
+                except Exception as e:
+                    out.append({"coin": coin, "retry": True, "ok": False, "err": str(e)})
+            if remaining:
+                remaining = list(adapter.positions().keys())
+            verified = not remaining
+        except Exception as e:
+            out.append({"verify_err": str(e)})
+        self.emit({"kind": "flatten", "reason": "stale + positions present",
+                   "closed": out, "verified_flat": verified})
+        return {"acted": True, "closed": out, "verified_flat": verified}
 
     def check_once(self) -> dict:
         health = self.read_health()

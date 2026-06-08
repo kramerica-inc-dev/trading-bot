@@ -13,9 +13,14 @@ Environment=PYTHONUNBUFFERED=1
 # needed for the opt-in --flatten-on-stale path. Alert-only (the default) needs
 # no credentials — it just reads health.json and appends to watchdog.events.jsonl.
 EnvironmentFile=-/etc/trading-bot/hl-watchdog-%i.env
-# Default is ALERT-ONLY (no --flatten-on-stale). Tune --min-equity-usd to the
-# real-money floor for this instance. Add --flatten-on-stale only after review.
-ExecStart=/usr/bin/python3 -m scripts.hl_watchdog --instance %i --stale-after-sec 900 --min-equity-usd 40
+# Inherit the runner's HL key (+ HL_CONFIRM_LIVE) so --flatten-on-stale can place
+# the reduce-only flatten. Optional (-) — alert-only still works without it.
+EnvironmentFile=-/etc/trading-bot/hl-xsectional-%i.env
+# --flatten-on-stale (P0 #4): the venue-independent backstop. It acts ONLY when
+# health is >900s stale (runner dead/wedged) AND positions actually exist — never
+# during normal operation (the runner writes health every safety cycle). Tune
+# --min-equity-usd to the real-money floor for this instance.
+ExecStart=/usr/bin/python3 -m scripts.hl_watchdog --instance %i --stale-after-sec 900 --min-equity-usd 40 --flatten-on-stale
 
 # Tiny oneshot (reads health.json, optional flatten). Hard cap only.
 MemoryMax=128M

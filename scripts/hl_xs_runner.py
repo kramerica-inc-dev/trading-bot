@@ -32,6 +32,7 @@ import math
 import os
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,8 +74,10 @@ class HLXSConfig:
     catastrophe_drawdown_pct: float = 0.12
     catastrophe_intracycle_pct: float = 0.08
     # fast safety cadence: how often run_safety_once() checks equity/CB/reconcile
-    # between the (slow) rebalances — so a live book isn't only seen hourly.
-    safety_interval_sec: int = 300
+    # between the (slow) rebalances — so a live book isn't only seen hourly. 180s
+    # tightens the window in which a fast move is caught (P0 #5); the cost is a
+    # cheap account read, not a rebalance.
+    safety_interval_sec: int = 180
     # --- P0 safety caps (live) ---
     # Pin per-coin cross leverage so a position can't inherit HL's per-coin MAX
     # (e.g. 40x BTC). The neutral basket only needs ~2x; 5x leaves headroom while
@@ -322,6 +325,12 @@ class HLXSRunner:
     # -- execution: LIVE (testnet / mainnet-live) --------------------------
     def _execute_live(self, targets: Dict[str, float], now: datetime) -> dict:
         orders = []
+        cid = now.isoformat()                        # stable cycle id → deterministic cloids
+        inst = self.cfg.instance_name
+
+        def cl(coin, action):                        # idempotency tag per cycle/coin/action
+            return self.adapter.make_cloid(f"{inst}|{cid}|{coin}|{action}")
+
         try:
             cur = self.adapter.positions()           # single snapshot
         except Exception as e:
@@ -332,7 +341,7 @@ class HLXSRunner:
         for coin, p in cur.items():
             tgt = targets.get(coin, 0.0)
             if tgt == 0.0 or int(np.sign(tgt)) != (1 if p["szi"] > 0 else -1):
-                r = self.adapter.close(coin)
+                r = self.adapter.close(coin, cloid=cl(coin, "close"))
                 orders.append({"act": "close", "coin": coin, "ok": r.ok, "err": r.error})
         # 2. establish target legs not held; RESIZE legs held on the correct side
         #    toward target notional (correct drift instead of silently skipping).
@@ -351,24 +360,35 @@ class HLXSRunner:
                 if ro is None:
                     continue                         # drift within tolerance — leave it
                 is_buy, usd = ro
-                r = self.adapter.market_order_usd(coin, is_buy, usd, slippage=self.cfg.slippage)
+                r = self.adapter.market_order_usd(coin, is_buy, usd, slippage=self.cfg.slippage,
+                                                  cloid=cl(coin, "resize"))
                 orders.append({"act": "resize", "coin": coin, "side": int(np.sign(tgt)),
                                "delta": round(tgt - cur_notional, 2), "ok": r.ok, "err": r.error})
                 continue
-            r = self.adapter.market_order_usd(coin, tgt > 0, abs(tgt), slippage=self.cfg.slippage)
+            r = self.adapter.market_order_usd(coin, tgt > 0, abs(tgt), slippage=self.cfg.slippage,
+                                              cloid=cl(coin, "open"))
             orders.append({"act": "open", "coin": coin, "side": int(np.sign(tgt)),
                            "ok": r.ok, "filled": r.filled_sz, "err": r.error})
-        # 3. verify the realized book; bounded-retry missing legs; else FLATTEN
-        #    (never leave a one-legged / non-neutral book).
+        # 3. verify the realized book; bounded-retry only the REMAINING shortfall of
+        #    each missing leg (partial-fill-aware → a re-send can't overshoot); else
+        #    FLATTEN (never leave a one-legged / non-neutral book).
         try:
             ok, missing, detail = self._verify_book(targets)
-            for _ in range(2):
-                if ok:
-                    break
-                for coin, tgt in missing.items():
-                    r = self.adapter.market_order_usd(coin, tgt > 0, abs(tgt),
-                                                      slippage=self.cfg.slippage)
-                    orders.append({"act": "retry", "coin": coin, "ok": r.ok, "err": r.error})
+            attempt = 0
+            while not ok and attempt < 2:
+                attempt += 1
+                book = self.adapter.book_notional()
+                for coin in list(missing):
+                    tgt = targets[coin]
+                    curn = book.get(coin, 0.0)
+                    remaining = (tgt - curn) if int(np.sign(curn)) == int(np.sign(tgt)) else tgt
+                    if abs(remaining) < self.adapter.MIN_ORDER_USD:
+                        continue
+                    r = self.adapter.market_order_usd(coin, remaining > 0, abs(remaining),
+                                                      slippage=self.cfg.slippage,
+                                                      cloid=cl(coin, f"retry{attempt}"))
+                    orders.append({"act": "retry", "coin": coin, "remaining": round(remaining, 2),
+                                   "ok": r.ok, "err": r.error})
                 ok, missing, detail = self._verify_book(targets)
         except Exception as e:
             ok, detail = False, f"verify error: {e}"
@@ -692,8 +712,52 @@ class HLXSRunner:
         s.last_settled_equity = s.equity              # record the accepted settled equity
         return None
 
+    # -- single-instance lock ----------------------------------------------
+    @contextmanager
+    def _cycle_lock(self):
+        """Exclusive per-cycle file lock (flock) so a manual run (e.g.
+        --force-rebalance) can't interleave order placement with the daemon loop
+        (P0 #2). Yields True if acquired, False if another process holds it.
+        Best-effort: a platform without fcntl simply yields True."""
+        f = None
+        acquired = False
+        try:
+            import fcntl
+            f = open(self.dir / "cycle.lock", "w")
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except (BlockingIOError, OSError):
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
+                f = None
+        except Exception:
+            acquired = True            # fcntl unavailable — don't block the cycle
+        try:
+            yield acquired
+        finally:
+            if f is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    f.close()
+                except OSError:
+                    pass
+
     # -- fast safety cycle (no rebalance) ----------------------------------
     def run_safety_once(self) -> dict:
+        """Lock wrapper: a manual run can't interleave with the daemon (P0 #2)."""
+        with self._cycle_lock() as locked:
+            if not locked:
+                return {"action": "skip", "reason": "another cycle holds the lock"}
+            return self._run_safety_once()
+
+    def _run_safety_once(self) -> dict:
         """The fast cadence: equity-read → drawdown/catastrophe/terminal breaker
         → reconcile, WITHOUT rebalancing. Run every `safety_interval_sec` between
         the (slow) full rebalances so a live book is checked far more often than
@@ -762,6 +826,13 @@ class HLXSRunner:
 
     # -- one cycle ---------------------------------------------------------
     def run_once(self) -> dict:
+        """Lock wrapper: a manual run can't interleave with the daemon (P0 #2)."""
+        with self._cycle_lock() as locked:
+            if not locked:
+                return {"action": "skip", "reason": "another cycle holds the lock"}
+            return self._run_once()
+
+    def _run_once(self) -> dict:
         cfg = self.cfg
         s = self.load_state()
         now = _utcnow()
