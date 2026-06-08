@@ -42,7 +42,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from xs_runner import XSState, Position, compute_target_weights  # noqa: E402
+from xs_core import XSState, Position, compute_target_weights  # noqa: E402
 from hl_adapter import (  # noqa: E402
     HLAdapter, MODE_TESTNET, MODE_MAINNET_DRY, MODE_MAINNET_LIVE, _mask,
 )

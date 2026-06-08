@@ -24,11 +24,10 @@ Self-test (no funds needed — proves data + signing end-to-end on testnet):
 from __future__ import annotations
 
 import argparse
-import math
-import os
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import hashlib
@@ -40,22 +39,13 @@ from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from hyperliquid.utils.types import Cloid
 
-MODE_TESTNET = "TESTNET"
-MODE_MAINNET_DRY = "MAINNET_DRY"
-MODE_MAINNET_LIVE = "MAINNET_LIVE"
-
-
-def resolve_hl_mode(network: str, allow_live: bool) -> str:
-    """Strict mode gate. MAINNET_LIVE (real money) requires allow_live to be the
-    bool `True` (identity, not truthiness — so a stray 'false'/'0'/1 can never
-    enable it) AND an out-of-band confirmation env var HL_CONFIRM_LIVE=YES."""
-    if network == "testnet":
-        return MODE_TESTNET
-    if network == "mainnet":
-        if allow_live is True and os.environ.get("HL_CONFIRM_LIVE") == "YES":
-            return MODE_MAINNET_LIVE
-        return MODE_MAINNET_DRY
-    raise ValueError(f"network must be 'testnet' or 'mainnet', got {network!r}")
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+# Mode gate centralised in mode_gate (re-exported for back-compat callers/tests).
+from mode_gate import (  # noqa: E402,F401
+    MODE_TESTNET, MODE_MAINNET_DRY, MODE_MAINNET_LIVE, resolve_hl_mode,
+)
 
 
 def _mask(addr: Optional[str]) -> str:

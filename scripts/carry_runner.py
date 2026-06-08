@@ -66,6 +66,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from okx_adapter import OkxAdapter  # noqa: E402
+from mode_gate import MODE_DRY, MODE_P2, MODE_P3, resolve_demo_mode  # noqa: E402,F401
 from carry_position import (  # noqa: E402
     CarryPosition, DriftReport, annualize_funding,
     delta_neutral_drift, funding_accrual_step,
@@ -128,29 +129,20 @@ def load_config(path: Optional[str]) -> CarryRunnerConfig:
 
 # =========================  Mode resolution  =========================
 
-# Mode codes used everywhere (logs, state, tests).
-MODE_DRY = "DRY_RUN"
-MODE_P2 = "P2_DEMO"
-MODE_P3 = "P3_LIVE"
+# Mode codes (MODE_DRY/P2/P3) + the shared DRY/P2/P3 gate now live in mode_gate
+# and are imported above; re-exported here for back-compat callers/tests.
 
 
 def resolve_mode(cfg: CarryRunnerConfig) -> str:
     """Resolve the runner's execution mode from the config flags.
 
-    Pure function — no environment, no I/O. Raises `RuntimeError` for
-    any unsupported / unsafe combination so the runner fails closed.
+    Wraps the shared `mode_gate.resolve_demo_mode` (DRY/P2/P3) and layers carry's
+    extra P3 sizing guard on top. Pure — no environment, no I/O; fails closed.
     """
-    if cfg.dry_run:
-        return MODE_DRY
-    if cfg.okx_demo:
-        return MODE_P2
-    # dry_run=false AND okx_demo=false → live attempt
-    if not cfg.allow_live:
-        raise RuntimeError(
-            "Refusing to run live: dry_run=false + okx_demo=false requires "
-            "allow_live=true in config (P3 gate). Set dry_run=true (DRY_RUN), "
-            "okx_demo=true (P2_DEMO), or explicitly allow_live=true (P3_LIVE)."
-        )
+    mode = resolve_demo_mode(dry_run=cfg.dry_run, okx_demo=cfg.okx_demo,
+                             allow_live=cfg.allow_live)
+    if mode != MODE_P3:
+        return mode
     # P3 sizing guard. Computed against per-leg notional, which equals
     # target_dn_notional_fraction × initial_notional_usd.
     per_leg = cfg.initial_notional_usd * cfg.target_dn_notional_fraction

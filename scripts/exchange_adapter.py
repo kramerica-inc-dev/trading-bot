@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
-"""
-Exchange Adapter - Abstract Interface
-Allows switching between exchanges via config
+"""Exchange adapter — abstract REST contract for the OKX (paper) execution lane.
+
+This ABC + the `create_exchange_adapter` factory define the REST request/response
+shape used by the OKX paper/carry lanes (and the retired BloFin/Coinbase venues).
+
+NOTE — the LIVE venue does NOT use this abstraction, by design. Hyperliquid trades
+through `hl_adapter.HLAdapter`, a thin wrapper over the official, audited
+`hyperliquid-python-sdk` (EIP-712 signing) with a deliberately smaller, different
+surface (`account_value` / `positions` / `market_order_usd` / `daily_closes`). It
+is NOT a defect that `HLAdapter` is not an `ExchangeAdapter` subclass: the SDK
+contract and this REST contract are genuinely different shapes, so forcing one onto
+the other would add ceremony without value. The live path routes around this
+factory intentionally — don't try to "unify" them (architecture audit P2 #13).
 """
 
 from abc import ABC, abstractmethod
@@ -26,7 +36,7 @@ class ExchangeAdapter(ABC):
                 "data": [
                     {
                         "currency": "USDT",
-                        "available": "115.56",
+                        "available": "1000.00",   # illustrative only
                         "frozen": "0.00"
                     }
                 ]
