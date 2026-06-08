@@ -19,7 +19,6 @@ from okx_adapter import (  # noqa: E402
     to_okx_symbol,
 )
 from okx_api import OkxAPI  # noqa: E402
-from exchange_adapter import create_exchange_adapter  # noqa: E402
 
 
 class TestSymbolNormalization(unittest.TestCase):
@@ -169,21 +168,6 @@ class TestAdapterPlaceOrderTranslation(unittest.TestCase):
             payload = mock.call_args.args[0]
             self.assertEqual([p["instId"] for p in payload],
                              ["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
-
-
-class TestFactoryDispatch(unittest.TestCase):
-
-    def test_factory_returns_okx_adapter(self):
-        a = create_exchange_adapter("okx", {})
-        self.assertIsInstance(a, OkxAdapter)
-
-    def test_factory_default_remains_blofin(self):
-        a = create_exchange_adapter("blofin", {})
-        self.assertEqual(type(a).__name__, "BlofinAdapter")
-
-    def test_factory_rejects_unknown(self):
-        with self.assertRaises(ValueError):
-            create_exchange_adapter("kraken", {})
 
 
 @unittest.skipUnless(

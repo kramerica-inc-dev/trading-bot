@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Exchange adapter — abstract REST contract for the OKX (paper) execution lane.
 
-This ABC + the `create_exchange_adapter` factory define the REST request/response
-shape used by the OKX paper/carry lanes (and the retired BloFin/Coinbase venues).
+This ABC is the REST request/response contract that `OkxAdapter` implements for the
+OKX paper/carry lanes. The old `create_exchange_adapter` factory (and the retired
+BloFin/Coinbase branches it dispatched to) were removed in the P2 research split —
+the only callers were the deleted single-asset bot and dead async runtime; live
+code constructs `OkxAdapter` directly.
 
 NOTE — the LIVE venue does NOT use this abstraction, by design. Hyperliquid trades
 through `hl_adapter.HLAdapter`, a thin wrapper over the official, audited
@@ -10,8 +13,7 @@ through `hl_adapter.HLAdapter`, a thin wrapper over the official, audited
 surface (`account_value` / `positions` / `market_order_usd` / `daily_closes`). It
 is NOT a defect that `HLAdapter` is not an `ExchangeAdapter` subclass: the SDK
 contract and this REST contract are genuinely different shapes, so forcing one onto
-the other would add ceremony without value. The live path routes around this
-factory intentionally — don't try to "unify" them (architecture audit P2 #13).
+the other would add ceremony without value (architecture audit P2 #13).
 """
 
 from abc import ABC, abstractmethod
@@ -182,32 +184,3 @@ class ExchangeAdapter(ABC):
             "fills_history": cls.get_fills_history is not base.get_fills_history,
             "positions_history": cls.get_positions_history is not base.get_positions_history,
         }
-
-
-def create_exchange_adapter(exchange_name: str, config: Dict) -> ExchangeAdapter:
-    """Factory function to create the appropriate exchange adapter
-
-    Args:
-        exchange_name: "blofin", "okx", or "coinbase"
-        config: Exchange-specific configuration
-
-    Returns:
-        ExchangeAdapter instance
-    """
-    exchange_name = exchange_name.lower()
-
-    if exchange_name == "blofin":
-        from blofin_adapter import BlofinAdapter
-        return BlofinAdapter(config)
-
-    elif exchange_name == "okx":
-        from okx_adapter import OkxAdapter
-        return OkxAdapter(config)
-
-    elif exchange_name == "coinbase":
-        from coinbase_adapter import CoinbaseAdapter
-        return CoinbaseAdapter(config)
-
-    else:
-        raise ValueError(f"Unsupported exchange: {exchange_name}. "
-                        f"Supported: blofin, okx, coinbase")
