@@ -12,6 +12,10 @@
   "resize_threshold": 0.10,
   "min_assets": 6,
   "halt_drawdown_pct": 0.25,
+  "verify_leverage": true,
+  "soft_delever_dd_pct": 0.06,
+  "soft_delever_factor": 0.5,
+  "net_imbalance_tolerance": 0.15,
   "network": "mainnet",
   "allow_live": false
 }

@@ -235,6 +235,50 @@ class HLAdapter:
             out[coin] = p["szi"] * mk
         return out
 
+    def get_leverage(self, coin: str) -> Optional[dict]:
+        """The venue-side leverage setting for `coin` ({type, value}) via the
+        activeAssetData info endpoint — the read-back for verifying the
+        set_leverage pin actually took. None on read failure / no address."""
+        if not self.address:
+            return None
+        try:
+            d = self.info.post("/info", {"type": "activeAssetData",
+                                         "user": self.address, "coin": coin})
+            lev = (d or {}).get("leverage") or {}
+            if "value" not in lev:
+                return None
+            return {"type": lev.get("type"), "value": int(lev["value"])}
+        except Exception:
+            return None
+
+    def margin_state(self) -> Optional[dict]:
+        """Perp margin snapshot for risk observability: {account_value,
+        total_margin_used, total_ntl_pos, withdrawable, margin_ratio}.
+        margin_ratio = totalMarginUsed / TOTAL equity (perp accountValue +
+        free spot USDC) — in a UNIFIED account the perp accountValue is mostly
+        just the margin earmark itself (the rest of the collateral sits free
+        on the spot side), so a perp-only ratio would read ~1.0 on a perfectly
+        healthy book. Falls back to the perp-only (conservative, overstated)
+        ratio when the spot read fails. None on a read failure / no address —
+        callers treat that as 'unknown', never as safe."""
+        if not self.address:
+            return None
+        try:
+            st = self.info.user_state(self.address)
+            ms = st.get("marginSummary") or {}
+            if "accountValue" not in ms:
+                return None
+            av = float(ms["accountValue"])
+            used = float(ms.get("totalMarginUsed") or 0.0)
+            equity = av + (self._spot_usdc_free() or 0.0)
+            return {"account_value": equity,
+                    "total_margin_used": used,
+                    "total_ntl_pos": float(ms.get("totalNtlPos") or 0.0),
+                    "withdrawable": float(st.get("withdrawable") or 0.0),
+                    "margin_ratio": (used / equity) if equity > 0 else 0.0}
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------ guard
     def _assert_can_trade(self) -> None:
         if self.exchange is None:

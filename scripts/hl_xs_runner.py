@@ -100,6 +100,21 @@ class HLXSConfig:
     # 0 disables. This is the scale-free alternative to a static max_gross_usd.
     max_equity_jump_factor: float = 3.0
     equity_jump_confirm_cycles: int = 3
+    # --- Track 0 risk infra (leverage-ladder prerequisites) ---
+    # Read-back verification of the per-coin leverage pin: until the pin is
+    # CONFIRMED on the venue (activeAssetData read-back), any gross_exposure
+    # above 1.0 sizes as 1.0 — leverage headroom is only ever used on a proven
+    # pin. Verification retries each full cycle until it passes.
+    verify_leverage: bool = True
+    # Soft de-lever band BELOW the breakers (never instead of them): at
+    # drawdown-from-peak >= soft_delever_dd_pct, new targets are scaled by
+    # soft_delever_factor so the book glides down before the catastrophe line.
+    # None disables. Breaker thresholds themselves are never widened.
+    soft_delever_dd_pct: Optional[float] = None
+    soft_delever_factor: float = 0.5
+    # Live-book neutrality tolerance |L-S|/gross for reconcile/_verify_book
+    # (was hard-coded 0.15).
+    net_imbalance_tolerance: float = 0.15
     network: str = "mainnet"            # 'mainnet' (DRY default) or 'testnet'
     allow_live: bool = False            # mainnet real-money gate
 
@@ -112,6 +127,14 @@ def load_config(path: str) -> HLXSConfig:
         raise ValueError(f"network must be 'testnet' or 'mainnet', got {cfg.network!r}")
     if not isinstance(cfg.allow_live, bool):       # reject 'false'/0/1 strings — never silently go live
         raise ValueError(f"allow_live must be a JSON boolean, got {cfg.allow_live!r}")
+    if not (0.0 <= cfg.soft_delever_factor <= 1.0):
+        raise ValueError(f"soft_delever_factor must be in [0,1], got {cfg.soft_delever_factor!r}")
+    if cfg.soft_delever_dd_pct is not None and not (
+            0.0 < cfg.soft_delever_dd_pct < cfg.catastrophe_drawdown_pct):
+        # the soft band must sit strictly BELOW the terminal catastrophe line
+        raise ValueError(
+            f"soft_delever_dd_pct must be in (0, {cfg.catastrophe_drawdown_pct}), "
+            f"got {cfg.soft_delever_dd_pct!r}")
     return cfg
 
 
@@ -132,6 +155,8 @@ class HLXSRunner:
                              and self.adapter.exchange is not None)
         self._force_rebalance = False        # set via --force-rebalance for a one-shot
         self._leverage_set = False           # per-process idempotent leverage pin
+        self._leverage_verified = False      # read-back-confirmed pin (gates gross>1.0)
+        self._delever_active = False         # soft de-lever engaged on current targets
         self.dir = STATE_ROOT / cfg.instance_name
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.dir / "state.json"
@@ -183,15 +208,37 @@ class HLXSRunner:
     def _ensure_leverage(self, s: XSState) -> None:
         """Pin per-coin cross leverage once per process (idempotent), so a live
         position can't inherit HL's per-coin MAX leverage (P0 #1). Best-effort;
-        logs failures but never blocks a cycle. No-op in sim/DRY."""
-        if self._leverage_set or not self.live_trading or self.cfg.max_leverage <= 0:
+        logs failures but never blocks a cycle. No-op in sim/DRY.
+
+        With verify_leverage, the pin is READ BACK from the venue and
+        _leverage_verified gates any gross_exposure above 1.0 (_targets clamps
+        until confirmed). Verification retries each full cycle until it passes;
+        the pin itself is still only sent once per process."""
+        if not self.live_trading or self.cfg.max_leverage <= 0:
             return
-        results = {c: self.adapter.set_leverage(c, self.cfg.max_leverage).get("ok", False)
-                   for c in self.cfg.universe}
-        self._leverage_set = True
-        self.log({"action": "set_leverage", "leverage": self.cfg.max_leverage,
-                  "ok_count": sum(1 for v in results.values() if v),
-                  "failed": [c for c, ok in results.items() if not ok]})
+        if not self._leverage_set:
+            results = {c: self.adapter.set_leverage(c, self.cfg.max_leverage).get("ok", False)
+                       for c in self.cfg.universe}
+            self._leverage_set = True
+            self.log({"action": "set_leverage", "leverage": self.cfg.max_leverage,
+                      "ok_count": sum(1 for v in results.values() if v),
+                      "failed": [c for c, ok in results.items() if not ok]})
+        if not self.cfg.verify_leverage or getattr(self, "_leverage_verified", False):
+            return
+        reader = getattr(self.adapter, "get_leverage", None)
+        if reader is None:                   # adapter can't read back (test stubs)
+            return
+        bad = []
+        for c in self.cfg.universe:
+            lv = reader(c)
+            # The pin is cross-margin; an 'isolated' read-back means the venue
+            # state diverged from what set_leverage requested → unverified.
+            if (not lv or int(lv.get("value", 0)) > self.cfg.max_leverage
+                    or lv.get("type") != "cross"):
+                bad.append(c)
+        self._leverage_verified = not bad
+        self.log({"action": "verify_leverage", "ok": self._leverage_verified,
+                  "leverage": self.cfg.max_leverage, "mismatched": bad})
 
     # -- sim funding (paper honesty) ---------------------------------------
     def _accrue_sim_funding(self, s: XSState, now: datetime) -> float:
@@ -225,10 +272,29 @@ class HLXSRunner:
         return total
 
     # -- targets -----------------------------------------------------------
-    def _targets(self, closes, equity) -> Dict[str, float]:
+    def _targets(self, closes, equity, dd: float = 0.0) -> Dict[str, float]:
         w = compute_target_weights(closes, self.cfg.lookback_days, self.cfg.m)
-        gross_book = equity * self.cfg.gross_exposure
+        ge = self.cfg.gross_exposure
+        # Leverage headroom only on a verified pin: while the per-coin pin is
+        # unconfirmed, gross_exposure > 1.0 sizes as 1.0 (never blocks a cycle).
+        if (ge > 1.0 and getattr(self, "live_trading", False)
+                and self.cfg.verify_leverage
+                and not getattr(self, "_leverage_verified", False)):
+            self.log({"action": "gross_clamped", "configured": ge, "used": 1.0,
+                      "reason": "leverage pin not verified"})
+            ge = 1.0
+        gross_book = equity * ge
         targets = {c: wt * gross_book for c, wt in w.items() if wt != 0.0}
+        # Soft de-lever BELOW the breakers: glide the book down in a drawdown
+        # before the catastrophe line. Never widens or replaces any breaker.
+        self._delever_active = False
+        sdd = self.cfg.soft_delever_dd_pct
+        if targets and sdd is not None and sdd > 0 and dd >= sdd:
+            f = min(max(self.cfg.soft_delever_factor, 0.0), 1.0)
+            targets = {c: v * f for c, v in targets.items()}
+            self._delever_active = True
+            self.log({"action": "soft_delever", "dd_pct": round(dd * 100, 2),
+                      "factor": f})
         return self._apply_exposure_caps(targets)
 
     def _apply_exposure_caps(self, targets: Dict[str, float]) -> Dict[str, float]:
@@ -267,7 +333,7 @@ class HLXSRunner:
         ln = sum(v for v in book.values() if v > 0)
         sn = -sum(v for v in book.values() if v < 0)
         g = ln + sn
-        neutral = (g <= 0) or (abs(ln - sn) / g <= 0.15)
+        neutral = (g <= 0) or (abs(ln - sn) / g <= self.cfg.net_imbalance_tolerance)
         ok = (not missing) and (not extra) and neutral
         return ok, missing, f"missing={list(missing)} extra={extra} L/S={ln:.0f}/{sn:.0f}"
 
@@ -452,7 +518,7 @@ class HLXSRunner:
             ln = sum(v for v in book.values() if v > 0)
             sn = -sum(v for v in book.values() if v < 0)
             g = ln + sn
-            if g > 0 and abs(ln - sn) / g > 0.15:
+            if g > 0 and abs(ln - sn) / g > self.cfg.net_imbalance_tolerance:
                 errs.append(f"venue not dollar-neutral: {ln:.0f}L/{sn:.0f}S")
             n_legs = len([c for c in book if abs(book[c]) > self.adapter.MIN_ORDER_USD])
             if n_legs > 2 * self.cfg.m:
@@ -461,7 +527,9 @@ class HLXSRunner:
             ln = sum(p.notional for p in s.positions.values() if p.side > 0)
             sn = sum(p.notional for p in s.positions.values() if p.side < 0)
             g = ln + sn
-            if g > 0 and abs(ln - sn) / g > 0.10:
+            # Same tolerance as the live path — a paper soak must reconcile
+            # exactly like the live book it rehearses for.
+            if g > 0 and abs(ln - sn) / g > self.cfg.net_imbalance_tolerance:
                 errs.append(f"sim not dollar-neutral: {ln:.0f}L/{sn:.0f}S")
         s.last_reconcile_ok = not errs
         return {"ok": not errs, "errors": errs}
@@ -494,7 +562,24 @@ class HLXSRunner:
              "last_rebalance_ts": s.last_rebalance_ts, "last_reconcile_ok": s.last_reconcile_ok,
              "config": {"lookback_days": self.cfg.lookback_days, "rebal_days": self.cfg.rebal_days,
                         "m": self.cfg.m, "universe": self.cfg.universe},
+             "gross_exposure": self.cfg.gross_exposure,
+             "leverage_verified": (getattr(self, "_leverage_verified", False)
+                                   if self.live_trading else None),
+             "delever_active": getattr(self, "_delever_active", False),
              **extra}
+        if self.live_trading:
+            # margin_read_ok makes a flaky margin endpoint VISIBLE in health
+            # (a silent gap would look like healthy-but-unreported margin).
+            margin_ok = False
+            try:
+                m = self.adapter.margin_state()
+                if m:
+                    h["margin_ratio"] = round(m["margin_ratio"], 4)
+                    h["total_margin_used"] = round(m["total_margin_used"], 2)
+                    margin_ok = True
+            except Exception:
+                pass
+            h["margin_read_ok"] = margin_ok
         tmp = self.health_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(h, indent=2))
         tmp.replace(self.health_path)
@@ -871,7 +956,7 @@ class HLXSRunner:
         result = {"action": "noop"}
         targets = None
         if self._should_rebalance(s, now):
-            targets = self._targets(closes, s.equity)
+            targets = self._targets(closes, s.equity, dd)
             if not targets:
                 result = {"action": "skip", "reason": "no target weights"}
                 s.skips_total += 1

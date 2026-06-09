@@ -50,7 +50,11 @@ rsync -avz --delete-excluded \
   "$HOST:$REMOTE_DIR/scripts/"
 
 ssh "$HOST" "mkdir -p $REMOTE_DIR/configs"
-rsync -avz configs/ "$HOST:$REMOTE_DIR/configs/"
+# NEVER ship the HL configs from here: the LXC's live hl-xsectional-mainnet.json
+# diverges from the repo on purpose (allow_live, gross_exposure, USD ceilings) —
+# overwriting it would silently de-live/re-size the real-money runner. The HL
+# lane deploys via deploy/deploy_hl.sh, which ships repo copies as *.repo.json.
+rsync -avz --exclude='hl-xsectional-*.json' configs/ "$HOST:$REMOTE_DIR/configs/"
 
 rsync -avz deploy/plan-e@.service "$HOST:/etc/systemd/system/plan-e@.service"
 

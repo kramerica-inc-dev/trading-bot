@@ -88,11 +88,12 @@ def evaluate(health: Optional[dict], health_path: Path, *, stale_after_sec: floa
 class Watchdog:
     def __init__(self, instance: str, *, stale_after_sec: float = 900.0,
                  min_equity_usd: Optional[float] = None, flatten_on_stale: bool = False,
-                 state_root: Path = STATE_ROOT):
+                 state_root: Path = STATE_ROOT, notify: bool = False):
         self.instance = instance
         self.stale_after_sec = stale_after_sec
         self.min_equity_usd = min_equity_usd
         self.flatten_on_stale = flatten_on_stale
+        self.notify = notify
         self.dir = state_root / instance
         self.health_path = self.dir / "health.json"
         self.events_path = self.dir / "watchdog.events.jsonl"
@@ -117,6 +118,18 @@ class Watchdog:
         except OSError:
             pass
         print(f"[hl_watchdog] {line}", file=sys.stderr)
+        if self.notify:
+            # Best-effort operator push (Telegram); the notifier itself never
+            # raises and no-ops without TELEGRAM_* env. Lazy import keeps the
+            # alert-only path dependency-free when --notify is off.
+            try:
+                if str(HERE) not in sys.path:
+                    sys.path.insert(0, str(HERE))
+                import notify as _tg
+                _tg.send(f"⚠️ hl_watchdog[{self.instance}] {event.get('kind')}: "
+                         f"{event.get('reason') or json.dumps(event)[:300]}")
+            except Exception:
+                pass
 
     def _make_adapter(self):
         """Construct the SAME HLAdapter the runner uses (same env key) — imported
@@ -209,9 +222,12 @@ def main() -> int:
                     help="alert if health equity falls below this floor")
     ap.add_argument("--flatten-on-stale", action="store_true",
                     help="opt-in: flatten via HLAdapter when stale AND positions exist")
+    ap.add_argument("--notify", action="store_true",
+                    help="push alerts via Telegram (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID env)")
     args = ap.parse_args()
     wd = Watchdog(args.instance, stale_after_sec=args.stale_after_sec,
-                  min_equity_usd=args.min_equity_usd, flatten_on_stale=args.flatten_on_stale)
+                  min_equity_usd=args.min_equity_usd, flatten_on_stale=args.flatten_on_stale,
+                  notify=args.notify)
     r = wd.check_once()
     print(json.dumps(r, indent=2))
     return 0
