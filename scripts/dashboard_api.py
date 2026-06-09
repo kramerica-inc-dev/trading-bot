@@ -1071,6 +1071,165 @@ def _hl_live_account(instance: str, override: Optional[str] = None) -> Dict[str,
     return snap
 
 
+_BTC_CANDLE_CACHE_TTL = 600  # 10 min
+
+
+def _fetch_btc_1h(start_ms: int, end_ms: int):
+    """BTC 1h closes from Hyperliquid's PUBLIC API, briefly cached. -> [(ms, close)]."""
+    key = f"btc1h:{start_ms // 3_600_000}:{end_ms // 3_600_000}"
+    now = time.time()
+    with _cache_lock:
+        if key in _cache and (now - _cache_ts.get(key, 0)) < _BTC_CANDLE_CACHE_TTL:
+            return _cache[key]
+    import urllib.request
+    req = urllib.request.Request(
+        "https://api.hyperliquid.xyz/info",
+        data=json.dumps({"type": "candleSnapshot", "req": {
+            "coin": "BTC", "interval": "1h", "startTime": start_ms, "endTime": end_ms}}).encode(),
+        headers={"Content-Type": "application/json"})
+    raw = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    out = sorted((int(c["t"]), float(c["c"])) for c in raw)
+    with _cache_lock:
+        _cache[key] = out
+        _cache_ts[key] = now
+    return out
+
+
+def _svg_two_lines(pts_a, pts_b, dep_frac=None, w=720, h=300):
+    """Minimal inline SVG of two evenly-spaced cum-% series. a=bot (blue), b=btc (orange)."""
+    n = len(pts_a)
+    if n < 2:
+        return "<div>insufficient data</div>"
+    ml, mr, mt, mb = 46, 12, 14, 8
+    iw, ih = w - ml - mr, h - mt - mb
+    ys = pts_a + pts_b
+    lo, hi = min(ys), max(ys)
+    if hi - lo < 1e-9:
+        hi, lo = hi + 1, lo - 1
+    pad = (hi - lo) * 0.08
+    lo -= pad; hi += pad
+    def X(i): return ml + iw * i / (n - 1)
+    def Y(v): return mt + ih * (hi - v) / (hi - lo)
+    def poly(pts, col):
+        d = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, v in enumerate(pts))
+        return f'<polyline fill="none" stroke="{col}" stroke-width="2" points="{d}"/>'
+    parts = [f'<svg viewBox="0 0 {w} {h}" width="100%" preserveAspectRatio="xMidYMid meet" '
+             f'font-family="system-ui,sans-serif" font-size="11">']
+    if lo < 0 < hi:
+        zy = Y(0)
+        parts.append(f'<line x1="{ml}" y1="{zy:.1f}" x2="{w-mr}" y2="{zy:.1f}" stroke="#888" stroke-width=".7"/>')
+    for v in sorted({lo, 0.0, hi}):
+        if lo <= v <= hi:
+            parts.append(f'<text x="4" y="{Y(v)+3:.1f}" fill="#999">{v:+.1f}%</text>')
+    if dep_frac is not None and 0 <= dep_frac <= 1:
+        dx = ml + iw * dep_frac
+        parts.append(f'<line x1="{dx:.1f}" y1="{mt}" x2="{dx:.1f}" y2="{mt+ih}" '
+                     f'stroke="#2ca02c" stroke-width="1" stroke-dasharray="4 3"/>')
+    parts.append(poly(pts_b, "#ff7f0e"))
+    parts.append(poly(pts_a, "#1f77b4"))
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _equity_vs_btc(instance: str) -> Dict[str, Any]:
+    """Deposit-adjusted live-equity TWR vs BTC buy&hold since live start, plus a
+    beta/dispersion decomposition. Returns a ready SVG + numbers so the tab is thin.
+    Never raises — returns {error} so the tab degrades softly."""
+    try:
+        if not CARRY_INSTANCE_NAME_RE.match(instance):
+            return {"error": "invalid instance"}
+        hist = HL_XSECTIONAL_STATE_DIR / instance / "equity_history.jsonl"
+        rows = []
+        for line in hist.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            eq = d.get("equity")
+            if eq is None or float(eq) >= 1000:   # skip MAINNET_DRY sim notional
+                continue
+            rows.append((datetime.fromisoformat(d["ts"]), float(eq)))
+        rows.sort()
+        if len(rows) < 5:
+            return {"error": "insufficient live equity history yet"}
+
+        twr = [1.0]; dep_i = None
+        for i in range(1, len(rows)):
+            pe, ce = rows[i-1][1], rows[i][1]
+            step = ce / pe - 1.0
+            if abs(step) > 0.15:                  # deposit/withdrawal — not performance
+                dep_i = i; step = 0.0
+            twr.append(twr[-1] * (1 + step))
+        t0, tN = rows[0][0], rows[-1][0]
+
+        btc = _fetch_btc_1h(int(t0.timestamp()*1000), int(tN.timestamp()*1000))
+        if not btc:
+            return {"error": "BTC fetch returned no data"}
+        b0 = btc[0][1]
+        import bisect
+        # Align both series to BTC's HOURLY grid so beta/corr aren't biased by the
+        # 3-min-bot vs 1h-stepped-BTC timescale mismatch (regress like-for-like).
+        native_ms = [int(t.timestamp() * 1000) for t, _ in rows]
+        def bot_twr_at(ms):
+            j = bisect.bisect_right(native_ms, ms) - 1
+            return twr[max(0, j)]
+        hours_ms = [c[0] for c in btc]
+        bot_cum = [(bot_twr_at(ms) - 1) * 100 for ms in hours_ms]
+        btc_cum = [(px / b0 - 1) * 100 for _, px in btc]
+        dep_h = bisect.bisect_left(hours_ms, native_ms[dep_i]) if dep_i is not None else None
+
+        def beta_of(bc, mc):
+            br = [bc[i]-bc[i-1] for i in range(1, len(bc))]
+            mr = [mc[i]-mc[i-1] for i in range(1, len(mc))]
+            n = len(br)
+            if n < 3:
+                return 0.0, 0.0
+            mb, mm = sum(br)/n, sum(mr)/n
+            cov = sum((br[i]-mb)*(mr[i]-mm) for i in range(n))/n
+            vm = sum((mr[i]-mm)**2 for i in range(n))/n
+            vb = sum((br[i]-mb)**2 for i in range(n))/n
+            return (cov/vm if vm else 0.0), (cov/((vb**.5)*(vm**.5)) if vb and vm else 0.0)
+
+        beta_full, corr_full = beta_of(bot_cum, btc_cum)
+        bot_ret = (twr[-1] - 1) * 100                 # exact final TWR
+        btc_ret = (btc[-1][1] / b0 - 1) * 100
+
+        pd = {}
+        if dep_h is not None and len(bot_cum) - dep_h > 4:
+            bcp = [v - bot_cum[dep_h] for v in bot_cum[dep_h:]]
+            mcp = [v - btc_cum[dep_h] for v in btc_cum[dep_h:]]
+            beta_pd, corr_pd = beta_of(bcp, mcp)
+            bot_pd, btc_pd = bcp[-1], mcp[-1]
+            pd = {"bot": round(bot_pd, 2), "btc": round(btc_pd, 2),
+                  "beta": round(beta_pd, 3), "corr": round(corr_pd, 3),
+                  "beta_comp": round(beta_pd * btc_pd, 2),
+                  "dispersion": round(bot_pd - beta_pd * btc_pd, 2)}
+
+        def ds(seq, k=240):
+            if len(seq) <= k:
+                return seq
+            step = len(seq) / k
+            return [seq[int(i*step)] for i in range(k)] + [seq[-1]]
+        svg = _svg_two_lines(ds(bot_cum), ds(btc_cum),
+                             (dep_h / (len(bot_cum)-1)) if dep_h is not None else None)
+
+        return {
+            "instance": instance,
+            "window_start": t0.isoformat(), "window_end": tN.isoformat(),
+            "days": round((tN - t0).total_seconds()/86400, 2), "points": len(rows),
+            "equity_start": round(rows[0][1], 2), "equity_now": round(rows[-1][1], 2),
+            "deposit": dep_i is not None,
+            "bot_ret": round(bot_ret, 2), "btc_ret": round(btc_ret, 2),
+            "beta": round(beta_full, 3), "corr": round(corr_full, 3),
+            "btc_now": round(btc[-1][1]), "post_deposit": pd, "svg": svg,
+        }
+    except Exception as e:   # noqa: BLE001
+        return {"error": f"equity_vs_btc failed: {e}"}
+
+
 def _unit_allowed(unit: str) -> bool:
     if unit in CONTROLLABLE_SERVICES:
         return True
@@ -1381,6 +1540,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 elif resource == "account":
                     # Live venue truth from the PUBLIC API (balance/positions/PnL).
                     self._send_json(_hl_live_account(instance, q.get("address")))
+                elif resource == "equity_vs_btc":
+                    # Deposit-adjusted equity TWR vs BTC B&H since live start + decomposition.
+                    self._send_json(_equity_vs_btc(instance))
                 else:
                     self._send_json({"error": "unknown hl_xsectional resource"}, 404)
             except ValueError as e:

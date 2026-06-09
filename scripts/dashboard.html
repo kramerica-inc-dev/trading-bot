@@ -158,6 +158,7 @@
 <!-- Tabs -->
 <div class="tabs">
   <button class="tab active" data-tab="hyperliquid">Hyperliquid</button>
+  <button class="tab" data-tab="vsbtc">vs BTC</button>
   <button class="tab" data-tab="xsectional">X-Sectional</button>
   <button class="tab" data-tab="sweep">OKX Sweep</button>
   <button class="tab" data-tab="carry">OKX Carry</button>
@@ -575,6 +576,13 @@
   </div>
 
 
+  <div class="tab-content" id="tab-vsbtc">
+    <div class="card">
+      <div class="label">Live equity vs BTC — sinds start live traden (deposit-adjusted TWR)</div>
+      <div id="vsbtc-body" style="margin-top:8px;color:var(--text-muted)">Laden…</div>
+    </div>
+  </div>
+
 </div><!-- end .content -->
 
 <script>
@@ -655,6 +663,36 @@ document.querySelectorAll('.tab').forEach(btn => {
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
   });
 });
+</script>
+
+<script>
+// ═══ Live equity vs BTC ═══
+async function fetchVsBtc() {
+  const host = document.getElementById('vsbtc-body');
+  if (!host) return;
+  try {
+    const r = await fetch('/api/hl_xsectional/mainnet/equity_vs_btc');
+    const d = await r.json();
+    if (d.error) { host.innerHTML = '<div style="color:var(--text-muted)">' + d.error + '</div>'; return; }
+    const pd = d.post_deposit || {};
+    const sgn = v => (v >= 0 ? '+' : '') + Number(v).toFixed(2);
+    const mut = 'color:var(--text-muted)';
+    host.innerHTML = `
+      <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px;font-size:13px">
+        <div><b style="color:#1f77b4">Bot (TWR)</b> ${sgn(d.bot_ret)}%</div>
+        <div><b style="color:#ff7f0e">BTC B&amp;H</b> ${sgn(d.btc_ret)}%</div>
+        <div>&beta; ${Number(d.beta).toFixed(2)} &middot; corr ${Number(d.corr).toFixed(2)}</div>
+        <div style="${mut}">${d.days}d &middot; ${d.points} pts &middot; BTC $${Number(d.btc_now).toLocaleString()}</div>
+      </div>
+      <div style="background:#fff;border-radius:8px;padding:6px">${d.svg}</div>
+      ${pd.bot !== undefined ? `<div style="margin-top:8px;font-size:12px;${mut}">
+        Na storting ($${d.equity_now}, representatief): bot ${sgn(pd.bot)}% = beta-component ${sgn(pd.beta_comp)}% (&beta; ${Number(pd.beta).toFixed(2)}) + pure dispersie-edge ${sgn(pd.dispersion)}%</div>` : ''}
+      <div style="margin-top:4px;font-size:11px;${mut}">Storting van 06-06 is uit het rendement gehaald (time-weighted). Dollar-neutraal &ne; beta-neutraal.</div>`;
+  } catch (e) { host.innerHTML = '<div style="color:var(--text-muted)">vs-BTC laden mislukt: ' + e + '</div>'; }
+}
+document.querySelector('.tab[data-tab="vsbtc"]')?.addEventListener('click', fetchVsBtc);
+setInterval(() => { const t = document.getElementById('tab-vsbtc'); if (t && t.classList.contains('active')) fetchVsBtc(); }, 60000);
+fetchVsBtc();
 </script>
 
 <script>
