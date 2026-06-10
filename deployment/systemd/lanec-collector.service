@@ -1,0 +1,41 @@
+[Unit]
+Description=Lane C cross-venue quote collector (read-only public market data)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+# READ-ONLY collector: public order-book endpoints only — no API keys, no order
+# code, no EnvironmentFile needed. Output lands in state/lanec/ (JSONL + gzip
+# rollover + health.json). 2s snapshot cadence; raise --cycle-sec to 3.0 if the
+# journal shows Kraken rate-limit lockouts (see module docstring rate budget).
+# The '+' prefix runs the pre-step with full privileges so the sandboxed unit
+# can be granted ONLY state/lanec below (kernel-enforced read-only elsewhere).
+ExecStartPre=+/bin/sh -c 'mkdir -p /opt/trading-bot/state/lanec && chown botuser:botuser /opt/trading-bot/state/lanec'
+ExecStart=/usr/bin/python3 -m scripts.lanec_collector --loop --cycle-sec 2.0
+
+Restart=on-failure
+RestartSec=10
+
+# Long-running but tiny (requests sessions + one JSONL appender). Hard cap only.
+MemoryMax=128M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lanec-collector
+
+# Narrower than the sibling units ON PURPOSE: this keyless collector gets
+# kernel-enforced write access to its own state dir ONLY — never to the
+# live-money runner's configs/state, even though it runs as the same botuser.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot/state/lanec
+
+[Install]
+WantedBy=multi-user.target
