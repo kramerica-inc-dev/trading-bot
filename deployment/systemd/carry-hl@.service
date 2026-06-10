@@ -1,0 +1,45 @@
+[Unit]
+Description=Carry runner (hl-%i) — funding/basis cash-and-carry on Hyperliquid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/trading-bot
+Environment=PYTHONUNBUFFERED=1
+# Per-instance credentials and overrides; the leading `-` makes it optional
+# so the unit can be loaded before the env-file is created. The runner will
+# log an error and skip its order/account paths if credentials are missing.
+# For the HL lane this file carries:
+#   HL_PRIVATE_KEY (or HL_CARRY_PRIVATE_KEY)  — AGENT wallet key (signs only).
+#   HL_CARRY_ACCOUNT_ADDRESS (or HL_ACCOUNT_ADDRESS) — the MASTER account 0x…
+#       REQUIRED for any non-DRY mode: the agent key's own address is never a
+#       valid account target (Info reads would see an empty book and orders
+#       would be venue-rejected). Config hl_account_address overrides.
+#   HL_CONFIRM_LIVE=YES — only for an intentional mainnet-live arm.
+# Non-DRY also requires account isolation in the JSON config:
+# hl_sub_account_address (preferred) or hl_dedicated_account_confirmed=true.
+EnvironmentFile=-/etc/trading-bot/carry-hl-%i.env
+ExecStart=/usr/bin/python3 -m scripts.carry_runner --loop --config /opt/trading-bot/configs/carry-hl-%i.json
+Restart=on-failure
+RestartSec=30
+
+# Cap RAM so one runaway process is cgroup-killed instead of OOM-reaping the
+# whole LXC. MemoryHigh throttles+reclaims first; MemoryMax is the hard ceiling.
+MemoryHigh=192M
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=carry-hl-%i
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trading-bot
+
+[Install]
+WantedBy=multi-user.target

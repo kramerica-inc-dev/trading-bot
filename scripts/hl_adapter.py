@@ -77,6 +77,7 @@ class HLAdapter:
         self.exchange = (Exchange(self.wallet, self.base_url, account_address=self.address)
                          if self.wallet else None)
         self._meta_cache: Optional[dict] = None
+        self._spot_meta_cache: Optional[dict] = None
 
     # ------------------------------------------------------------------ reads
     def meta(self) -> dict:
@@ -150,6 +151,137 @@ class HLAdapter:
         except Exception:
             pass
         return out
+
+    def funding_history(self, coin: str, start_ms: int, end_ms: Optional[int] = None,
+                        *, max_pages: int = 50) -> List[dict]:
+        """HOURLY funding rows for `coin` (perp name, e.g. "BTC") within
+        [start_ms, end_ms] as [{time_ms, rate}], sorted ASCENDING and deduped on
+        time. The server caps each response (~500 rows), so this pages forward on
+        the last seen timestamp until the window is exhausted (90d hourly ≈ 2160
+        rows ≈ 5 pages). Raises on a hard read failure — callers must NOT treat
+        that as 'no funding'. `max_pages` only bounds a misbehaving server (no
+        normal window hits it)."""
+        out: Dict[int, float] = {}
+        cursor = int(start_ms)
+        for _ in range(max_pages):
+            rows = self.info.funding_history(coin, cursor, end_ms)
+            if not isinstance(rows, list) or not rows:
+                break
+            page_max = cursor - 1
+            for r in rows:
+                try:
+                    t = int(r["time"])
+                    rate = float(r["fundingRate"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                page_max = max(page_max, t)
+                if t < start_ms or (end_ms is not None and t > end_ms):
+                    continue
+                out[t] = rate
+            if page_max < cursor:          # no forward progress → final/garbage page
+                break
+            cursor = page_max + 1
+            if end_ms is not None and cursor > end_ms:
+                break
+        return [{"time_ms": t, "rate": out[t]} for t in sorted(out)]
+
+    # ------------------------------------------------------------- spot reads
+    def spot_meta(self) -> dict:
+        """Cached spot metadata ({universe, tokens}) — same caching discipline
+        as meta(); refreshed only on a new adapter instance."""
+        if self._spot_meta_cache is None:
+            self._spot_meta_cache = self.info.spot_meta()
+        return self._spot_meta_cache
+
+    def spot_pairs(self) -> Dict[str, dict]:
+        """Every listed spot pair keyed by the composed "BASE/QUOTE" name (e.g.
+        the Unit-bridged "UBTC/USDC") → {coin, index, base, quote, sz_decimals}.
+        `coin` is the SDK's spot-universe name ("PURR/USDC" for canonical pairs,
+        "@<index>" otherwise) — the name the SDK expects for orders and ctx
+        lookups; `sz_decimals` is the BASE token's szDecimals (spot order sizing
+        rounds to it, NOT the perp coin's). This is also the map of which coins
+        have a spot pair at all. {} on a read failure — never a real empty
+        listing."""
+        try:
+            sm = self.spot_meta()
+            tok = {t["index"]: t for t in sm.get("tokens", []) or []}
+            out: Dict[str, dict] = {}
+            for u in sm.get("universe", []) or []:
+                try:
+                    base, quote = u["tokens"]
+                    name = f'{tok[base]["name"]}/{tok[quote]["name"]}'
+                    out[name] = {"coin": u["name"], "index": int(u["index"]),
+                                 "base": tok[base]["name"], "quote": tok[quote]["name"],
+                                 "sz_decimals": int(tok[base]["szDecimals"])}
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return out
+        except Exception:
+            return {}
+
+    def resolve_spot_pair(self, pair: str) -> Optional[dict]:
+        """Resolve a composed "UBTC/USDC" name (or a raw universe name like
+        "@142") to its spot_pairs() record. None when unknown/unreadable —
+        callers must treat None as 'cannot trade this pair', never default."""
+        pairs = self.spot_pairs()
+        rec = pairs.get(pair)
+        if rec is not None:
+            return rec
+        for rec in pairs.values():
+            if rec["coin"] == pair:
+                return rec
+        return None
+
+    def spot_mids(self) -> Dict[str, float]:
+        """Current spot mids keyed by BOTH the composed "BASE/QUOTE" name and
+        the SDK universe name ("@N"/"PURR/USDC"). Prefers midPx, falls back to
+        markPx (thin books often have no mid). Like all_mids(): an EMPTY dict
+        means the feed is unavailable/degraded — callers must treat {} as
+        "no data", never as a genuine empty market."""
+        out: Dict[str, float] = {}
+        try:
+            sm, ctxs = self.info.spot_meta_and_asset_ctxs()
+            tok = {t["index"]: t for t in sm.get("tokens", []) or []}
+            for u, ctx in zip(sm.get("universe", []) or [], ctxs or []):
+                if not isinstance(ctx, dict):
+                    continue
+                try:
+                    px = float(ctx.get("midPx") or ctx.get("markPx") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if px <= 0:
+                    continue
+                out[u["name"]] = px
+                try:
+                    base, quote = u["tokens"]
+                    out[f'{tok[base]["name"]}/{tok[quote]["name"]}'] = px
+                except (KeyError, TypeError, ValueError):
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def spot_balances(self) -> Optional[Dict[str, dict]]:
+        """ALL spot-clearinghouse balances {token: {total, hold, free}} — the
+        full-list sibling of _spot_usdc_free (free = total − hold; see there for
+        why `hold` is removed). {} for a keyless/empty account, None on a read
+        failure — callers treat None as 'unknown', never as flat."""
+        if not self.address:
+            return {}
+        try:
+            ss = self.info.spot_user_state(self.address)
+            out: Dict[str, dict] = {}
+            for b in ss.get("balances", []) or []:
+                try:
+                    total = float(b.get("total") or 0.0)
+                    hold = float(b.get("hold") or 0.0)
+                    out[b["coin"]] = {"total": total, "hold": hold,
+                                      "free": max(0.0, total - hold)}
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return out
+        except Exception:
+            return None
 
     def _spot_usdc_free(self) -> Optional[float]:
         """FREE (un-held) USDC in the spot clearinghouse: total − hold. `hold` is
@@ -351,11 +483,72 @@ class HLAdapter:
             return HLOrderResult(ok=False, raw={}, error=f"order exception: {e}")
         return self._parse_order(raw)
 
-    def close(self, coin: str, *, slippage: float = 0.05,
-              cloid: Optional[Cloid] = None) -> HLOrderResult:
+    def spot_market_order_usd(self, pair: str, is_buy: bool, usd_notional: float, *,
+                              slippage: float = 0.05, cloid: Optional[Cloid] = None) -> HLOrderResult:
+        """Spot marketable IOC sized by USD notional (spot mid → BASE sz, rounded
+        to the BASE token's szDecimals — NOT the perp coin's). Mirrors
+        market_order_usd: enforces HL's $10 min and rejects if rounding moved the
+        notional far, so a leg is never silently mis-sized or dropped to 0. Never
+        raises past the trade gate. `pair` is the composed "UBTC/USDC" name (or a
+        raw universe name); an optional cloid tags the order for idempotency."""
         self._assert_can_trade()
+        rec = self.resolve_spot_pair(pair)
+        if rec is None:
+            return HLOrderResult(ok=False, raw={}, error=f"unknown spot pair {pair!r}")
+        if usd_notional < self.MIN_ORDER_USD:
+            return HLOrderResult(ok=False, raw={},
+                                 error=f"notional ${usd_notional:.2f} < ${self.MIN_ORDER_USD:.0f} min ({pair})")
+        mid = self.spot_mids().get(rec["coin"])
+        if not mid or mid <= 0:
+            return HLOrderResult(ok=False, raw={}, error=f"no spot mid for {pair}")
+        sz = float(round(usd_notional / mid, rec["sz_decimals"]))
+        if sz <= 0:
+            return HLOrderResult(ok=False, raw={}, error=f"size rounds to 0 ({pair}, ${usd_notional:.2f})")
+        rounded = sz * mid
+        if rounded < self.MIN_ORDER_USD or abs(rounded - usd_notional) / usd_notional > 0.5:
+            return HLOrderResult(ok=False, raw={},
+                                 error=f"rounded notional ${rounded:.2f} off-target/below-min ({pair})")
         try:
-            raw = self.exchange.market_close(coin, None, None, slippage, cloid)
+            raw = self.exchange.market_open(rec["coin"], is_buy, sz, None, slippage, cloid)
+        except Exception as e:
+            return HLOrderResult(ok=False, raw={}, error=f"spot order exception: {e}")
+        return self._parse_order(raw)
+
+    def usd_class_transfer(self, amount_usd: float, to_perp: bool) -> dict:
+        """Move USDC between the spot and perp clearinghouses (to_perp=True →
+        spot→perp). Routed through _assert_can_trade — refused in MAINNET_DRY /
+        without a signing wallet — because a transfer MUTATES the live account
+        even though it places no order. Returns {ok, raw, error}. NOTE: this is
+        a USER-SIGNED action (not L1) — whether an AGENT key may perform it is
+        unverified; prove on testnet before relying on it (fallback:
+        sub_account_transfer, which is L1-signed)."""
+        self._assert_can_trade()
+        if not amount_usd or amount_usd <= 0:
+            return {"ok": False, "raw": {}, "error": f"amount ${amount_usd} must be > 0"}
+        try:
+            raw = self.exchange.usd_class_transfer(float(amount_usd), bool(to_perp))
+            ok = isinstance(raw, dict) and raw.get("status") == "ok"
+            return {"ok": ok, "raw": raw, "error": None if ok else str(raw)}
+        except Exception as e:
+            return {"ok": False, "raw": {}, "error": str(e)}
+
+    def close(self, coin: str, *, sz: Optional[float] = None, slippage: float = 0.05,
+              cloid: Optional[Cloid] = None) -> HLOrderResult:
+        """Reduce/close a perp position. sz=None closes the ENTIRE position of
+        whatever account the Exchange routes to — callers that manage only a
+        SUB-book (e.g. the carry lane on a shared account) MUST pass their own
+        qty so a reduce-only leg can never flatten another lane's position
+        (review 2026-06-09 #2). sz is rounded to the coin's szDecimals; a size
+        that rounds to 0 is rejected (never silently escalated to close-all)."""
+        self._assert_can_trade()
+        sz_rounded: Optional[float] = None
+        if sz is not None:
+            sz_rounded = self._round_sz(coin, float(sz))
+            if sz_rounded <= 0:
+                return HLOrderResult(ok=False, raw={},
+                                     error=f"close size {sz} rounds to 0 ({coin})")
+        try:
+            raw = self.exchange.market_close(coin, sz_rounded, None, slippage, cloid)
         except Exception as e:
             return HLOrderResult(ok=False, raw={}, error=f"close exception: {e}")
         if raw is None:                          # SDK returns None when nothing to close

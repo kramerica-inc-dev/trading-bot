@@ -225,21 +225,33 @@ def projected_next_funding_usd(
 # Green-button rule
 # ---------------------------------------------------------------------------
 
-SETTLEMENTS_PER_YEAR = 3 * 365   # 8h funding settlements
+SETTLEMENTS_PER_YEAR = 3 * 365   # 8h funding settlements (OKX default)
+
+# Hyperliquid settles funding hourly → 24 * 365 settlements per year.
+SETTLEMENTS_PER_YEAR_HOURLY = 24 * 365
 
 
-def annualize_funding(per_8h_rate: float) -> float:
-    """Convert a single 8h funding rate to an annualised fraction.
+def annualize_funding(
+    per_settlement_rate: float,
+    settlements_per_year: float = SETTLEMENTS_PER_YEAR,
+) -> float:
+    """Convert a single per-settlement funding rate to an annualised fraction.
 
-    Matches `docs/STRATEGY-CARRY.md` and `backtest/carry_backtest.py`:
+    Default cadence is the OKX 8h schedule (3 * 365 settlements/yr),
+    matching `docs/STRATEGY-CARRY.md` and `backtest/carry_backtest.py`:
     a `+0.96 bps/8h` mean ≈ `+10.5%/yr` (0.000096 * 3 * 365 ≈ 0.1051).
+
+    For Hyperliquid's hourly funding pass
+    `settlements_per_year=SETTLEMENTS_PER_YEAR_HOURLY` (24 * 365 = 8760);
+    do NOT aggregate hourly rates to 8h-equivalents.
     """
-    return float(per_8h_rate) * SETTLEMENTS_PER_YEAR
+    return float(per_settlement_rate) * float(settlements_per_year)
 
 
 def green_button_on(
     trailing_funding_rates: list, threshold_annualised: float,
     min_samples: int = 1,
+    settlements_per_year: float = SETTLEMENTS_PER_YEAR,
 ) -> Dict[str, Any]:
     """Decide whether the carry should be ON for the next cycle.
 
@@ -251,6 +263,9 @@ def green_button_on(
             Per the DECISIONS.md 2026-05-13 entry: the trade is "always on
             when funding is on" — i.e. ON if trailing 90d annualised
             funding > threshold, else FLAT (target_notional=0, hold cash).
+        settlements_per_year: funding cadence used to annualise the mean
+            of the trailing window. Defaults to the OKX 8h schedule
+            (3 * 365 = 1095). Hyperliquid hourly = 24 * 365 = 8760.
 
     Returns:
         {
@@ -270,7 +285,7 @@ def green_button_on(
             "reason": f"insufficient_history (have {samples}, need {min_samples})",
         }
     mean_rate = sum(float(r) for r in trailing_funding_rates) / samples
-    annualised = annualize_funding(mean_rate)
+    annualised = annualize_funding(mean_rate, settlements_per_year)
     on = annualised > float(threshold_annualised)
     return {
         "on": on,

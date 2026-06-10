@@ -18,7 +18,7 @@ from carry_position import (  # noqa: E402
     annualize_funding, delta_neutral_drift,
     funding_accrual_step, green_button_on,
     projected_next_funding_usd, target_position_for,
-    SETTLEMENTS_PER_YEAR,
+    SETTLEMENTS_PER_YEAR, SETTLEMENTS_PER_YEAR_HOURLY,
 )
 
 
@@ -191,6 +191,103 @@ class TestGreenButton(unittest.TestCase):
         r = green_button_on([-0.0001] * 30, threshold_annualised=0.05)
         self.assertFalse(r["on"])
         self.assertLess(r["trailing_annualised"], 0)
+
+
+class TestCadenceParameter(unittest.TestCase):
+    """settlements_per_year param — default = 8h (3*365), HL hourly = 8760."""
+
+    def test_hourly_constant_value(self):
+        self.assertEqual(SETTLEMENTS_PER_YEAR_HOURLY, 24 * 365)
+        self.assertEqual(SETTLEMENTS_PER_YEAR_HOURLY, 8760)
+
+    def test_default_cadence_unchanged(self):
+        # Explicit default kwarg must equal the legacy single-arg call.
+        self.assertEqual(
+            annualize_funding(0.000096),
+            annualize_funding(0.000096,
+                              settlements_per_year=SETTLEMENTS_PER_YEAR),
+        )
+        self.assertAlmostEqual(annualize_funding(0.000096),
+                               0.000096 * 3 * 365, places=12)
+
+    def test_hourly_cadence_annualizes_x8760(self):
+        # 1.14e-5/hr * 8760 ≈ 9.99%/yr
+        ann = annualize_funding(1.14e-5, settlements_per_year=8760)
+        self.assertAlmostEqual(ann, 1.14e-5 * 8760, places=12)
+        self.assertGreater(ann, 0.099)
+        self.assertLess(ann, 0.101)
+
+    def test_hourly_via_exported_constant(self):
+        self.assertAlmostEqual(
+            annualize_funding(1e-5,
+                              settlements_per_year=SETTLEMENTS_PER_YEAR_HOURLY),
+            1e-5 * 8760, places=12)
+
+    def test_green_button_hourly_above_threshold(self):
+        # +1e-5/hr → +8.76%/yr; threshold +5%/yr → ON under hourly cadence
+        r = green_button_on([1e-5] * 48, threshold_annualised=0.05,
+                            settlements_per_year=SETTLEMENTS_PER_YEAR_HOURLY)
+        self.assertTrue(r["on"])
+        self.assertAlmostEqual(r["trailing_annualised"], 1e-5 * 8760,
+                               places=12)
+        self.assertEqual(r["reason"], "above_threshold")
+
+    def test_green_button_hourly_same_rate_off_at_8h_default(self):
+        # The same hourly samples annualised at the 8h default (1095)
+        # → only ~+1.1%/yr → OFF. Cadence param is load-bearing.
+        r = green_button_on([1e-5] * 48, threshold_annualised=0.05)
+        self.assertFalse(r["on"])
+        self.assertAlmostEqual(r["trailing_annualised"], 1e-5 * 1095,
+                               places=12)
+
+    def test_green_button_hourly_exact_threshold_is_off(self):
+        # Strictly greater-than: equality at hourly cadence → OFF
+        r = green_button_on([0.05 / SETTLEMENTS_PER_YEAR_HOURLY] * 30,
+                            threshold_annualised=0.05,
+                            settlements_per_year=SETTLEMENTS_PER_YEAR_HOURLY)
+        self.assertFalse(r["on"])
+
+    def test_threshold_equivalence_8h_vs_hourly(self):
+        # Same underlying annualised rate sampled at 8h vs 1h cadence must
+        # produce identical trailing_annualised and the same ON decision.
+        underlying_annual = 0.08   # +8%/yr
+        rate_8h = underlying_annual / SETTLEMENTS_PER_YEAR
+        rate_1h = underlying_annual / SETTLEMENTS_PER_YEAR_HOURLY
+        r8 = green_button_on([rate_8h] * 270, threshold_annualised=0.05,
+                             settlements_per_year=SETTLEMENTS_PER_YEAR)
+        r1 = green_button_on([rate_1h] * 2160, threshold_annualised=0.05,
+                             settlements_per_year=SETTLEMENTS_PER_YEAR_HOURLY)
+        self.assertAlmostEqual(r8["trailing_annualised"],
+                               underlying_annual, places=12)
+        self.assertAlmostEqual(r1["trailing_annualised"],
+                               underlying_annual, places=12)
+        self.assertAlmostEqual(r8["trailing_annualised"],
+                               r1["trailing_annualised"], places=12)
+        self.assertTrue(r8["on"])
+        self.assertTrue(r1["on"])
+
+    def test_threshold_equivalence_below_threshold_both_off(self):
+        # +1.98%/yr (study's current trailing-90d) → OFF on both cadences.
+        underlying_annual = 0.0198
+        r8 = green_button_on(
+            [underlying_annual / SETTLEMENTS_PER_YEAR] * 270,
+            threshold_annualised=0.05,
+            settlements_per_year=SETTLEMENTS_PER_YEAR)
+        r1 = green_button_on(
+            [underlying_annual / SETTLEMENTS_PER_YEAR_HOURLY] * 2160,
+            threshold_annualised=0.05,
+            settlements_per_year=SETTLEMENTS_PER_YEAR_HOURLY)
+        self.assertFalse(r8["on"])
+        self.assertFalse(r1["on"])
+        self.assertAlmostEqual(r8["trailing_annualised"],
+                               r1["trailing_annualised"], places=12)
+
+    def test_green_button_insufficient_history_with_cadence(self):
+        r = green_button_on([], threshold_annualised=0.05, min_samples=5,
+                            settlements_per_year=SETTLEMENTS_PER_YEAR_HOURLY)
+        self.assertFalse(r["on"])
+        self.assertEqual(r["reason"],
+                         "insufficient_history (have 0, need 5)")
 
 
 if __name__ == "__main__":

@@ -66,8 +66,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from okx_adapter import OkxAdapter  # noqa: E402
-from mode_gate import MODE_DRY, MODE_P2, MODE_P3, resolve_demo_mode  # noqa: E402,F401
+from mode_gate import (  # noqa: E402,F401
+    MODE_DRY, MODE_P2, MODE_P3, MODE_MAINNET_DRY, resolve_demo_mode,
+)
 from carry_position import (  # noqa: E402
+    SETTLEMENTS_PER_YEAR,
     CarryPosition, DriftReport, annualize_funding,
     delta_neutral_drift, funding_accrual_step,
     green_button_on, projected_next_funding_usd,
@@ -86,9 +89,10 @@ class CarryRunnerConfig:
     """
     instance_name: str = "carry"
     # exchange + symbol
-    exchange: str = "okx"                  # only "okx" supported
-    spot_symbol: str = "BTC-USDT"          # OKX spot
+    exchange: str = "okx"                  # "okx" or "hyperliquid"
+    spot_symbol: str = "BTC-USDT"          # OKX spot ("UBTC/USDC" on HL)
     perp_symbol: str = "BTC-USDT"          # passed to OkxAdapter — gets -SWAP
+    #                                        ("BTC" on HL)
     # sizing
     initial_notional_usd: float = 5000.0   # book size (projection / live cap basis)
     target_dn_notional_fraction: float = 0.6   # fraction of book deployed delta-neutral
@@ -111,6 +115,22 @@ class CarryRunnerConfig:
     rebalance_threshold_pct: float = 0.05  # resize when current/target drifts >5%
     # OKX base URL override (EU region or testnet)
     okx_base_url: Optional[str] = None
+    # funding cadence — per-settlement rate × settlements_per_year = annualised.
+    # OKX settles every 8h (3*365 = 1095, the default). Hyperliquid settles
+    # HOURLY (24*365 = 8760): pass NATIVE hourly samples + 8760 here; never
+    # aggregate hourly rates to 8h-equivalents (HL-CARRY-STUDY caveat #1).
+    settlements_per_year: float = float(SETTLEMENTS_PER_YEAR)
+    # Hyperliquid lane (exchange == "hyperliquid"); ignored for OKX.
+    hl_network: str = "mainnet"            # "mainnet" (data) | "testnet" (paper)
+    hl_account_address: Optional[str] = None      # master account 0x…
+    hl_sub_account_address: Optional[str] = None  # sub-account holding the carry
+    # Account-isolation gate (review 2026-06-09 #2): any non-DRY HL mode must
+    # either trade an isolating SUB-account or carry this explicit operator
+    # confirmation that the master account is DEDICATED to the carry (no other
+    # lane — e.g. hl-xsectional — trades it). Without isolation, a carry
+    # unwind (reduce-only market_close) on a shared account could flatten
+    # another lane's position in the same coin. Identity-checked bool True.
+    hl_dedicated_account_confirmed: bool = False
 
 
 def load_config(path: Optional[str]) -> CarryRunnerConfig:
@@ -138,7 +158,16 @@ def resolve_mode(cfg: CarryRunnerConfig) -> str:
 
     Wraps the shared `mode_gate.resolve_demo_mode` (DRY/P2/P3) and layers carry's
     extra P3 sizing guard on top. Pure — no environment, no I/O; fails closed.
+
+    Hyperliquid has NO demo venue, so `okx_demo=true` is rejected outright for
+    `exchange="hyperliquid"` (fail closed) — paper-trade HL via dry_run=true
+    (DRY_RUN) or hl_network="testnet" + dry_run=false + allow_live=true.
     """
+    if cfg.exchange == "hyperliquid" and cfg.okx_demo:
+        raise RuntimeError(
+            "exchange='hyperliquid' has no demo venue: okx_demo=true is "
+            "invalid. Use dry_run=true (DRY_RUN), or hl_network='testnet' with "
+            "dry_run=false + allow_live=true for testnet paper orders.")
     mode = resolve_demo_mode(dry_run=cfg.dry_run, okx_demo=cfg.okx_demo,
                              allow_live=cfg.allow_live)
     if mode != MODE_P3:
@@ -164,8 +193,14 @@ class CarryRunnerState:
     started_ts: Optional[str] = None
     last_cycle_ts: Optional[str] = None
     cycles_total: int = 0
-    funding_samples: List[float] = field(default_factory=list)  # rolling-90d cache
+    # Trailing SETTLED-funding window (green-button input). Refreshed WHOLESALE
+    # from the venue's funding history once per settlement period — never
+    # appended per cycle (review 2026-06-09 #1: per-cycle appends of the
+    # predicted rate flushed the seeded history, shrinking the "90d" window to
+    # trailing_window_samples × cycle_interval ≈ 36h on the HL lane).
+    funding_samples: List[float] = field(default_factory=list)
     funding_samples_ts: List[str] = field(default_factory=list)
+    funding_window_last_refresh_ts: Optional[str] = None
     simulated_position: Dict[str, Any] = field(default_factory=lambda: asdict(CarryPosition()))
     simulated_equity: float = 0.0
     last_funding_rate: float = 0.0
@@ -362,6 +397,25 @@ def pull_live_fees(adapter: Any, *, spot_inst: str, perp_inst: str) -> Dict[str,
         "sources": {},
         "errors": [],
     }
+    # Adapter-declared static schedule (Hyperliquid shim: HL has no per-account
+    # fee-probe API, so the shim publishes documented base-tier constants).
+    static_fn = getattr(adapter, "static_fee_schedule", None)
+    if callable(static_fn):
+        try:
+            static = static_fn()
+        except Exception as e:
+            static = None
+            out["errors"].append({"leg": "static", "error": str(e)})
+        if isinstance(static, dict) and static:
+            for k in FALLBACK_FEES:
+                if static.get(k) is not None:
+                    out[k] = abs(float(static[k]))
+                    out["sources"][k] = "adapter_static"
+                else:
+                    out[k] = FALLBACK_FEES[k]
+                    out["sources"][k] = "fallback"
+            return out
+
     api = getattr(adapter, "api", None)
     if api is None or not hasattr(api, "_request"):
         # Stub adapter (tests) — return fallback.
@@ -446,6 +500,36 @@ def verify_leverage_cap(
         "message": "",
         "errors": [],
     }
+    # Adapter-declared venue max (Hyperliquid shim: per-coin maxLeverage from
+    # perp meta — there is no OKX-style leverage-info REST path).
+    probe = getattr(adapter, "max_leverage", None)
+    if callable(probe):
+        mx: Optional[float] = None
+        try:
+            v = probe(perp_inst)
+            mx = float(v) if v is not None else None
+        except Exception as e:
+            out["errors"].append({"step": "adapter_max_leverage", "error": str(e)})
+        if mx is not None:
+            out["contract_max"] = mx
+            out["effective_max"] = mx
+            if mx >= configured_cap:
+                out["ok"] = True
+                out["message"] = (
+                    f"leverage cap OK: configured={configured_cap}×, "
+                    f"venue max={mx}×")
+            else:
+                out["message"] = (
+                    f"leverage cap MISMATCH: configured={configured_cap}× but "
+                    f"venue max={mx}×. Lower leverage_cap in the config to "
+                    "match the venue's cap.")
+        else:
+            out["ok"] = True
+            out["message"] = (
+                f"could not read venue max leverage — keeping configured cap "
+                f"{configured_cap}× as assumed (errors: {len(out['errors'])})")
+        return out
+
     api = getattr(adapter, "api", None)
     if api is None or not hasattr(api, "_request"):
         out["message"] = "no live adapter — skipping leverage check"
@@ -585,20 +669,85 @@ class CarryRunner:
         self.health_path = instance_dir / "health.json"
         self.halt_sentinel = instance_dir / "halt"
 
-        api_key = os.environ.get("OKX_API_KEY", "")
-        api_secret = os.environ.get("OKX_API_SECRET", "")
-        passphrase = os.environ.get("OKX_API_PASSPHRASE", "")
-        self.have_private_creds = bool(api_key and api_secret and passphrase)
+        if cfg.exchange == "hyperliquid":
+            # Lazy import: the HL SDK is only a dependency of the HL lane.
+            from hl_carry_adapter import HLCarryAdapter
+            hl_key = (os.environ.get("HL_CARRY_PRIVATE_KEY")
+                      or os.environ.get("HL_PRIVATE_KEY") or "")
+            hl_master = (cfg.hl_account_address
+                         or os.environ.get("HL_CARRY_ACCOUNT_ADDRESS")
+                         or os.environ.get("HL_ACCOUNT_ADDRESS") or None)
+            self.have_private_creds = bool(hl_key)
+            if self.mode != MODE_DRY:
+                # Fail closed AT STARTUP (review 2026-06-09 #2/#4):
+                # 1. An explicit master/sub account address is REQUIRED. The
+                #    env key is an AGENT wallet; without an address, HLAdapter
+                #    falls back to the agent's own (empty) address — Info
+                #    reads see a flat book (reconcile noise) and orders are
+                #    venue-rejected with no startup diagnosis.
+                if not hl_master:
+                    raise RuntimeError(
+                        "exchange='hyperliquid' mode "
+                        f"{self.mode} requires an explicit account address: "
+                        "set hl_account_address in the config or env "
+                        "HL_CARRY_ACCOUNT_ADDRESS / HL_ACCOUNT_ADDRESS (the "
+                        "MASTER account 0x…, not the agent wallet's own "
+                        "address).")
+                # 2. Account ISOLATION. A reduce-only unwind market-closes the
+                #    carry coin on whatever account the Exchange routes to; on
+                #    a shared master (e.g. the live hl-xsectional account, BTC
+                #    in its universe) that would flatten the OTHER lane's leg
+                #    and reconcile would read its positions as the carry's.
+                if not cfg.hl_sub_account_address \
+                        and cfg.hl_dedicated_account_confirmed is not True:
+                    raise RuntimeError(
+                        "exchange='hyperliquid' mode "
+                        f"{self.mode} requires account isolation: set "
+                        "hl_sub_account_address (sub-account holding ONLY the "
+                        "carry), or — if the master truly runs no other lane "
+                        "— set hl_dedicated_account_confirmed=true "
+                        "explicitly.")
+            # Inner-adapter arming: only carry P3 may even REQUEST a live HL
+            # adapter; DRY always builds MAINNET_DRY (double gate — the shim's
+            # order paths raise via HLAdapter._assert_can_trade regardless of
+            # any runner bug). MAINNET_LIVE additionally needs the bool-True
+            # allow_live AND env HL_CONFIRM_LIVE=YES inside resolve_hl_mode.
+            hl_allow_live = (self.mode == MODE_P3 and cfg.allow_live is True)
+            self.adapter = HLCarryAdapter({
+                "network": cfg.hl_network,
+                "private_key": hl_key or None,
+                "account_address": hl_master,
+                "sub_account_address": cfg.hl_sub_account_address,
+                "coin": cfg.perp_symbol,
+                "spot_pair": cfg.spot_symbol,
+                "allow_live": hl_allow_live,
+            })
+            # Fail closed AT STARTUP: a non-DRY carry mode whose HL adapter
+            # resolved to MAINNET_DRY would refuse every order anyway (raise
+            # per leg) — surface the misconfiguration immediately instead.
+            if self.mode != MODE_DRY and \
+                    getattr(self.adapter, "mode", None) == MODE_MAINNET_DRY:
+                raise RuntimeError(
+                    "exchange='hyperliquid' mode mismatch: carry mode "
+                    f"{self.mode} needs a tradable HL adapter, but "
+                    "hl_network='mainnet' resolved to MAINNET_DRY. MAINNET_LIVE "
+                    "requires allow_live=true AND env HL_CONFIRM_LIVE=YES; for "
+                    "paper orders use hl_network='testnet'.")
+        else:
+            api_key = os.environ.get("OKX_API_KEY", "")
+            api_secret = os.environ.get("OKX_API_SECRET", "")
+            passphrase = os.environ.get("OKX_API_PASSPHRASE", "")
+            self.have_private_creds = bool(api_key and api_secret and passphrase)
 
-        adapter_cfg: Dict[str, Any] = {
-            "api_key": api_key,
-            "api_secret": api_secret,
-            "passphrase": passphrase,
-            "demo_mode": cfg.okx_demo,
-        }
-        if cfg.okx_base_url:
-            adapter_cfg["base_url"] = cfg.okx_base_url
-        self.adapter = OkxAdapter(adapter_cfg)
+            adapter_cfg: Dict[str, Any] = {
+                "api_key": api_key,
+                "api_secret": api_secret,
+                "passphrase": passphrase,
+                "demo_mode": cfg.okx_demo,
+            }
+            if cfg.okx_base_url:
+                adapter_cfg["base_url"] = cfg.okx_base_url
+            self.adapter = OkxAdapter(adapter_cfg)
 
         # Live fee + leverage probes (lazy: filled on first cycle in modes
         # that need credentials).
@@ -615,12 +764,14 @@ class CarryRunner:
         )
 
         if self.mode != MODE_DRY and not self.have_private_creds:
+            cred_hint = ("HL_PRIVATE_KEY (or HL_CARRY_PRIVATE_KEY)"
+                         if cfg.exchange == "hyperliquid"
+                         else "OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE")
             logging.error(
-                "[%s] mode=%s requires OKX API credentials in env "
-                "(OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE). "
+                "[%s] mode=%s requires API credentials in env (%s). "
                 "Without them the runner cannot place orders or fetch the "
                 "account snapshot; cycles will skip the order leg.",
-                cfg.instance_name, self.mode,
+                cfg.instance_name, self.mode, cred_hint,
             )
 
     # ---------- state I/O ----------
@@ -717,7 +868,35 @@ class CarryRunner:
         if not self.leverage_check.get("ok"):
             raise RuntimeError(self.leverage_check.get("message")
                                or "leverage cap verification failed")
+        if self.cfg.exchange == "hyperliquid" and self.mode != MODE_DRY:
+            self._pin_hl_leverage()
         self._startup_probes_done = True
+
+    def _pin_hl_leverage(self) -> None:
+        """PIN the venue-side per-coin leverage to leverage_cap and verify by
+        read-back (review 2026-06-09 #5, mirroring hl_xs_runner._ensure_leverage).
+
+        verify_leverage_cap only checks the venue ALLOWS the configured cap; it
+        never sets it, so the perp short would inherit the account's prior /
+        default per-coin leverage (up to HL's 40× BTC max). totalMarginUsed
+        would then be notional/40 instead of notional/leverage_cap and the
+        inverted margin_ratio (equity/used) would read so large that
+        margin_ratio_alarm could never fire. Raises on pin or read-back
+        failure → one_cycle trips a startup halt (fail closed)."""
+        cap = int(self.cfg.leverage_cap)
+        res = self.adapter.set_leverage(cap, is_cross=True)
+        if not (isinstance(res, dict) and res.get("ok")):
+            raise RuntimeError(
+                f"leverage pin failed: set_leverage({cap}) → "
+                f"{(res or {}).get('error') if isinstance(res, dict) else res}")
+        reader = getattr(self.adapter, "get_leverage", None)
+        lv = reader() if callable(reader) else None
+        if not lv or int(lv.get("value", 0)) != cap or lv.get("type") != "cross":
+            raise RuntimeError(
+                f"leverage read-back mismatch: pinned {cap}× cross but venue "
+                f"reports {lv!r}")
+        logging.info("[%s] LEVERAGE pinned %s× cross (read-back verified)",
+                     self.cfg.instance_name, cap)
 
     # ---------- market-data probes ----------
 
@@ -752,10 +931,15 @@ class CarryRunner:
             return None
 
     def fetch_funding_history(self, limit: int = 100) -> List[float]:
+        # OKX caps funding-history pages at 100 rows; the HL shim paginates
+        # internally and honors the full window (e.g. 2160 = 90d hourly).
+        lim = int(limit)
+        if self.cfg.exchange != "hyperliquid":
+            lim = min(lim, 100)
         resp = self.adapter.api.get_funding_rate_history(
             inst_id=f"{self.cfg.perp_symbol}-SWAP"
             if not self.cfg.perp_symbol.endswith("-SWAP") else self.cfg.perp_symbol,
-            limit=min(int(limit), 100),
+            limit=lim,
         )
         if not isinstance(resp, dict) or not resp.get("data"):
             return []
@@ -880,13 +1064,18 @@ class CarryRunner:
             self.cfg.spot_symbol, oid1, is_spot=True,
             timeout_sec=self.cfg.legging_window_sec,
         )
+        filled1 = _filled_qty(det1)
         result["legs"].append({
             "leg": "spot_buy", "ok": ok1, "ord_id": oid1,
-            "filled_qty": _filled_qty(det1), "state": _order_state(det1),
+            "filled_qty": filled1, "state": _order_state(det1),
         })
         if not ok1:
             result["reason"] = "spot_open_did_not_fill"
             return result
+        # Abort/flatten must move the ACTUAL leg-1 fill, never the requested
+        # qty (review 2026-06-09 #3 — a venue/shim fill report < requested
+        # would otherwise leave net delta after the "flatten").
+        flatten_qty = filled1 if filled1 > 0 else qty_btc
 
         # ---- leg 2: perp sell (short)
         resp2 = self._place_perp_market("sell", qty_btc)
@@ -904,10 +1093,10 @@ class CarryRunner:
             "raw_resp_if_no_oid": None if oid2 else resp2,
         })
         if not ok2:
-            # Leg-2 failed → flatten leg 1 immediately.
-            flatten = self._place_spot_market("sell", qty_btc)
+            # Leg-2 failed → flatten leg 1 immediately (actual filled qty).
+            flatten = self._place_spot_market("sell", flatten_qty)
             result["legs"].append({
-                "leg": "spot_flatten", "ok": True,
+                "leg": "spot_flatten", "ok": True, "qty_btc": flatten_qty,
                 "ord_id": self._extract_order_id(flatten),
                 "raw_resp": flatten,
             })
@@ -934,13 +1123,17 @@ class CarryRunner:
             self.cfg.spot_symbol, oid1, is_spot=True,
             timeout_sec=self.cfg.legging_window_sec,
         )
+        filled1 = _filled_qty(det1)
         result["legs"].append({
             "leg": "spot_sell", "ok": ok1, "ord_id": oid1,
-            "filled_qty": _filled_qty(det1), "state": _order_state(det1),
+            "filled_qty": filled1, "state": _order_state(det1),
         })
         if not ok1:
             result["reason"] = "spot_close_did_not_fill"
             return result
+        # Relist (abort path) re-buys the ACTUAL sold qty, never the requested
+        # qty (review 2026-06-09 #3).
+        relist_qty = filled1 if filled1 > 0 else qty_btc
 
         # ---- leg 2: perp buy to close
         resp2 = self._place_perp_market("buy", qty_btc, reduce_only=True)
@@ -958,10 +1151,11 @@ class CarryRunner:
             "raw_resp_if_no_oid": None if oid2 else resp2,
         })
         if not ok2:
-            # Leg-2 failed on UNWIND. Re-buy spot to restore the pair.
-            relist = self._place_spot_market("buy", qty_btc)
+            # Leg-2 failed on UNWIND. Re-buy spot (actual sold qty) to
+            # restore the pair.
+            relist = self._place_spot_market("buy", relist_qty)
             result["legs"].append({
-                "leg": "spot_relist", "ok": True,
+                "leg": "spot_relist", "ok": True, "qty_btc": relist_qty,
                 "ord_id": self._extract_order_id(relist),
                 "raw_resp": relist,
             })
@@ -1033,33 +1227,43 @@ class CarryRunner:
         perp_px = self.fetch_perp_price()
         funding = self.fetch_funding_rate()
 
-        # Seed funding history on first cycle.
-        if not state.funding_samples:
-            seed = self.fetch_funding_history(limit=100)
-            if seed:
-                state.funding_samples.extend(seed)
-                state.funding_samples_ts.extend([now_iso] * len(seed))
-                excess = len(state.funding_samples) - self.cfg.trailing_window_samples
-                if excess > 0:
-                    state.funding_samples = state.funding_samples[excess:]
-                    state.funding_samples_ts = state.funding_samples_ts[excess:]
+        # Trailing settled-funding window (the green button's ONLY input).
+        # Refreshed WHOLESALE from the venue's funding HISTORY once per
+        # settlement period (hourly on HL, 8h on OKX) — one sample per
+        # SETTLEMENT by construction. Review 2026-06-09 #1: the previous
+        # per-cycle append of the PREDICTED rate displaced one seeded history
+        # sample per cycle, so in steady state the "trailing 90d" window was
+        # really trailing_window_samples × cycle_interval (≈36h on the HL
+        # lane, ≈4.5h on OKX) and any ~1.5-day funding spike flipped the gate.
+        # A failed/empty history read keeps the previous (stale) window and
+        # retries next cycle — it never zeroes the gate's history. The HL shim
+        # paginates the full window (~5 calls/hour); OKX is page-capped at 100
+        # rows inside fetch_funding_history, so its EFFECTIVE window is
+        # min(trailing_window_samples, 100) settlements (~33d at 8h cadence).
+        refresh_due = not state.funding_samples
+        if not refresh_due:
+            period_sec = (365.0 * 24.0 * 3600.0) / float(self.cfg.settlements_per_year)
+            try:
+                last_refresh = datetime.fromisoformat(
+                    state.funding_window_last_refresh_ts or "")
+                refresh_due = (now - last_refresh).total_seconds() >= period_sec
+            except ValueError:
+                refresh_due = True
+        if refresh_due:
+            window = self.fetch_funding_history(
+                limit=self.cfg.trailing_window_samples)
+            if window:
+                window = window[-self.cfg.trailing_window_samples:]
+                state.funding_samples = [float(r) for r in window]
+                state.funding_samples_ts = [now_iso] * len(window)
+                state.funding_window_last_refresh_ts = now_iso
 
-        if funding is not None:
-            if not state.funding_samples or state.funding_samples[-1] != funding \
-                    or not state.funding_samples_ts \
-                    or state.funding_samples_ts[-1] != now_iso:
-                state.funding_samples.append(float(funding))
-                state.funding_samples_ts.append(now_iso)
-                excess = len(state.funding_samples) - self.cfg.trailing_window_samples
-                if excess > 0:
-                    state.funding_samples = state.funding_samples[excess:]
-                    state.funding_samples_ts = state.funding_samples_ts[excess:]
-
-        # Green-button decision
+        # Green-button decision (annualised at the venue's funding cadence)
         gate = green_button_on(
             state.funding_samples,
             self.cfg.funding_on_threshold_annualised,
             min_samples=1,
+            settlements_per_year=self.cfg.settlements_per_year,
         )
 
         target_notional = (
@@ -1243,9 +1447,12 @@ class CarryRunner:
             "perp_price": perp_px,
             "basis_usd": (spot_px - perp_px) if (spot_px and perp_px) else None,
             "basis_frac": basis_frac if (spot_px and perp_px) else None,
-            "funding_rate_8h": funding,
+            "funding_rate_8h": funding,   # key kept for dashboard compat —
+            #                               holds the PER-SETTLEMENT rate
+            "funding_cadence_hours": (365.0 * 24.0) / float(self.cfg.settlements_per_year),
             "funding_rate_annualised": (
-                annualize_funding(funding) if funding is not None else None
+                annualize_funding(funding, self.cfg.settlements_per_year)
+                if funding is not None else None
             ),
             "gate": gate,
             "target_notional_usd": target_notional,
@@ -1317,7 +1524,8 @@ class CarryRunner:
             "last_cycle_ts": state.last_cycle_ts,
             "cycles_total": state.cycles_total,
             "last_funding_rate_8h": state.last_funding_rate,
-            "last_funding_annualised": annualize_funding(state.last_funding_rate),
+            "last_funding_annualised": annualize_funding(
+                state.last_funding_rate, self.cfg.settlements_per_year),
             "last_basis_usd": state.last_basis_usd,
             "last_spot_price": state.last_spot_price,
             "last_perp_price": state.last_perp_price,

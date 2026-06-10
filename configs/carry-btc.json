@@ -16,6 +16,7 @@
   "basis_kill_pct": 0.01,
   "funding_on_threshold_annualised": 0.05,
   "trailing_window_samples": 270,
+  "_trailing_window_comment": "Intended 90d of 8h settlements. HONEST EFFECTIVE WINDOW: OKX's funding-rate-history page is capped at 100 rows and the runner does not paginate it, so the window holds min(270, 100) = 100 settlements (~33d). It is rebuilt WHOLESALE from settled history once per 8h settlement — never appended per 60s cycle (review 2026-06-09 #1).",
   "margin_ratio_alarm": 1.5,
   "legging_window_sec": 5,
   "rebalance_threshold_pct": 0.05,
