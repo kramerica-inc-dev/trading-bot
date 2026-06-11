@@ -35,7 +35,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/trading-bot/state/lanec
+# '-' = ignore-if-missing: namespace setup must not fail on a fresh box where
+# the dir doesn't exist yet — the privileged ExecStartPre creates it, and the
+# main ExecStart gets its own (later) namespace where the path then mounts rw.
+ReadWritePaths=-/opt/trading-bot/state/lanec
 
 [Install]
 WantedBy=multi-user.target
