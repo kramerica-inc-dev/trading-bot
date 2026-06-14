@@ -411,7 +411,7 @@ class TestRunSafetyOnce(unittest.TestCase):
             if stub.state_path.exists() else s0
         # bind the real methods under test (incl. the single-instance lock wrapper)
         for name in ("run_safety_once", "_run_safety_once", "_cycle_lock",
-                     "_read_equity", "_apply_circuit_breaker",
+                     "_read_equity", "_apply_circuit_breaker", "_maybe_delever",
                      "reconcile", "save_state", "write_health", "log"):
             setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
         # tripwire: rebalance/order paths must NOT be touched by the safety cycle

@@ -51,6 +51,9 @@ class XSState:
     last_funding_ts: Optional[str] = None         # last sim-funding accrual (HL runner)
     data_outage_streak: int = 0                   # consecutive insufficient/stale-data cycles
     equity_jump_streak: int = 0                   # consecutive suspicious equity-jump reads (HL runner)
+    catastrophe_streak: int = 0                   # consecutive confirming dd>=catastrophe reads (terminal-halt confirm-guard)
+    delever_active: bool = False                  # soft de-lever episode engaged (book trimmed between rebalances)
+    last_cb_state: str = "normal"                 # previous cycle's cb_state — detects terminal-halt→normal resume to re-anchor peak
     started_ts: Optional[str] = None
     last_rebalance_ts: Optional[str] = None
     last_cycle_ts: Optional[str] = None

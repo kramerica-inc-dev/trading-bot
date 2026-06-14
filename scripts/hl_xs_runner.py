@@ -73,6 +73,14 @@ class HLXSConfig:
     # via the manual op_halt path.
     catastrophe_drawdown_pct: float = 0.12
     catastrophe_intracycle_pct: float = 0.08
+    # The TERMINAL catastrophe halt is irreversible (manual clear only), so the
+    # slow drawdown-from-peak trigger must be CONFIRMED over this many consecutive
+    # reads before it fires — a single transient unified-margin mark under-read
+    # (the 2026-06-13 false trip) can't strand the book. The FAST intracycle
+    # trigger (a real flash crash) still fires immediately, no confirmation.
+    # 1 = legacy immediate behaviour. Mirrors equity_jump_confirm_cycles on the
+    # upside (that guard was asymmetric — upside confirmed, downside not).
+    catastrophe_confirm_cycles: int = 1
     # fast safety cadence: how often run_safety_once() checks equity/CB/reconcile
     # between the (slow) rebalances — so a live book isn't only seen hourly. 180s
     # tightens the window in which a fast move is caught (P0 #5); the cost is a
@@ -135,6 +143,9 @@ def load_config(path: str) -> HLXSConfig:
         raise ValueError(
             f"soft_delever_dd_pct must be in (0, {cfg.catastrophe_drawdown_pct}), "
             f"got {cfg.soft_delever_dd_pct!r}")
+    if cfg.catastrophe_confirm_cycles < 1:
+        raise ValueError(
+            f"catastrophe_confirm_cycles must be >= 1, got {cfg.catastrophe_confirm_cycles!r}")
     return cfg
 
 
@@ -166,7 +177,13 @@ class HLXSRunner:
     # -- persistence (same shape as xs_runner) -----------------------------
     def load_state(self) -> XSState:
         if self.state_path.exists():
-            return XSState.from_json(json.loads(self.state_path.read_text()))
+            s = XSState.from_json(json.loads(self.state_path.read_text()))
+            # catastrophe_streak counts CONSECUTIVE confirming reads within one
+            # uptime — a restart mid-confirm-sequence must not inherit a partial
+            # streak (a single post-restart read would then fire the terminal
+            # halt). Reset on every load; the persisted value is never trusted.
+            s.catastrophe_streak = 0
+            return s
         return XSState(cash=self.cfg.initial_capital, equity=self.cfg.initial_capital,
                        peak_equity=self.cfg.initial_capital,
                        started_ts=_utcnow().isoformat(), dry_run=not self.live_trading)
@@ -565,7 +582,10 @@ class HLXSRunner:
              "gross_exposure": self.cfg.gross_exposure,
              "leverage_verified": (getattr(self, "_leverage_verified", False)
                                    if self.live_trading else None),
-             "delever_active": getattr(self, "_delever_active", False),
+             # persisted episode flag (safety-cycle + rebalance de-lever share it),
+             # not the per-call _targets instance flag
+             "delever_active": s.delever_active,
+             "catastrophe_streak": s.catastrophe_streak,
              **extra}
         if self.live_trading:
             # margin_read_ok makes a flaky margin endpoint VISIBLE in health
@@ -725,6 +745,21 @@ class HLXSRunner:
                               "reason": f"suspicious equity jump ({eq:.0f} vs settled {ref:.0f}); holding"}
         s.equity_jump_streak = 0
         s.equity = eq
+        # Resume re-anchor: when a TERMINAL halt (catastrophe_halt / op_halt) has
+        # been manually cleared to "normal", the previous cycle's persisted
+        # last_cb_state is still terminal on this first post-clear read. Re-anchor
+        # peak to current equity (a stale pre-halt peak — e.g. 185.68 — would
+        # otherwise re-trip the breaker instantly) and clear every staleness
+        # counter, so the operator's clear is just `cb_state="normal"` and the
+        # resumed book starts from a clean baseline (it's flat — the halt
+        # flattened it). Does NOT touch the 25% auto-resume "halted" path.
+        if s.last_cb_state in ("catastrophe_halt", "op_halt") and s.cb_state == "normal":
+            s.peak_equity = eq
+            s.last_settled_equity = eq
+            s.catastrophe_streak = 0
+            s.delever_active = False
+            self.log({"action": "resume_reanchor", "from": s.last_cb_state,
+                      "equity": round(eq, 2)})
         if s.cycles_total == 1:                       # anchor peak to true starting equity
             s.peak_equity = s.equity
         if self.live_trading and s.equity < 5.0:      # live account not funded yet
@@ -761,16 +796,30 @@ class HLXSRunner:
             intracycle_drop = max(0.0, (prev_settled - s.equity) / prev_settled)
 
         # 1. catastrophe (terminal, non-auto-resuming) — checked first.
-        if s.cb_state != "catastrophe_halt" and (
-                dd >= cfg.catastrophe_drawdown_pct
-                or intracycle_drop >= cfg.catastrophe_intracycle_pct):
-            trigger = ("drawdown" if dd >= cfg.catastrophe_drawdown_pct else "intracycle")
-            s.cb_state = "catastrophe_halt"
-            flat = self.flatten_all() if self.live_trading else []
-            self.log({"action": "catastrophe_halt", "trigger": trigger,
-                      "drawdown_pct": round(dd * 100, 2),
-                      "intracycle_drop_pct": round(intracycle_drop * 100, 2),
-                      "flattened": flat})
+        #    Two triggers, treated asymmetrically:
+        #     - intracycle (real flash crash): fire IMMEDIATELY, no confirmation.
+        #     - drawdown-from-peak (slow bleed): CONFIRM over catastrophe_confirm_cycles
+        #       consecutive reads before this irreversible halt — a single transient
+        #       unified-margin mark under-read (the 2026-06-13 false trip, where the
+        #       flatten realised ~$170.84 vs the $163.30 trip-read) can't strand the
+        #       book. A sub-threshold read resets the streak.
+        if s.cb_state != "catastrophe_halt":
+            intracycle_trip = intracycle_drop >= cfg.catastrophe_intracycle_pct
+            if dd >= cfg.catastrophe_drawdown_pct:
+                s.catastrophe_streak += 1
+            else:
+                s.catastrophe_streak = 0
+            confirm = max(1, cfg.catastrophe_confirm_cycles)
+            drawdown_trip = s.catastrophe_streak >= confirm
+            if intracycle_trip or drawdown_trip:
+                trigger = "intracycle" if intracycle_trip else "drawdown"
+                s.cb_state = "catastrophe_halt"
+                s.catastrophe_streak = 0
+                flat = self.flatten_all() if self.live_trading else []
+                self.log({"action": "catastrophe_halt", "trigger": trigger,
+                          "drawdown_pct": round(dd * 100, 2),
+                          "intracycle_drop_pct": round(intracycle_drop * 100, 2),
+                          "confirm_cycles": confirm, "flattened": flat})
 
         # 2. the auto-resuming 25% drawdown breaker. On a NEW halt, FLATTEN.
         if dd >= cfg.halt_drawdown_pct and s.cb_state not in (
@@ -789,13 +838,63 @@ class HLXSRunner:
             else:
                 if self.live_trading:                 # keep the book flat while halted
                     self.flatten_all()
+                s.last_cb_state = s.cb_state           # carry terminal state → resume re-anchor
                 self.save_state(s)
                 self.write_health(s, {"last_action": "halted", "cb_state": s.cb_state,
                                       "drawdown_pct": round(dd * 100, 2)})
                 return {"action": "halted", "cb_state": s.cb_state,
                         "drawdown_pct": round(dd * 100, 2)}
         s.last_settled_equity = s.equity              # record the accepted settled equity
+        s.last_cb_state = s.cb_state                  # for next cycle's resume-transition check
         return None
+
+    # -- soft de-lever (between-rebalance protection) ----------------------
+    def _maybe_delever(self, s: XSState, dd: float) -> Optional[dict]:
+        """When drawdown enters the soft band, trim the LIVE book by
+        (1 - soft_delever_factor) ONCE per episode so a slide is cut down before
+        it can reach the terminal catastrophe line. The safety cycle runs every
+        safety_interval_sec — far more often than the rebalance cadence — so this
+        closes the gap the rebalance-time de-lever in _targets left open (it could
+        only act every rebal_days; the 2026-06-13 bleed crossed 6%→12% between
+        rebalances with no cushion). Re-leveraging happens only at the next
+        scheduled rebalance (no churn). Proportional trim preserves dollar-
+        neutrality and can never flip a leg (factor in [0,1]). No-op in sim,
+        when disabled, already de-levered, flat, or not in the normal state."""
+        sdd = self.cfg.soft_delever_dd_pct
+        if sdd is None or sdd <= 0:
+            return None
+        if s.delever_active and dd < sdd * 0.5:        # hysteresis → episode over
+            s.delever_active = False
+            self.log({"action": "delever_clear", "dd_pct": round(dd * 100, 2)})
+        if (not self.live_trading or s.cb_state != "normal"
+                or dd < sdd or s.delever_active):
+            return None
+        factor = min(max(self.cfg.soft_delever_factor, 0.0), 1.0)
+        try:
+            book = self.adapter.book_notional()
+        except Exception as e:
+            self.log({"action": "delever_skip", "reason": f"book read failed: {e}"})
+            return None
+        orders = []
+        for coin, notional in book.items():
+            if abs(notional) < self.adapter.MIN_ORDER_USD:
+                continue
+            reduce_usd = abs(notional) * (1.0 - factor)
+            if reduce_usd < self.adapter.MIN_ORDER_USD:
+                continue
+            # reduce a long by SELLING (is_buy=False), a short by BUYING; the
+            # reduce notional is < the held notional so a trim can never flip.
+            r = self.adapter.market_order_usd(
+                coin, notional < 0, reduce_usd, slippage=self.cfg.slippage,
+                cloid=self.adapter.make_cloid(
+                    f"{self.cfg.instance_name}|delever|{s.cycles_total}|{coin}"))
+            orders.append({"coin": coin, "reduce_usd": round(reduce_usd, 2),
+                           "ok": r.ok, "err": r.error})
+        s.delever_active = True
+        self.log({"action": "safety_delever", "dd_pct": round(dd * 100, 2),
+                  "factor": factor, "orders": orders})
+        return {"action": "safety_delever", "dd_pct": round(dd * 100, 2),
+                "orders": orders}
 
     # -- single-instance lock ----------------------------------------------
     @contextmanager
@@ -844,9 +943,11 @@ class HLXSRunner:
 
     def _run_safety_once(self) -> dict:
         """The fast cadence: equity-read → drawdown/catastrophe/terminal breaker
-        → reconcile, WITHOUT rebalancing. Run every `safety_interval_sec` between
-        the (slow) full rebalances so a live book is checked far more often than
-        hourly. Places NO venue order except a flatten when a breaker trips."""
+        → soft de-lever → reconcile, WITHOUT rebalancing. Run every
+        `safety_interval_sec` between the (slow) full rebalances so a live book is
+        checked — and trimmed in a drawdown — far more often than hourly. Places
+        NO venue order except a flatten when a breaker trips or a one-shot trim
+        when drawdown enters the soft de-lever band."""
         cfg = self.cfg
         s = self.load_state()
         now = _utcnow()
@@ -860,6 +961,8 @@ class HLXSRunner:
         sc = self._apply_circuit_breaker(s, dd)
         if sc is not None:
             return sc
+
+        self._maybe_delever(s, dd)        # between-rebalance drawdown protection
 
         rec = self.reconcile(s, None)
         if not rec["ok"]:
@@ -971,7 +1074,15 @@ class HLXSRunner:
                     self.log({"action": "rebalance_halt", "book": result.get("book")})
                 elif result.get("complete", True):
                     s.last_rebalance_ts = now.isoformat()   # advance only on a complete rebalance
+            # the rebalance just sized the fresh book ×factor when in the band
+            # (via _targets); persist that episode flag so the safety cycle's
+            # _maybe_delever neither double-trims nor re-levers before recovery.
+            s.delever_active = bool(getattr(self, "_delever_active", False))
             self.log(result)
+        else:
+            # no rebalance due → the safety-path trim is the only between-cadence
+            # cushion; run it on the hourly full cycle too (it self-gates).
+            self._maybe_delever(s, dd)
 
         eq2 = self.equity(s, mids)
         if self._accept_post_trade_equity(s.equity, eq2, result):
