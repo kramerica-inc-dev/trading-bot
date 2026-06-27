@@ -16,9 +16,21 @@ live book is risky (races the runner, double-closes). The opt-in
 when the health is stale AND positions actually exist, so the safe default can
 never produce a false-positive flatten.
 
+Two hardening guards make the flatten safe against the 2026-06-20 race (a
+blocking call hung the runner → health went stale → the watchdog flattened on
+recovery, before the runner self-healed):
+  * CONFIRM-CYCLES (`--stale-confirm-count`, default 2): the stale state must
+    persist across N consecutive checks before a flatten — a single stale read
+    that self-heals is ignored. The streak persists in watchdog.state.json.
+  * MAINTENANCE: a `MAINTENANCE` sentinel in the instance dir (or the runner's
+    own health `liveness.maintenance` flag) suppresses the flatten entirely, for
+    planned gateway/runner outages. The decoupled heartbeat (hl_runner_async)
+    also means a stale `ts` now reflects real PROCESS death, not a slow cycle.
+
 Usage (one-shot; drive on a cadence from a systemd .timer):
     python -m scripts.hl_watchdog --instance mainnet --min-equity-usd 40
-    python -m scripts.hl_watchdog --instance mainnet --min-equity-usd 40 --flatten-on-stale
+    python -m scripts.hl_watchdog --instance mainnet --min-equity-usd 40 \
+        --flatten-on-stale --stale-confirm-count 2
 """
 
 from __future__ import annotations
@@ -88,21 +100,51 @@ def evaluate(health: Optional[dict], health_path: Path, *, stale_after_sec: floa
 class Watchdog:
     def __init__(self, instance: str, *, stale_after_sec: float = 900.0,
                  min_equity_usd: Optional[float] = None, flatten_on_stale: bool = False,
-                 state_root: Path = STATE_ROOT, notify: bool = False):
+                 state_root: Path = STATE_ROOT, notify: bool = False,
+                 confirm_count: int = 2):
         self.instance = instance
         self.stale_after_sec = stale_after_sec
         self.min_equity_usd = min_equity_usd
         self.flatten_on_stale = flatten_on_stale
+        self.confirm_count = max(1, int(confirm_count))
         self.notify = notify
         self.dir = state_root / instance
         self.health_path = self.dir / "health.json"
         self.events_path = self.dir / "watchdog.events.jsonl"
+        # Confirm-cycle streak persists across one-shot invocations; MAINTENANCE
+        # sentinel suppresses flatten during planned outages.
+        self.wd_state_path = self.dir / "watchdog.state.json"
+        self.maint_path = self.dir / "MAINTENANCE"
 
     def read_health(self) -> Optional[dict]:
         try:
             return json.loads(self.health_path.read_text())
         except (OSError, ValueError):
             return None
+
+    def _read_streak(self) -> int:
+        try:
+            return int(json.loads(self.wd_state_path.read_text()).get("stale_streak", 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return 0
+
+    def _write_streak(self, n: int) -> None:
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.wd_state_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"stale_streak": n, "ts": _utcnow().isoformat()}))
+            tmp.replace(self.wd_state_path)
+        except OSError:
+            pass
+
+    def _in_maintenance(self, health: Optional[dict]) -> bool:
+        """A planned outage: either an operator-dropped MAINTENANCE sentinel in
+        the instance dir, or the runner's own health liveness.maintenance flag.
+        Suppresses flatten so a deliberate gateway/runner restart can't trip it."""
+        if self.maint_path.exists():
+            return True
+        live = (health or {}).get("liveness") or {}
+        return bool(live.get("maintenance"))
 
     def emit(self, event: dict) -> None:
         """Append to the JSONL event log AND print to stderr (the journal)."""
@@ -199,13 +241,37 @@ class Watchdog:
 
     def check_once(self) -> dict:
         health = self.read_health()
+        maintenance = self._in_maintenance(health)
         alerts = evaluate(health, self.health_path, stale_after_sec=self.stale_after_sec,
                           min_equity_usd=self.min_equity_usd)
+        is_stale = any(a["kind"] == "stale" for a in alerts)
+
+        # Confirm-cycles: a flatten requires the stale state to PERSIST across
+        # `confirm_count` consecutive checks. A single stale read — a transient
+        # hang that self-heals, which is exactly the 2026-06-20 false-positive
+        # flatten — must NOT act. Maintenance freezes the streak (planned outage).
+        if maintenance or not is_stale:
+            streak = 0
+        else:
+            streak = self._read_streak() + 1
+        self._write_streak(streak)
+
         for a in alerts:
-            self.emit({"kind": "alert", **a})
-        flatten = self.maybe_flatten(alerts) if alerts else None
+            self.emit({"kind": "alert", "stale_streak": streak,
+                       "maintenance": maintenance, **a})
+
+        flatten = None
+        if is_stale and self.flatten_on_stale:
+            if maintenance:
+                self.emit({"kind": "flatten_suppressed",
+                           "reason": "maintenance flag set", "stale_streak": streak})
+            elif streak < self.confirm_count:
+                self.emit({"kind": "flatten_deferred", "stale_streak": streak,
+                           "reason": f"stale streak {streak} < confirm {self.confirm_count}"})
+            else:
+                flatten = self.maybe_flatten(alerts)
         return {"instance": self.instance, "alerts": alerts, "flatten": flatten,
-                "ok": not alerts}
+                "stale_streak": streak, "maintenance": maintenance, "ok": not alerts}
 
 
 def main() -> int:
@@ -222,12 +288,15 @@ def main() -> int:
                     help="alert if health equity falls below this floor")
     ap.add_argument("--flatten-on-stale", action="store_true",
                     help="opt-in: flatten via HLAdapter when stale AND positions exist")
+    ap.add_argument("--stale-confirm-count", type=int, default=2,
+                    help="consecutive stale checks required before a flatten "
+                         "(confirm-cycles; 1 = act on first stale)")
     ap.add_argument("--notify", action="store_true",
                     help="push alerts via Telegram (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID env)")
     args = ap.parse_args()
     wd = Watchdog(args.instance, stale_after_sec=args.stale_after_sec,
                   min_equity_usd=args.min_equity_usd, flatten_on_stale=args.flatten_on_stale,
-                  notify=args.notify)
+                  notify=args.notify, confirm_count=args.stale_confirm_count)
     r = wd.check_once()
     print(json.dumps(r, indent=2))
     return 0

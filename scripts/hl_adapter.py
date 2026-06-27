@@ -24,8 +24,10 @@ Self-test (no funds needed — proves data + signing end-to-end on testnet):
 from __future__ import annotations
 
 import argparse
+import functools
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -48,6 +50,16 @@ from mode_gate import (  # noqa: E402,F401
 )
 
 
+# (connect, read) seconds passed straight to requests via the SDK. A bounded
+# read timeout converts an INDEFINITE hang — the 2026-06-20 outage mechanism: a
+# blocking POST during a gateway outage freezes the loop → health.json goes
+# stale → the watchdog emergency-flattens on recovery — into a catchable
+# exception that the transient-skip read paths (account_value→None, all_mids→{})
+# already handle as "no data, skip this cycle". None reverts to the SDK default
+# (no timeout); do NOT run production with None.
+_DEFAULT_TIMEOUT = (5.0, 10.0)
+
+
 def _mask(addr: Optional[str]) -> str:
     return f"{addr[:6]}…{addr[-4:]}" if addr and len(addr) > 12 else str(addr)
 
@@ -61,23 +73,112 @@ class HLOrderResult:
     error: Optional[str] = None
 
 
+class _LatencyRing:
+    """Bounded in-memory ring of recent network-call latencies, split read
+    (via /info) vs write (via /exchange). Pure observability substrate: every
+    SDK read/write funnels through a single API.post chokepoint, so wrapping
+    that one method captures the whole latency picture. Single-process, GIL-
+    bound appends; read with samples()/summary(). Cheap enough to leave on in
+    production health, and the baseline contract for the latency probe."""
+
+    __slots__ = ("_buf",)
+
+    def __init__(self, maxlen: int = 4096):
+        self._buf: "deque[dict]" = deque(maxlen=maxlen)
+
+    def record(self, side: str, url_path: str, elapsed_ms: float, ok: bool, t_wall: float) -> None:
+        self._buf.append({"t": t_wall, "side": side, "path": url_path,
+                          "ms": round(elapsed_ms, 3), "ok": ok})
+
+    def samples(self) -> List[dict]:
+        return list(self._buf)
+
+    def summary(self) -> Dict[str, dict]:
+        samples = list(self._buf)
+        out: Dict[str, dict] = {}
+        for side in ("read", "write"):
+            xs = [s["ms"] for s in samples if s["side"] == side]
+            if not xs:
+                out[side] = {"n": 0}
+                continue
+            a = np.asarray(xs, dtype=float)
+            out[side] = {
+                "n": len(xs),
+                "p50": round(float(np.percentile(a, 50)), 3),
+                "p95": round(float(np.percentile(a, 95)), 3),
+                "p99": round(float(np.percentile(a, 99)), 3),
+                "max": round(float(a.max()), 3),
+                "errs": sum(1 for s in samples if s["side"] == side and not s["ok"]),
+            }
+        return out
+
+
 class HLAdapter:
     """Thin, guarded wrapper over the Hyperliquid SDK (Info + Exchange)."""
 
     def __init__(self, *, network: str = "testnet", private_key: Optional[str] = None,
-                 account_address: Optional[str] = None, allow_live: bool = False):
+                 account_address: Optional[str] = None, allow_live: bool = False,
+                 timeout: Optional[tuple] = _DEFAULT_TIMEOUT):
         self.network = network
         self.allow_live = allow_live
+        self.timeout = timeout
         self.mode = resolve_hl_mode(network, allow_live)
         self.base_url = (constants.TESTNET_API_URL if network == "testnet"
                          else constants.MAINNET_API_URL)
-        self.info = Info(self.base_url, skip_ws=True)
+        self.info = Info(self.base_url, skip_ws=True, timeout=timeout)
         self.wallet = eth_account.Account.from_key(private_key) if private_key else None
         self.address = account_address or (self.wallet.address if self.wallet else None)
-        self.exchange = (Exchange(self.wallet, self.base_url, account_address=self.address)
+        self.exchange = (Exchange(self.wallet, self.base_url, account_address=self.address,
+                                  timeout=timeout)
                          if self.wallet else None)
         self._meta_cache: Optional[dict] = None
         self._spot_meta_cache: Optional[dict] = None
+        self._latency = _LatencyRing()
+        self._instrument_latency()
+
+    # --------------------------------------------------------- instrumentation
+    def _instrument_latency(self) -> None:
+        """Wrap the single API.post chokepoint on the Info (reads, /info) and
+        Exchange (writes, /exchange) instances to time every call into the
+        latency ring. Pure instrumentation: the wrapper returns the original
+        result and re-raises the original exception unchanged — only timing is
+        added. Idempotent guard via the `_lat_wrapped` marker so a re-init can't
+        double-wrap and inflate counts."""
+        def _wrap(obj, side: str) -> None:
+            if obj is None or getattr(obj, "_lat_wrapped", False):
+                return
+            original = obj.post
+            ring = self._latency
+
+            @functools.wraps(original)
+            def post(url_path, payload=None):
+                t_wall = time.time()
+                t0 = time.perf_counter()
+                ok = True
+                try:
+                    return original(url_path, payload)
+                except Exception:
+                    ok = False
+                    raise
+                finally:
+                    ring.record(side, url_path, (time.perf_counter() - t0) * 1000.0, ok, t_wall)
+
+            obj.post = post
+            obj._lat_wrapped = True
+
+        _wrap(self.info, "read")
+        _wrap(self.exchange, "write")
+
+    def latency_samples(self) -> List[dict]:
+        """Recent per-call network latencies (read via /info, write via
+        /exchange) as raw event dicts — for health export / JSONL dumps."""
+        return self._latency.samples()
+
+    def latency_summary(self) -> Dict[str, dict]:
+        """p50/p95/p99/max (ms) over the latency ring, split read vs write.
+        Read-side ≈ market-data freshness cost; write-side ≈ HL order-inclusion
+        floor (~200ms+). The before/after contract for the WS migration."""
+        return self._latency.summary()
 
     # ------------------------------------------------------------------ reads
     def meta(self) -> dict:

@@ -4,8 +4,12 @@ requests>=2.28.0
 numpy>=1.24.0
 pandas>=1.5.0
 
-# Optional: WebSocket market data stream
+# WebSocket market-data stream — required by the event-driven runner's WS feed
+# (scripts/hl_ws_feed.py, scripts/hl_runner_async.py) and the latency probe.
 websocket-client>=1.8.0
+# Explicit CA bundle for the WS TLS trust store (also pulled in by requests);
+# the WS feed pins this so it never fails on an unconfigured system CA store.
+certifi>=2023.7.22
 
 # Optional: For better logging
 # colorama>=0.4.6

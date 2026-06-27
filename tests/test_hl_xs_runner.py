@@ -209,6 +209,7 @@ class TestHealthLivePositions(unittest.TestCase):
 
     def _write_and_read(self, stub, s):
         import json
+        stub._health_payload = types.MethodType(R.HLXSRunner._health_payload, stub)
         R.HLXSRunner.write_health(stub, s, {"last_action": "rebalance"})
         return json.loads((stub.health_path).read_text())
 
@@ -311,6 +312,7 @@ class TestCatastropheBreaker(unittest.TestCase):
         stub.equity = lambda st, mids: st.equity        # echo the seeded settled equity
         stub.skips_total = 0
         stub.save_state = types.MethodType(R.HLXSRunner.save_state, stub)
+        stub._health_payload = types.MethodType(R.HLXSRunner._health_payload, stub)
         stub.write_health = types.MethodType(R.HLXSRunner.write_health, stub)
         return stub
 
@@ -412,7 +414,7 @@ class TestRunSafetyOnce(unittest.TestCase):
         # bind the real methods under test (incl. the single-instance lock wrapper)
         for name in ("run_safety_once", "_run_safety_once", "_cycle_lock",
                      "_read_equity", "_apply_circuit_breaker", "_maybe_delever",
-                     "reconcile", "save_state", "write_health", "log"):
+                     "reconcile", "save_state", "write_health", "_health_payload", "log"):
             setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
         # tripwire: rebalance/order paths must NOT be touched by the safety cycle
         stub._execute_live = lambda *a, **k: stub._rebal_calls.append("live")
@@ -657,7 +659,7 @@ class TestDataOutage(unittest.TestCase):
             adapter=types.SimpleNamespace(book_notional=lambda: (book or {}),
                                           MIN_ORDER_USD=10.0, wallet=object(), address="0xM"))
         stub.flatten_all = lambda: (flat.append(True) or [{"act": "flatten"}])
-        for name in ("_handle_data_outage", "save_state", "write_health", "log"):
+        for name in ("_handle_data_outage", "save_state", "write_health", "_health_payload", "log"):
             setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
         return stub
 
@@ -719,7 +721,7 @@ class TestEquityJumpGuard(unittest.TestCase):
             adapter=types.SimpleNamespace(wallet=object(), address="0xM",
                                           book_notional=lambda: {}, MIN_ORDER_USD=10.0))
         stub.equity = lambda st, mids: eq
-        for name in ("_read_equity", "save_state", "write_health"):
+        for name in ("_read_equity", "save_state", "write_health", "_health_payload"):
             setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
         return stub
 

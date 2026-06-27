@@ -110,14 +110,15 @@ class TestWatchdogFlattenOptIn(unittest.TestCase):
     """--flatten-on-stale: only flattens when stale AND positions exist; the
     adapter is mocked so no network/credentials are needed."""
 
-    def _wd(self, health, positions, *, flatten=True):
+    def _wd(self, health, positions, *, flatten=True, confirm_count=1):
         root = Path(tempfile.mkdtemp())
         d = root / "mainnet"
         d.mkdir(parents=True)
         if health is not None:
             (d / "health.json").write_text(json.dumps(health))
         wd = W.Watchdog("mainnet", stale_after_sec=900, min_equity_usd=40,
-                        flatten_on_stale=flatten, state_root=root)
+                        flatten_on_stale=flatten, state_root=root,
+                        confirm_count=confirm_count)
         closes = []
         remaining = dict(positions)
         def _close(coin):
@@ -168,6 +169,83 @@ class TestWatchdogFlattenOptIn(unittest.TestCase):
         wd = self._wd({"ts": _iso(old), "equity": 50.0},
                       positions={"BTC": {"szi": 0.01}}, flatten=False)
         r = wd.check_once()
+        self.assertIsNone(r["flatten"])
+        self.assertEqual(wd._closed, [])
+
+
+class TestWatchdogConfirmCycles(unittest.TestCase):
+    """Confirm-cycles + maintenance hardening against the 2026-06-20 race."""
+
+    def _wd(self, health, positions, *, confirm_count=2, maintenance=False):
+        root = Path(tempfile.mkdtemp())
+        d = root / "mainnet"
+        d.mkdir(parents=True)
+        if health is not None:
+            (d / "health.json").write_text(json.dumps(health))
+        if maintenance:
+            (d / "MAINTENANCE").write_text("planned")
+        wd = W.Watchdog("mainnet", stale_after_sec=900, min_equity_usd=40,
+                        flatten_on_stale=True, state_root=root, confirm_count=confirm_count)
+        remaining = dict(positions)
+        closes = []
+        def _close(coin):
+            closes.append(coin); remaining.pop(coin, None)
+            return types.SimpleNamespace(ok=True, error=None)
+        wd._make_adapter = lambda: types.SimpleNamespace(
+            positions=lambda: dict(remaining), close=_close)
+        wd._closed = closes
+        return wd
+
+    def _stale_health(self):
+        old = datetime.now(timezone.utc) - timedelta(seconds=2000)
+        return {"ts": _iso(old), "equity": 50.0}
+
+    def test_single_stale_does_not_flatten_with_confirm_2(self):
+        wd = self._wd(self._stale_health(), {"BTC": {"szi": 0.01}}, confirm_count=2)
+        r = wd.check_once()                                   # first stale -> defer
+        self.assertEqual(r["stale_streak"], 1)
+        self.assertIsNone(r["flatten"])
+        self.assertEqual(wd._closed, [])
+
+    def test_two_consecutive_stale_flattens(self):
+        wd = self._wd(self._stale_health(), {"BTC": {"szi": 0.01}}, confirm_count=2)
+        wd.check_once()                                       # streak 1 -> defer
+        r = wd.check_once()                                   # streak 2 -> act
+        self.assertEqual(r["stale_streak"], 2)
+        self.assertIsNotNone(r["flatten"])
+        self.assertTrue(r["flatten"]["acted"])
+        self.assertEqual(wd._closed, ["BTC"])
+
+    def test_recovery_resets_streak(self):
+        wd = self._wd(self._stale_health(), {"BTC": {"szi": 0.01}}, confirm_count=2)
+        wd.check_once()                                       # streak 1
+        # runner recovers: write fresh health -> not stale -> streak resets
+        (wd.dir / "health.json").write_text(json.dumps(
+            {"ts": _iso(datetime.now(timezone.utc)), "equity": 50.0}))
+        r = wd.check_once()
+        self.assertEqual(r["stale_streak"], 0)
+        # back to stale: must start the streak over, NOT flatten on this single read
+        (wd.dir / "health.json").write_text(json.dumps(self._stale_health()))
+        r = wd.check_once()
+        self.assertEqual(r["stale_streak"], 1)
+        self.assertIsNone(r["flatten"])
+        self.assertEqual(wd._closed, [])
+
+    def test_maintenance_suppresses_flatten(self):
+        wd = self._wd(self._stale_health(), {"BTC": {"szi": 0.01}},
+                      confirm_count=1, maintenance=True)
+        r = wd.check_once()                                   # stale + would-flatten…
+        self.assertTrue(r["maintenance"])
+        self.assertEqual(r["stale_streak"], 0)                # frozen during maintenance
+        self.assertIsNone(r["flatten"])                       # …but suppressed
+        self.assertEqual(wd._closed, [])
+
+    def test_maintenance_via_health_liveness_flag(self):
+        h = self._stale_health()
+        h["liveness"] = {"maintenance": True}
+        wd = self._wd(h, {"BTC": {"szi": 0.01}}, confirm_count=1)
+        r = wd.check_once()
+        self.assertTrue(r["maintenance"])
         self.assertIsNone(r["flatten"])
         self.assertEqual(wd._closed, [])
 

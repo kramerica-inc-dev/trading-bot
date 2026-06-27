@@ -552,7 +552,10 @@ class HLXSRunner:
         return {"ok": not errs, "errors": errs}
 
     # -- health ------------------------------------------------------------
-    def write_health(self, s: XSState, extra: dict) -> None:
+    def _health_payload(self, s: XSState, extra: dict) -> dict:
+        """Build the health dict (split out from write_health so the async
+        runner can capture the payload and let its decoupled heartbeat be the
+        single writer — keeping ts fresh independent of cycle I/O). No file I/O."""
         dd = (s.peak_equity - s.equity) / s.peak_equity if s.peak_equity > 0 else 0.0
         # In live mode the book lives on-venue (s.positions is only the sim dict),
         # so report the real held-leg count — the dashboard must not show 0 legs
@@ -600,6 +603,10 @@ class HLXSRunner:
             except Exception:
                 pass
             h["margin_read_ok"] = margin_ok
+        return h
+
+    def write_health(self, s: XSState, extra: dict) -> None:
+        h = self._health_payload(s, extra)
         tmp = self.health_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(h, indent=2))
         tmp.replace(self.health_path)
