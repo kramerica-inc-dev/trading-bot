@@ -8,6 +8,7 @@ simulated rebalance accounting without constructing the (networked) adapter.
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 import unittest.mock
@@ -34,6 +35,27 @@ def _closes(finals):
         cl = np.ones(200); cl[-1] = 1.0 + f
         out[sym] = cl
     return out
+
+
+def _wire_venue(stub):
+    """Attach the venue-upgrade guard wiring (Layer 1-3) the way HLXSRunner.__init__
+    and the real adapter provide it, so a stub that reaches _read_equity /
+    flatten_all doesn't AttributeError on the new guards. Defaults model a HEALTHY
+    venue (no hold, fresh chain clock, not restricted) — preserving pre-guard
+    behaviour for the existing tests; the new tests override per case."""
+    if not hasattr(stub, "_venue_upgrade_until"):
+        stub._venue_upgrade_until = 0.0
+    for name in ("_in_upgrade_hold", "_venue_restricted"):
+        if not hasattr(stub, name):
+            setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
+    ad = stub.adapter
+    if not hasattr(ad, "exchange_status"):
+        ad.exchange_status = lambda: None
+    if not hasattr(ad, "last_account_age_s"):
+        ad.last_account_age_s = lambda: 0.0
+    if not hasattr(ad, "is_upgrade_reject"):
+        ad.is_upgrade_reject = R.HLAdapter.is_upgrade_reject
+    return stub
 
 
 @unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
@@ -203,9 +225,9 @@ class TestHealthLivePositions(unittest.TestCase):
     def _stub(self, tmp, live, book):
         adapter = types.SimpleNamespace(wallet=object(), address="0xMaster",
                                         book_notional=lambda: book, MIN_ORDER_USD=10.0)
-        return types.SimpleNamespace(cfg=R.HLXSConfig(), mode="TESTNET",
-                                     live_trading=live, adapter=adapter,
-                                     health_path=tmp / "health.json")
+        return _wire_venue(types.SimpleNamespace(cfg=R.HLXSConfig(), mode="TESTNET",
+                                                 live_trading=live, adapter=adapter,
+                                                 health_path=tmp / "health.json"))
 
     def _write_and_read(self, stub, s):
         import json
@@ -314,7 +336,7 @@ class TestCatastropheBreaker(unittest.TestCase):
         stub.save_state = types.MethodType(R.HLXSRunner.save_state, stub)
         stub._health_payload = types.MethodType(R.HLXSRunner._health_payload, stub)
         stub.write_health = types.MethodType(R.HLXSRunner.write_health, stub)
-        return stub
+        return _wire_venue(stub)
 
     def _cb(self, stub, s, dd):
         return R.HLXSRunner._apply_circuit_breaker(stub, s, dd)
@@ -419,7 +441,7 @@ class TestRunSafetyOnce(unittest.TestCase):
         # tripwire: rebalance/order paths must NOT be touched by the safety cycle
         stub._execute_live = lambda *a, **k: stub._rebal_calls.append("live")
         stub._execute_sim = lambda *a, **k: stub._rebal_calls.append("sim")
-        return stub
+        return _wire_venue(stub)
 
     def test_safety_no_rebalance_on_normal_book(self):
         stub = self._runner(live=True, equity=1000.0)
@@ -590,7 +612,7 @@ class TestFlattenAllHardened(unittest.TestCase):
             return types.SimpleNamespace(ok=True, error=None)
 
     def _stub(self, adapter):
-        return types.SimpleNamespace(adapter=adapter)
+        return _wire_venue(types.SimpleNamespace(cfg=R.HLXSConfig(), adapter=adapter))
 
     def test_unconfirmed_when_read_always_fails(self):
         ad = self._Adapter([RuntimeError("502")] * 3)
@@ -661,7 +683,7 @@ class TestDataOutage(unittest.TestCase):
         stub.flatten_all = lambda: (flat.append(True) or [{"act": "flatten"}])
         for name in ("_handle_data_outage", "save_state", "write_health", "_health_payload", "log"):
             setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
-        return stub
+        return _wire_venue(stub)
 
     def _state(self, streak=0, cb="normal"):
         return XSState(cash=900.0, equity=900.0, peak_equity=1000.0,
@@ -723,7 +745,7 @@ class TestEquityJumpGuard(unittest.TestCase):
         stub.equity = lambda st, mids: eq
         for name in ("_read_equity", "save_state", "write_health", "_health_payload"):
             setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
-        return stub
+        return _wire_venue(stub)
 
     def _state(self, settled=173.0):
         s = XSState(cash=173.0, equity=173.0, peak_equity=173.0, cycles_total=5)
@@ -914,7 +936,7 @@ class TestEquityDropGuard(unittest.TestCase):
         stub.equity = lambda st, mids: eq
         for name in ("_read_equity", "save_state", "write_health", "_health_payload"):
             setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
-        return stub
+        return _wire_venue(stub)
 
     def _state(self, settled=171.0):
         s = XSState(cash=171.0, equity=171.0, peak_equity=186.0, cycles_total=5)
@@ -993,6 +1015,133 @@ class TestRegimeShiftAlert(unittest.TestCase):
 
     def test_no_alert_when_disabled(self):
         self.assertEqual(self._run({"label": "a"}, {"label": "b"}, alerts_on=False), [])
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestVenueAdapterHelpers(unittest.TestCase):
+    """Adapter-level primitives for the venue-upgrade guards (pure, network-free)."""
+
+    def test_is_upgrade_reject_matches_post_only_window(self):
+        f = R.HLAdapter.is_upgrade_reject
+        self.assertTrue(f("Only post-only orders allowed immediately after a network upgrade"))
+        self.assertTrue(f("Only post-only orders allowed immediately after network upgrade"))
+        self.assertTrue(f("POST-ONLY required after UPGRADE"))
+
+    def test_is_upgrade_reject_ignores_other_errors(self):
+        f = R.HLAdapter.is_upgrade_reject
+        self.assertFalse(f(None))
+        self.assertFalse(f(""))
+        self.assertFalse(f("insufficient margin"))
+        self.assertFalse(f("post-only rejected (would cross)"))   # post-only but not an upgrade
+
+    def test_last_account_age_s(self):
+        age = R.HLAdapter.last_account_age_s
+        self.assertIsNone(age(types.SimpleNamespace(_last_av_time_ms=None)))
+        ns = types.SimpleNamespace(_last_av_time_ms=int(time.time() * 1000) - 5000)
+        self.assertAlmostEqual(age(ns), 5.0, delta=1.0)
+        # a server clock leading the local clock clamps at 0 (never negative)
+        ahead = types.SimpleNamespace(_last_av_time_ms=int(time.time() * 1000) + 3000)
+        self.assertEqual(age(ahead), 0.0)
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestVenueUpgradeGuards(unittest.TestCase):
+    """The 2026-06-29 venue-upgrade guards: a stale chain clock (Layer 1) or a
+    venue special-status (Layer 2) HOLDS a suspicious read instead of believing it
+    after the confirm window; a post-only order reject defers the flatten (Layer 3)."""
+
+    def _stub(self, eq, *, age=2.0, status=None, **over):
+        cfg = R.HLXSConfig(max_equity_drop_pct=0.50, equity_jump_confirm_cycles=3,
+                           max_account_staleness_sec=90.0, venue_upgrade_hold_sec=300.0,
+                           **over)
+        tmp = Path(tempfile.mkdtemp())
+        stub = types.SimpleNamespace(
+            cfg=cfg, live_trading=True, mode="MAINNET_LIVE",
+            health_path=tmp / "health.json", state_path=tmp / "state.json",
+            adapter=types.SimpleNamespace(
+                wallet=object(), address="0xM", book_notional=lambda: {}, MIN_ORDER_USD=10.0,
+                last_account_age_s=lambda: age, exchange_status=lambda: status,
+                is_upgrade_reject=R.HLAdapter.is_upgrade_reject))
+        stub.equity = lambda st, mids: eq
+        stub._venue_upgrade_until = 0.0
+        for name in ("_read_equity", "save_state", "write_health", "_health_payload",
+                     "_in_upgrade_hold", "_venue_restricted", "flatten_all"):
+            setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
+        return stub
+
+    def _state(self, settled=170.0, peak=186.0):
+        s = XSState(cash=170.0, equity=170.0, peak_equity=peak, cycles_total=5)
+        s.last_settled_equity = settled
+        return s
+
+    # -- Layer 1: chain-clock freshness ------------------------------------
+    def test_stale_account_read_skips_before_breaker(self):
+        stub = self._stub(eq=170.0, age=600.0)          # plausible value but 600s-stale clock
+        s = self._state()
+        dd, sc = stub._read_equity(s, {})
+        self.assertIsNone(dd)
+        self.assertIn("stale account read", sc["reason"])
+        self.assertEqual(s.equity, 170.0)               # never sized off the stale read
+
+    def test_fresh_account_read_passes(self):
+        stub = self._stub(eq=170.0, age=2.0)
+        s = self._state()
+        dd, sc = stub._read_equity(s, {})
+        self.assertIsNone(sc)
+        self.assertEqual(s.equity, 170.0)
+
+    # -- Layer 2: exchangeStatus corroboration -----------------------------
+    def test_drop_during_venue_upgrade_held_past_confirm(self):
+        # 86% "drop" + venue reports specialStatuses -> NEVER believed, even well
+        # past equity_jump_confirm_cycles=3 (the streak alone capitulated on 06-27)
+        stub = self._stub(eq=24.0, status={"specialStatuses": {"reason": "upgrade"}})
+        s = self._state(settled=170.0)
+        for _ in range(5):
+            dd, sc = stub._read_equity(s, {})
+            self.assertEqual(sc["action"], "skip")
+            self.assertIn("venue restricted", sc["reason"])
+        self.assertEqual(s.equity, 170.0)
+        self.assertNotEqual(s.cb_state, "catastrophe_halt")
+
+    def test_drop_with_healthy_venue_still_believed_after_n(self):
+        # same drop, venue healthy (exchange_status None) -> existing 3-cycle confirm applies
+        stub = self._stub(eq=24.0, status=None)
+        s = self._state(settled=170.0)
+        self.assertIsNotNone(stub._read_equity(s, {})[1])    # hold 1
+        self.assertIsNotNone(stub._read_equity(s, {})[1])    # hold 2
+        dd, sc = stub._read_equity(s, {})                    # 3rd -> believed (real loss)
+        self.assertIsNone(sc)
+        self.assertEqual(s.equity, 24.0)
+
+    def test_venue_restricted_on_stalled_status_time(self):
+        # specialStatuses null but the status `time` itself is stale -> restricted
+        stub = self._stub(eq=24.0,
+                          status={"specialStatuses": None,
+                                  "time": int(time.time() * 1000) - 600_000})
+        s = self._state(settled=170.0)
+        dd, sc = stub._read_equity(s, {})
+        self.assertEqual(sc["action"], "skip")
+        self.assertEqual(s.equity, 170.0)
+
+    # -- Layer 3: post-only flatten guard ----------------------------------
+    def test_flatten_all_deferred_during_hold(self):
+        stub = self._stub(eq=170.0)
+        stub._venue_upgrade_until = time.time() + 100        # inside the hold
+        called = []
+        stub.adapter.positions = lambda: called.append(True) or {}
+        out = stub.flatten_all()
+        self.assertFalse(called)                             # never even read the book
+        self.assertIn("upgrade hold", out[0]["err"])
+
+    def test_flatten_all_post_only_reject_arms_hold_and_skips_retry(self):
+        stub = self._stub(eq=170.0)
+        stub.adapter.positions = lambda: {"BTC": {}, "ETH": {}}
+        stub.adapter.close = lambda coin, **k: types.SimpleNamespace(
+            ok=False, error="Only post-only orders allowed immediately after a network upgrade")
+        out = stub.flatten_all()
+        self.assertGreater(stub._venue_upgrade_until, time.time())   # hold armed
+        self.assertTrue(any(o.get("act") == "flatten_deferred" for o in out))
+        self.assertFalse(any(o.get("act") == "flatten_retry" for o in out))   # no churn round
 
 
 if __name__ == "__main__":

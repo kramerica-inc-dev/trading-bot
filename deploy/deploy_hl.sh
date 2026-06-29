@@ -40,7 +40,8 @@ RESTART=1
 FILES=(scripts/hl_xs_runner.py scripts/hl_runner_async.py scripts/hl_ws_feed.py
        scripts/hl_nonce.py scripts/regime_tag.py scripts/hl_adapter.py
        scripts/hl_watchdog.py scripts/xs_core.py scripts/mode_gate.py scripts/notify.py
-       scripts/equity_sampler.py scripts/dashboard_api.py scripts/dashboard.html)
+       scripts/equity_sampler.py scripts/hl_status_probe.py
+       scripts/dashboard_api.py scripts/dashboard.html)
 
 echo "→ Target: $HOST:$REMOTE_DIR  (restart: $RESTART)"
 

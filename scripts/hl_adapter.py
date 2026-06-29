@@ -133,6 +133,7 @@ class HLAdapter:
                          if self.wallet else None)
         self._meta_cache: Optional[dict] = None
         self._spot_meta_cache: Optional[dict] = None
+        self._last_av_time_ms: Optional[int] = None   # chain `time` from the last account_value read (staleness gate)
         self._latency = _LatencyRing()
         self._instrument_latency()
 
@@ -422,6 +423,12 @@ class HLAdapter:
         for i in range(3):
             try:
                 st = self.info.user_state(self.address)
+                t = st.get("time")                    # L1 block time (ms) — for the staleness gate
+                if t is not None:
+                    try:
+                        self._last_av_time_ms = int(t)
+                    except (TypeError, ValueError):
+                        pass
                 ms = st.get("marginSummary")
                 if ms is None or "accountValue" not in ms:
                     time.sleep(0.4 * (i + 1)); continue
@@ -439,6 +446,38 @@ class HLAdapter:
             except Exception:
                 time.sleep(0.4 * (i + 1))
         return None
+
+    def last_account_age_s(self) -> Optional[float]:
+        """Wall-clock age (s) of the chain `time` carried by the last
+        account_value() read, or None if never read. HL's clearinghouseState
+        carries the L1 block `time`; during a network upgrade the chain halts and
+        this stops advancing, so a large age flags a stale/halted read even when
+        the returned numbers look plausible. Clamped at 0 (the server clock can
+        lead the local clock by a few hundred ms)."""
+        if self._last_av_time_ms is None:
+            return None
+        return max(0.0, time.time() - self._last_av_time_ms / 1000.0)
+
+    def exchange_status(self) -> Optional[dict]:
+        """The venue's operational status: {"specialStatuses": <marker|null>,
+        "time": <ms>}. `specialStatuses` is null in normal operation and carries a
+        marker during a restricted window (e.g. the post-only window right after a
+        network upgrade). Best-effort, weight-2 read: returns None on a read
+        failure so the caller treats 'unknown' as 'not restricted'."""
+        try:
+            return self.info.post("/info", {"type": "exchangeStatus"})
+        except Exception:
+            return None
+
+    @staticmethod
+    def is_upgrade_reject(err: Optional[str]) -> bool:
+        """True if an order error is HL's post-only-only window right after a
+        network upgrade ("Only post-only orders allowed immediately after a
+        network upgrade") — a transient venue-restricted state, NOT a bad order."""
+        if not err:
+            return False
+        e = err.lower()
+        return ("post-only" in e or "post only" in e) and "upgrade" in e
 
     def positions(self) -> Dict[str, dict]:
         """{coin: {szi, entry_px, unrealized_pnl}} for open perp positions.

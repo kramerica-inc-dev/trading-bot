@@ -185,12 +185,19 @@ class TestResumeReanchor(unittest.TestCase):
 
     def _stub(self, live=True):
         cfg = R.HLXSConfig()
-        stub = types.SimpleNamespace(cfg=cfg, live_trading=live, _logs=[])
+        # healthy-venue wiring for the 2026-06-29 upgrade guards (fresh chain clock,
+        # not restricted, no hold) so _read_equity exercises only the reanchor path
+        stub = types.SimpleNamespace(cfg=cfg, live_trading=live, _logs=[],
+                                     _venue_upgrade_until=0.0,
+                                     adapter=types.SimpleNamespace(
+                                         last_account_age_s=lambda: 0.0,
+                                         exchange_status=lambda: None))
         stub.log = lambda e: stub._logs.append(e)
         stub.save_state = lambda s: None
         stub.write_health = lambda s, extra: None
         stub.equity = lambda s, mids: stub._eq
-        stub._read_equity = types.MethodType(R.HLXSRunner._read_equity, stub)
+        for name in ("_read_equity", "_in_upgrade_hold", "_venue_restricted"):
+            setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
         return stub
 
     def test_reanchor_on_cleared_catastrophe(self):

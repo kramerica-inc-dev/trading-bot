@@ -116,6 +116,15 @@ class HLXSConfig:
     # 85.78% "drop" that instant-tripped the intracycle breaker). Held +
     # confirmed over equity_jump_confirm_cycles before it's believed. 0 disables.
     max_equity_drop_pct: float = 0.50
+    # --- Venue-upgrade / maintenance guards (HL L1 upgrades return garbage
+    # account reads AND open a post-only order window; root of the 2026-06-27
+    # false catastrophe). A stale chain clock or a venue special-status makes a
+    # read UNTRUSTABLE regardless of magnitude, so the runner HOLDS instead of
+    # believing it once the equity-drop confirm window runs out (the streak alone
+    # capitulated on 06-27). ---
+    max_account_staleness_sec: float = 90.0   # reject an account read whose chain `time` is older than this (0 disables)
+    venue_status_check: bool = True           # corroborate a suspicious drop with one exchangeStatus read
+    venue_upgrade_hold_sec: float = 300.0     # a post-only order reject arms an order-hold this long (0 disables)
     # --- Track 0 risk infra (leverage-ladder prerequisites) ---
     # Read-back verification of the per-coin leverage pin: until the pin is
     # CONFIRMED on the venue (activeAssetData read-back), any gross_exposure
@@ -177,6 +186,7 @@ class HLXSRunner:
         self._last_regime = None             # diagnostic regime tag (observability only; never trades)
         self._leverage_verified = False      # read-back-confirmed pin (gates gross>1.0)
         self._delever_active = False         # soft de-lever engaged on current targets
+        self._venue_upgrade_until = 0.0      # wall ts; while now < this, HL is in the post-only upgrade window → hold orders
         self.dir = STATE_ROOT / cfg.instance_name
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.dir / "state.json"
@@ -368,6 +378,12 @@ class HLXSRunner:
         Hardened (P0 #8): retry the positions read, then VERIFY the book is flat and
         re-close any straggler, so a breaker can never report a benign-looking
         'flattened' while a read failure actually left real positions open."""
+        # Post-only upgrade window (Layer 3): a flatten is rejected order-by-order
+        # here (the 2026-06-27 churn: 6 closes + 6 retries all rejected). Skip +
+        # hold; the caller's halt/cb state persists, so we re-attempt once it clears.
+        if self._in_upgrade_hold():
+            return [{"act": "flatten", "ok": False, "verified_flat": False,
+                     "err": "skipped: venue upgrade hold (post-only window)"}]
         coins = None
         last_err = None
         for i in range(3):
@@ -382,9 +398,20 @@ class HLXSRunner:
             return [{"act": "flatten", "ok": False, "verified_flat": False,
                      "err": f"positions read failed (UNCONFIRMED flatten): {last_err}"}]
         out = []
+        upgrade_rejects = 0
         for coin in coins:
             r = self.adapter.close(coin)
             out.append({"act": "flatten", "coin": coin, "ok": r.ok, "err": r.error})
+            if not r.ok and self.adapter.is_upgrade_reject(r.error):
+                upgrade_rejects += 1
+        # If closes were rejected by the post-only upgrade window, stop — the retry
+        # round would only churn more rejects. Arm the hold so subsequent cycles
+        # skip cleanly until it clears (the breaker/halt state itself persists).
+        if upgrade_rejects and self.cfg.venue_upgrade_hold_sec > 0:
+            self._venue_upgrade_until = time.time() + self.cfg.venue_upgrade_hold_sec
+            out.append({"act": "flatten_deferred", "reason": "venue upgrade (post-only) — holding",
+                        "rejects": upgrade_rejects, "hold_sec": self.cfg.venue_upgrade_hold_sec})
+            return out
         # verify flat; re-close any straggler once more, then report verified_flat
         try:
             remaining = list(self.adapter.positions().keys())
@@ -645,6 +672,11 @@ class HLXSRunner:
             except Exception:
                 pass
             h["margin_read_ok"] = margin_ok
+            # venue-upgrade guards — observability for the dashboard/watchdog
+            h["venue_upgrade_hold"] = self._in_upgrade_hold()
+            age = self.adapter.last_account_age_s()
+            if age is not None:
+                h["account_read_age_s"] = round(age, 1)
         if getattr(self, "_last_regime", None) is not None:
             h["regime"] = self._last_regime          # diagnostic tag (observability only)
         return h
@@ -768,6 +800,32 @@ class HLXSRunner:
     #   place. _read_equity returns (dd, short_circuit_result|None); a non-None
     #   result means the cycle must stop now (transient/unfunded skip). The
     #   helpers never place a venue order EXCEPT a flatten when a breaker trips.
+    def _in_upgrade_hold(self) -> bool:
+        """True while inside the post-only window HL opens right after a network
+        upgrade (armed by an order/flatten reject). Orders are rejected in this
+        window, so the runner holds rather than churning rejects."""
+        return (self.cfg.venue_upgrade_hold_sec > 0
+                and time.time() < self._venue_upgrade_until)
+
+    def _venue_restricted(self) -> bool:
+        """Best-effort authoritative check (one weight-2 exchangeStatus read):
+        True when HL reports a special status OR a stalled chain clock (an L1
+        upgrade in progress). Unknown / read error → False (never fabricate a
+        restriction from a status hiccup). Used to corroborate a suspicious equity
+        read so a network-upgrade artifact is HELD, not believed after N cycles."""
+        if not self.cfg.venue_status_check:
+            return False
+        es = self.adapter.exchange_status()
+        if not es:
+            return False
+        if es.get("specialStatuses"):
+            return True
+        t = es.get("time")
+        if (t is not None and self.cfg.max_account_staleness_sec > 0
+                and (time.time() - t / 1000.0) > self.cfg.max_account_staleness_sec):
+            return True
+        return False
+
     def _read_equity(self, s: XSState, mids: Dict[str, float]):
         """Read settled equity, apply the transient/unfunded guards, update
         peak + drawdown. Returns (dd, short_circuit_result|None)."""
@@ -777,6 +835,26 @@ class HLXSRunner:
             self.save_state(s)
             self.write_health(s, {"last_action": "skip", "reason": "account read transient"})
             return None, {"action": "skip", "reason": "transient account read failure"}
+        # Venue post-only upgrade window (Layer 3): account reads are unreliable
+        # here; hold the book (never act) until the window clears.
+        if self.live_trading and self._in_upgrade_hold():
+            s.skips_total += 1
+            self.save_state(s)
+            self.write_health(s, {"last_action": "skip", "reason": "venue upgrade hold (post-only window)"})
+            return None, {"action": "skip", "reason": "venue upgrade hold (post-only window)"}
+        # Chain-clock freshness gate (Layer 1 — root fix for the 2026-06-27 false
+        # catastrophe): clearinghouseState carries the L1 block `time`; during an
+        # upgrade it stops advancing. A stale read is UNTRUSTABLE no matter how
+        # plausible the number — reject it here so a frozen-garbage value never
+        # reaches the drop guard / breaker.
+        if self.live_trading and self.cfg.max_account_staleness_sec > 0:
+            age = self.adapter.last_account_age_s()
+            if age is not None and age > self.cfg.max_account_staleness_sec:
+                s.skips_total += 1
+                self.save_state(s)
+                self.write_health(s, {"last_action": "skip",
+                                      "reason": f"stale account read ({age:.0f}s; chain halted?)"})
+                return None, {"action": "skip", "reason": f"stale account read ({age:.0f}s)"}
         # Equity-jump guard (P0 #1/#11): a read absurdly ABOVE the last settled
         # equity is almost certainly a misread (unified perp/spot accounting glitch),
         # not a real gain — never size the book off it. A genuine DEPOSIT persists,
@@ -806,14 +884,21 @@ class HLXSRunner:
         if (ref is not None and ref > 0 and self.cfg.max_equity_drop_pct > 0
                 and eq < ref * (1.0 - self.cfg.max_equity_drop_pct)):
             s.equity_drop_streak += 1
-            if s.equity_drop_streak < self.cfg.equity_jump_confirm_cycles:
+            # Authoritative corroboration (Layer 2): if the venue itself reports a
+            # restricted / halted state, this "drop" is a network-upgrade artifact
+            # — HOLD indefinitely (never let the confirm-streak believe it). The
+            # streak alone capitulated after 3 cycles on 2026-06-27; this does not.
+            venue_suspect = self.live_trading and self._venue_restricted()
+            if venue_suspect or s.equity_drop_streak < self.cfg.equity_jump_confirm_cycles:
                 s.skips_total += 1
                 self.save_state(s)
-                self.write_health(s, {"last_action": "skip",
-                                      "reason": f"implausible equity drop {eq:.2f} vs settled {ref:.2f}",
-                                      "equity_drop_streak": s.equity_drop_streak})
-                return None, {"action": "skip",
-                              "reason": f"implausible equity drop ({eq:.2f} vs settled {ref:.2f}); holding"}
+                reason = f"implausible equity drop {eq:.2f} vs settled {ref:.2f}"
+                if venue_suspect:
+                    reason += " [venue restricted/halted]"
+                self.write_health(s, {"last_action": "skip", "reason": reason,
+                                      "equity_drop_streak": s.equity_drop_streak,
+                                      "venue_restricted": venue_suspect})
+                return None, {"action": "skip", "reason": reason + "; holding"}
         s.equity_drop_streak = 0
         s.equity = eq
         # Resume re-anchor: when a TERMINAL halt (catastrophe_halt / op_halt) has
@@ -1140,10 +1225,16 @@ class HLXSRunner:
                           else self._execute_sim(s, targets, mids, now))
                 s.rebalances_total += 1
                 if self.live_trading and not result.get("complete", True):
-                    # rebalance could not be completed — _execute_live already
-                    # flattened the book; halt for an operator (no churn loop).
-                    s.cb_state = "op_halt"
-                    self.log({"action": "rebalance_halt", "book": result.get("book")})
+                    if self._in_upgrade_hold():
+                        # incomplete because HL is in the post-only upgrade window —
+                        # hold (do NOT op_halt; the window clears in minutes and the
+                        # book intent is unchanged).
+                        self.log({"action": "rebalance_deferred", "reason": "venue upgrade hold"})
+                    else:
+                        # rebalance could not be completed — _execute_live already
+                        # flattened the book; halt for an operator (no churn loop).
+                        s.cb_state = "op_halt"
+                        self.log({"action": "rebalance_halt", "book": result.get("book")})
                 elif result.get("complete", True):
                     s.last_rebalance_ts = now.isoformat()   # advance only on a complete rebalance
             # the rebalance just sized the fresh book ×factor when in the band
