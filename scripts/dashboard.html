@@ -424,6 +424,7 @@
       <span id="hl-mode-pill" class="pill pill-accent">MAINNET_DRY</span>
       <span id="hl-live-pill" class="pill pill-dim">paper</span>
       <span id="hl-cb-pill" style="display:none" class="pill pill-red">HALTED</span>
+      <span id="hl-regime-pill" class="pill pill-dim" title="Diagnostic market-regime tag — observability only, does NOT gate or size the book (regime gating is a closed dead lane). Colour = favorability from the per-regime edge decomposition.">regime —</span>
       <span style="flex:1"></span>
       <span style="color:var(--text-dim)">Rebalances</span><span id="hl-rebalances" style="color:var(--text)">0</span>
       <span style="color:var(--text-dim)">·</span>
@@ -1439,6 +1440,23 @@ async function fetchHyperliquid() {
   set('hl-cycles', health.cycles_total != null ? health.cycles_total : 0);
   set('hl-last-rebal', health.last_rebalance_ts ? relTime(health.last_rebalance_ts) : '—');
   document.getElementById('hl-cb-pill').style.display = (health.cb_state === 'halted') ? 'inline-flex' : 'none';
+  // diagnostic regime tag (observability only — never gates/sizes)
+  const reg = health.regime;
+  const regPill = document.getElementById('hl-regime-pill');
+  if (regPill) {
+    if (reg && reg.label) {
+      regPill.className = 'pill ' + ({ strong: 'pill-green', neutral: 'pill-amber', adverse: 'pill-red' }[reg.favorability] || 'pill-dim');
+      regPill.textContent = 'regime: ' + reg.label + ' (' + (reg.favorability || '?') + ')';
+      const f = reg.features || {};
+      regPill.title = 'Diagnostic only — observability, no gating/sizing. BTC trend '
+        + (f.btc_trend_ret != null ? (f.btc_trend_ret * 100).toFixed(1) + '%' : '?')
+        + ' · xs-dispersion ' + (f.xs_dispersion != null ? f.xs_dispersion : '?')
+        + ' · in_distribution ' + reg.in_distribution;
+    } else {
+      regPill.className = 'pill pill-dim';
+      regPill.textContent = 'regime —';
+    }
+  }
   set('hl-equity', usd(health.equity));
   set('hl-dd', 'drawdown ' + (health.drawdown_pct != null ? health.drawdown_pct : 0) + '% · peak ' + usd(health.peak_equity));
   // real venue book + net-beta gauge + the momentum ranking that selected the legs

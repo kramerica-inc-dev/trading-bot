@@ -569,7 +569,28 @@ class HLXSRunner:
         Best-effort: a failure here never disturbs a cycle."""
         try:
             from regime_tag import compute_regime
+            prev = self._last_regime
             self._last_regime = compute_regime({c: closes[c] for c in closes})
+            self._maybe_alert_regime_shift(prev, self._last_regime)
+        except Exception:
+            pass
+
+    def _maybe_alert_regime_shift(self, prev, new) -> None:
+        """Telegram notification on a regime LABEL change — observability ONLY,
+        takes NO action (gating is the closed dead lane). No alert on the first
+        observation (prev=None) or when unchanged; gated to MAINNET_LIVE so
+        testnet/DRY can't spam, and to cfg.regime_shift_alerts. Best-effort."""
+        if not prev or prev.get("label") == new.get("label"):
+            return
+        if self.mode != MODE_MAINNET_LIVE or not getattr(self.cfg, "regime_shift_alerts", True):
+            return
+        try:
+            import notify
+            emoji = {"adverse": "🔴", "strong": "🟢", "neutral": "🟡"}.get(new.get("favorability"), "⚪")
+            notify.send(f"{emoji} regime shift [{self.cfg.instance_name}]: "
+                        f"{prev.get('label')} → {new.get('label')} "
+                        f"(favorability {new.get('favorability')}, in_dist={new.get('in_distribution')}). "
+                        f"Diagnostic only — no action taken.")
         except Exception:
             pass
 

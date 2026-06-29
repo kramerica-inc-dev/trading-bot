@@ -955,5 +955,45 @@ class TestEquityDropGuard(unittest.TestCase):
         self.assertEqual(s.equity, 24.0)
 
 
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestRegimeShiftAlert(unittest.TestCase):
+    """The regime Telegram alert fires only on a real label change, only on
+    MAINNET_LIVE, only when enabled — and never takes any action."""
+
+    def _run(self, prev, new, *, mode=None, alerts_on=True):
+        import notify
+        mode = mode if mode is not None else R.MODE_MAINNET_LIVE
+        sent = []
+        orig = notify.send
+        notify.send = lambda text, **k: (sent.append(text) or True)
+        try:
+            stub = types.SimpleNamespace(mode=mode, cfg=types.SimpleNamespace(
+                instance_name="mainnet", regime_shift_alerts=alerts_on))
+            stub._maybe_alert_regime_shift = types.MethodType(R.HLXSRunner._maybe_alert_regime_shift, stub)
+            stub._maybe_alert_regime_shift(prev, new)
+        finally:
+            notify.send = orig
+        return sent
+
+    def test_alert_on_label_change(self):
+        sent = self._run({"label": "bull_trend|high_disp"},
+                         {"label": "chop|high_disp", "favorability": "adverse", "in_distribution": False})
+        self.assertEqual(len(sent), 1)
+        self.assertIn("regime shift", sent[0])
+        self.assertIn("chop|high_disp", sent[0])
+
+    def test_no_alert_first_observation(self):
+        self.assertEqual(self._run(None, {"label": "x", "favorability": "neutral"}), [])
+
+    def test_no_alert_when_unchanged(self):
+        self.assertEqual(self._run({"label": "x"}, {"label": "x", "favorability": "neutral"}), [])
+
+    def test_no_alert_on_testnet(self):
+        self.assertEqual(self._run({"label": "a"}, {"label": "b"}, mode=R.MODE_TESTNET), [])
+
+    def test_no_alert_when_disabled(self):
+        self.assertEqual(self._run({"label": "a"}, {"label": "b"}, alerts_on=False), [])
+
+
 if __name__ == "__main__":
     unittest.main()
