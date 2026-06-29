@@ -174,6 +174,7 @@ class HLXSRunner:
                              and self.adapter.exchange is not None)
         self._force_rebalance = False        # set via --force-rebalance for a one-shot
         self._leverage_set = False           # per-process idempotent leverage pin
+        self._last_regime = None             # diagnostic regime tag (observability only; never trades)
         self._leverage_verified = False      # read-back-confirmed pin (gates gross>1.0)
         self._delever_active = False         # soft de-lever engaged on current targets
         self.dir = STATE_ROOT / cfg.instance_name
@@ -560,6 +561,18 @@ class HLXSRunner:
         return {"ok": not errs, "errors": errs}
 
     # -- health ------------------------------------------------------------
+    def _update_regime_tag(self, closes) -> None:
+        """Compute the DIAGNOSTIC market-regime label from the daily closes this
+        cycle already fetched, and stash it for health.json. Observability ONLY —
+        the result feeds NOTHING in the trading path (no targets, no exposure, no
+        gating; regime-gating is the closed dead lane per DECISIONS.md 2026-06-10).
+        Best-effort: a failure here never disturbs a cycle."""
+        try:
+            from regime_tag import compute_regime
+            self._last_regime = compute_regime({c: closes[c] for c in closes})
+        except Exception:
+            pass
+
     def _health_payload(self, s: XSState, extra: dict) -> dict:
         """Build the health dict (split out from write_health so the async
         runner can capture the payload and let its decoupled heartbeat be the
@@ -611,6 +624,8 @@ class HLXSRunner:
             except Exception:
                 pass
             h["margin_read_ok"] = margin_ok
+        if getattr(self, "_last_regime", None) is not None:
+            h["regime"] = self._last_regime          # diagnostic tag (observability only)
         return h
 
     def write_health(self, s: XSState, extra: dict) -> None:
@@ -1090,6 +1105,7 @@ class HLXSRunner:
         if data_bad:
             return self._handle_data_outage(s, closes, stale_h, mids)
         s.data_outage_streak = 0
+        self._update_regime_tag(closes)      # diagnostic only — never affects targets/exposure
 
         result = {"action": "noop"}
         targets = None
