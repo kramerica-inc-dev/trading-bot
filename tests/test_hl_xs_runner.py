@@ -895,5 +895,65 @@ class TestExecuteLiveCloidPartialFill(unittest.TestCase):
         self.assertFalse([o for o in ad.orders if "retry" in str(o.get("cloid"))])
 
 
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestEquityDropGuard(unittest.TestCase):
+    """Symmetric to the jump guard: an implausible single-cycle DROP is a likely
+    bad read (HL's garbage account value during a network upgrade — the
+    2026-06-27 false catastrophe, an 85.78% 'drop' that instant-tripped the
+    intracycle breaker). It must be HELD + confirmed, never instant-flattened."""
+
+    def _stub(self, eq, **over):
+        kw = {"max_equity_drop_pct": 0.50, "equity_jump_confirm_cycles": 3, **over}
+        cfg = R.HLXSConfig(**kw)
+        tmp = Path(tempfile.mkdtemp())
+        stub = types.SimpleNamespace(
+            cfg=cfg, live_trading=True, mode="MAINNET_LIVE",
+            health_path=tmp / "health.json", state_path=tmp / "state.json",
+            adapter=types.SimpleNamespace(wallet=object(), address="0xM",
+                                          book_notional=lambda: {}, MIN_ORDER_USD=10.0))
+        stub.equity = lambda st, mids: eq
+        for name in ("_read_equity", "save_state", "write_health", "_health_payload"):
+            setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
+        return stub
+
+    def _state(self, settled=171.0):
+        s = XSState(cash=171.0, equity=171.0, peak_equity=186.0, cycles_total=5)
+        s.last_settled_equity = settled
+        return s
+
+    def test_implausible_drop_held_not_accepted(self):
+        stub = self._stub(eq=24.0)               # 86% drop vs settled 171 (> 50%)
+        s = self._state()
+        dd, sc = stub._read_equity(s, {})
+        self.assertIsNone(dd)
+        self.assertIn("implausible equity drop", sc["reason"])
+        self.assertEqual(s.equity_drop_streak, 1)
+        self.assertEqual(s.equity, 171.0)        # NOT sized off the garbage read
+
+    def test_persistent_drop_confirmed_as_real(self):
+        stub = self._stub(eq=24.0)
+        s = self._state()
+        self.assertIsNotNone(stub._read_equity(s, {})[1])    # hold 1
+        self.assertIsNotNone(stub._read_equity(s, {})[1])    # hold 2
+        dd, sc = stub._read_equity(s, {})                    # 3rd -> confirmed real loss
+        self.assertIsNone(sc)
+        self.assertEqual(s.equity, 24.0)
+        self.assertEqual(s.equity_drop_streak, 0)
+
+    def test_plausible_drop_passes_through(self):
+        stub = self._stub(eq=160.0)              # 6.4% drop < 50% -> normal, breaker sees it
+        s = self._state()
+        dd, sc = stub._read_equity(s, {})
+        self.assertIsNone(sc)
+        self.assertEqual(s.equity, 160.0)
+
+    def test_disabled_when_pct_zero(self):
+        stub = self._stub(eq=24.0, max_equity_drop_pct=0.0)
+        s = self._state()
+        dd, sc = stub._read_equity(s, {})
+        self.assertIsNone(sc)                    # guard off -> passes through
+        self.assertEqual(s.equity, 24.0)
+
+
 if __name__ == "__main__":
     unittest.main()

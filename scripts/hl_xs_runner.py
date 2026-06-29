@@ -108,6 +108,14 @@ class HLXSConfig:
     # 0 disables. This is the scale-free alternative to a static max_gross_usd.
     max_equity_jump_factor: float = 3.0
     equity_jump_confirm_cycles: int = 3
+    # Equity-DROP sanity guard (symmetric to the jump guard): an account read
+    # implying a single-cycle drop > this fraction of the last settled equity is
+    # treated as a likely BAD READ — a dollar-neutral basket cannot lose this
+    # much in one cycle from market moves (e.g. the garbage account value HL
+    # returns DURING a network upgrade: the 2026-06-27 false catastrophe, an
+    # 85.78% "drop" that instant-tripped the intracycle breaker). Held +
+    # confirmed over equity_jump_confirm_cycles before it's believed. 0 disables.
+    max_equity_drop_pct: float = 0.50
     # --- Track 0 risk infra (leverage-ladder prerequisites) ---
     # Read-back verification of the per-coin leverage pin: until the pin is
     # CONFIRMED on the venue (activeAssetData read-back), any gross_exposure
@@ -751,6 +759,26 @@ class HLXSRunner:
                 return None, {"action": "skip",
                               "reason": f"suspicious equity jump ({eq:.0f} vs settled {ref:.0f}); holding"}
         s.equity_jump_streak = 0
+        # Symmetric equity-DROP guard: a read absurdly BELOW the last settled
+        # equity is almost certainly a bad read — a dollar-neutral basket can't
+        # lose this much in one cycle. The 2026-06-27 false catastrophe was an
+        # 85.78% "drop" from a garbage value HL returned during a network
+        # upgrade, which the intracycle breaker then flattened on (and the
+        # flatten was rejected by the post-only window). Hold + skip until
+        # confirmed over equity_jump_confirm_cycles; a genuine persistent drop
+        # (real loss) is then accepted and the breaker sees it normally.
+        if (ref is not None and ref > 0 and self.cfg.max_equity_drop_pct > 0
+                and eq < ref * (1.0 - self.cfg.max_equity_drop_pct)):
+            s.equity_drop_streak += 1
+            if s.equity_drop_streak < self.cfg.equity_jump_confirm_cycles:
+                s.skips_total += 1
+                self.save_state(s)
+                self.write_health(s, {"last_action": "skip",
+                                      "reason": f"implausible equity drop {eq:.2f} vs settled {ref:.2f}",
+                                      "equity_drop_streak": s.equity_drop_streak})
+                return None, {"action": "skip",
+                              "reason": f"implausible equity drop ({eq:.2f} vs settled {ref:.2f}); holding"}
+        s.equity_drop_streak = 0
         s.equity = eq
         # Resume re-anchor: when a TERMINAL halt (catastrophe_halt / op_halt) has
         # been manually cleared to "normal", the previous cycle's persisted
