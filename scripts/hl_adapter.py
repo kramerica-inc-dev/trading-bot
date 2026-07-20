@@ -339,12 +339,30 @@ class HLAdapter:
         the SDK universe name ("@N"/"PURR/USDC"). Prefers midPx, falls back to
         markPx (thin books often have no mid). Like all_mids(): an EMPTY dict
         means the feed is unavailable/degraded — callers must treat {} as
-        "no data", never as a genuine empty market."""
+        "no data", never as a genuine empty market.
+
+        Ctx association is by the ctx's own `coin` field (fallback: the
+        universe entry's `index` into the ctx list) — NEVER positional. The
+        spot universe list has gaps from delisted pairs, so a positional zip
+        pairs an entry with another pair's ctx (mainnet 2026-07-20: position
+        140 = @142 UBTC/USDC, but ctxs[140] belongs to @140 at $0.000068 —
+        the carry lane read that as its spot mid and alarmed basis-blowout
+        every cycle; testnet's gapless universe masked it)."""
         out: Dict[str, float] = {}
         try:
             sm, ctxs = self.info.spot_meta_and_asset_ctxs()
+            ctxs = ctxs or []
             tok = {t["index"]: t for t in sm.get("tokens", []) or []}
-            for u, ctx in zip(sm.get("universe", []) or [], ctxs or []):
+            ctx_by_coin = {c.get("coin"): c for c in ctxs
+                           if isinstance(c, dict)}
+            for u in sm.get("universe", []) or []:
+                ctx = ctx_by_coin.get(u.get("name"))
+                if ctx is None:
+                    try:
+                        idx = int(u["index"])
+                        ctx = ctxs[idx] if 0 <= idx < len(ctxs) else None
+                    except (KeyError, TypeError, ValueError):
+                        ctx = None
                 if not isinstance(ctx, dict):
                     continue
                 try:

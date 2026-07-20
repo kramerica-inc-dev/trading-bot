@@ -341,6 +341,21 @@ class TestSpotMids(unittest.TestCase):
         a = _spot_adapter(_FakeSpotInfo(ctxs=_ubtc_ctxs(mid=None, mark="64900.0")))
         self.assertAlmostEqual(a.spot_mids()["UBTC/USDC"], 64900.0)
 
+    def test_gapped_universe_matches_ctx_by_coin(self):
+        # Mainnet regression (2026-07-20): the spot universe list has gaps
+        # from delisted pairs, so ctxs do NOT align positionally with it. A
+        # positional zip paired UBTC/USDC (universe position 140, index 142)
+        # with @140's ctx and read $0.000068 as its spot mid — the carry lane
+        # then alarmed basis-blowout every cycle. Association must be by the
+        # ctx's own `coin` field.
+        ctxs = [{"coin": "@140", "midPx": "0.000068", "markPx": "0.000037"},
+                {"coin": "PURR/USDC", "midPx": "0.35", "markPx": "0.35"},
+                {"coin": "@142", "midPx": "64667.5", "markPx": "64667.0"}]
+        mids = _spot_adapter(_FakeSpotInfo(ctxs=ctxs)).spot_mids()
+        self.assertAlmostEqual(mids["UBTC/USDC"], 64667.5)
+        self.assertAlmostEqual(mids["@142"], 64667.5)
+        self.assertAlmostEqual(mids["PURR/USDC"], 0.35)
+
     def test_outage_is_empty_dict(self):
         self.assertEqual(_spot_adapter(_FakeSpotInfo(raise_ctxs=True)).spot_mids(), {})
 
