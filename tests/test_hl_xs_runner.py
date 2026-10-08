@@ -55,6 +55,11 @@ def _wire_venue(stub):
         ad.last_account_age_s = lambda: 0.0
     if not hasattr(ad, "is_upgrade_reject"):
         ad.is_upgrade_reject = R.HLAdapter.is_upgrade_reject
+    # breaker helpers (cooldown / terminal / notify, 2026-10-08)
+    for name in ("_breaker_notify", "_cut_book", "_enter_cooldown", "_go_terminal",
+                 "_cooldown_ready", "_auto_resume", "_hold_flat"):
+        if not hasattr(stub, name):
+            setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
     return stub
 
 
@@ -315,8 +320,9 @@ class TestInsightNetBetaDry(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
 class TestCatastropheBreaker(unittest.TestCase):
-    """(B) the terminal catastrophe breaker: fires at threshold, does NOT
-    auto-resume, and a transient None / settling-low read can't trip it."""
+    """(B) the catastrophe triggers: fire at threshold into COOLDOWN (2026-10-08;
+    auto-resume is market-gated, see TestCooldown*), a terminal catastrophe_halt
+    still never auto-resumes, and a transient None / settling-low read can't trip."""
 
     def _stub(self, live, **over):
         cfg = R.HLXSConfig(halt_drawdown_pct=0.25, catastrophe_drawdown_pct=0.12,
@@ -345,10 +351,10 @@ class TestCatastropheBreaker(unittest.TestCase):
         stub = self._stub(live=True)
         s = XSState(cash=880.0, equity=880.0, peak_equity=1000.0)   # 12% dd
         res = self._cb(stub, s, dd=0.12)
-        self.assertEqual(s.cb_state, "catastrophe_halt")
-        self.assertEqual(res["cb_state"], "catastrophe_halt")
+        self.assertEqual(s.cb_state, "cooldown")
+        self.assertEqual(res["cb_state"], "cooldown")
         self.assertTrue(stub._flat_calls)                          # flattened
-        self.assertTrue(any(l.get("action") == "catastrophe_halt" for l in stub._logs))
+        self.assertTrue(any(l.get("action") == "cooldown_enter" for l in stub._logs))
 
     def test_catastrophe_does_not_auto_resume(self):
         # once terminal, even a full recovery (dd→0) must NOT clear it
@@ -363,8 +369,8 @@ class TestCatastropheBreaker(unittest.TestCase):
         s = XSState(cash=910.0, equity=910.0, peak_equity=1000.0)  # only 9% dd-from-peak
         s.last_settled_equity = 1000.0                             # but a 9% drop this cycle
         res = self._cb(stub, s, dd=0.09)
-        self.assertEqual(s.cb_state, "catastrophe_halt")
-        self.assertEqual(res["cb_state"], "catastrophe_halt")
+        self.assertEqual(s.cb_state, "cooldown")
+        self.assertEqual(res["cb_state"], "cooldown")
 
     def test_below_threshold_does_not_fire(self):
         stub = self._stub(live=True)
@@ -454,14 +460,14 @@ class TestRunSafetyOnce(unittest.TestCase):
         stub = self._runner(live=True, equity=850.0, peak=1000.0)   # 15% dd > 12%
         r = stub.run_safety_once()
         self.assertEqual(r["action"], "halted")
-        self.assertEqual(r["cb_state"], "catastrophe_halt")
+        self.assertEqual(r["cb_state"], "cooldown")
         self.assertTrue(stub._flat_calls)              # flattened on breaker
         self.assertEqual(stub._rebal_calls, [])        # still no rebalance
 
     def test_safety_sim_mode_no_orders(self):
         stub = self._runner(live=False, equity=850.0, peak=1000.0)  # breaker, but sim
         r = stub.run_safety_once()
-        self.assertEqual(r["cb_state"], "catastrophe_halt")
+        self.assertEqual(r["cb_state"], "cooldown")
         self.assertFalse(stub._flat_calls)             # sim never places venue orders
         self.assertEqual(stub._rebal_calls, [])
 

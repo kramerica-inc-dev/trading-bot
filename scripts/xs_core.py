@@ -18,7 +18,7 @@ audit P2 #12). No I/O, no exchange client, no environment — pure data + numpy.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -46,7 +46,7 @@ class XSState:
     cycles_total: int = 0
     funding_paid_total: float = 0.0     # cumulative net funding outflow (USD)
     fees_paid_total: float = 0.0
-    cb_state: str = "normal"            # normal | halted | op_halt | catastrophe_halt
+    cb_state: str = "normal"            # normal | cooldown | op_halt | catastrophe_halt (| legacy halted)
     last_settled_equity: Optional[float] = None   # last accepted settled equity (intracycle-drop ref)
     last_funding_ts: Optional[str] = None         # last sim-funding accrual (HL runner)
     data_outage_streak: int = 0                   # consecutive insufficient/stale-data cycles
@@ -55,6 +55,15 @@ class XSState:
     catastrophe_streak: int = 0                   # consecutive confirming dd>=catastrophe reads (terminal-halt confirm-guard)
     delever_active: bool = False                  # soft de-lever episode engaged (book trimmed between rebalances)
     last_cb_state: str = "normal"                 # previous cycle's cb_state — detects terminal-halt→normal resume to re-anchor peak
+    # --- HL breaker cooldown (2026-10-08): cut off → wait for a calm market → auto-resume ---
+    cooldown_since_ts: Optional[str] = None       # when the current cooldown began (ISO)
+    cooldown_trigger: Optional[str] = None        # intracycle | drawdown | deep_drawdown | legacy_halted
+    cooldown_stable_streak: int = 0               # consecutive passing market-stability checks
+    cooldown_last_check: Optional[dict] = None    # last stability check (ratios, ok, reason, ts)
+    auto_resume_ts: List[float] = field(default_factory=list)  # epoch s of automatic resumes (budget window)
+    hwm_equity: Optional[float] = None            # all-time high equity (NOT re-anchored on auto-resume) → hard floor
+    floor_streak: int = 0                         # consecutive reads at/below the hard floor
+    terminal_reason: Optional[str] = None         # why the runner went terminal (hard_floor | resume_budget | ...)
     started_ts: Optional[str] = None
     last_rebalance_ts: Optional[str] = None
     last_cycle_ts: Optional[str] = None

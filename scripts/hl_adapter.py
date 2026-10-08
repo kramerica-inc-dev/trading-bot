@@ -267,6 +267,29 @@ class HLAdapter:
             time.sleep(0.05)
         return (out, latest_ms) if return_latest_ms else out
 
+    def hourly_closes(self, coins: List[str], hours: int) -> Dict[str, np.ndarray]:
+        """Recent CLOSED hourly closes per coin (oldest→newest), for the breaker's
+        cooldown market-stability test. Public (no wallet). Drops the in-progress
+        bar. A failing coin is skipped (the caller fails safe on too few coins)."""
+        now_ms = int(time.time() * 1000)
+        start = now_ms - (int(hours) + 3) * 3_600_000
+        out: Dict[str, np.ndarray] = {}
+        for c in coins:
+            try:
+                data = self.info.post("/info", {"type": "candleSnapshot", "req": {
+                    "coin": c, "interval": "1h", "startTime": start, "endTime": now_ms}})
+                if not isinstance(data, list):
+                    continue
+                rows = sorted((int(d["T"]), float(d["c"])) for d in data
+                              if isinstance(d, dict) and "c" in d and "T" in d
+                              and int(d["T"]) <= now_ms)
+            except Exception:
+                continue
+            if rows:
+                out[c] = np.asarray([r[1] for r in rows], dtype=float)
+            time.sleep(0.05)
+        return out
+
     def funding_daily(self, coins: List[str]) -> Dict[str, float]:
         """Current predicted DAILY funding rate per coin (HL funding settles
         hourly → ×24). Best-effort; returns {} on any failure so a caller can fall

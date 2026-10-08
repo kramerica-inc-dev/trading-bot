@@ -1439,7 +1439,35 @@ async function fetchHyperliquid() {
   set('hl-rebalances', health.rebalances_total != null ? health.rebalances_total : 0);
   set('hl-cycles', health.cycles_total != null ? health.cycles_total : 0);
   set('hl-last-rebal', health.last_rebalance_ts ? relTime(health.last_rebalance_ts) : '—');
-  document.getElementById('hl-cb-pill').style.display = (health.cb_state === 'halted') ? 'inline-flex' : 'none';
+  {
+    // breaker state: COOLDOWN (cut off, auto-resumes once the market has calmed) vs terminal HALTED
+    const cbp = document.getElementById('hl-cb-pill');
+    const cb = health.cb_state || 'normal';
+    const br = health.breaker || {};
+    if (cb === 'normal') {
+      cbp.style.display = 'none';
+    } else {
+      cbp.style.display = 'inline-flex';
+      const cd = br.cooldown;
+      if (cd) {
+        const lc = cd.last_check || {};
+        cbp.className = 'pill pill-amber';
+        cbp.textContent = 'COOLDOWN · ' + (cd.min_elapsed ? ('market check ' + cd.stable_streak + '/' + cd.stable_needed)
+          : ('resume ≥ ' + (cd.min_until ? new Date(cd.min_until).toISOString().slice(5, 16).replace('T', ' ') + ' UTC' : '?')));
+        cbp.title = 'Cut off (' + (cd.trigger || '?') + ') since ' + (cd.since || '?')
+          + '. Auto-resume no earlier than ' + (cd.min_until || '?')
+          + ' and after ' + cd.stable_needed + ' consecutive stable market checks.'
+          + (lc.ts ? ' Last check ' + lc.ts + ': ' + (lc.reason || '') + ' (vol ' + lc.vol_ratio
+            + ', disp ' + lc.disp_ratio + ', move ' + lc.move_ratio + ')' : '')
+          + ' · auto-resumes ' + br.auto_resumes_window + '/' + br.max_auto_resumes
+          + ' in ' + br.auto_resume_window_days + 'd · hard floor ' + br.hard_floor_equity;
+      } else {
+        cbp.className = 'pill pill-red';
+        cbp.textContent = 'HALTED · ' + cb + (br.terminal_reason ? ' (' + br.terminal_reason + ')' : '');
+        cbp.title = 'Terminal stop — manual clear required (cb_state → normal).';
+      }
+    }
+  }
   // diagnostic regime tag (observability only — never gates/sizes)
   const reg = health.regime;
   const regPill = document.getElementById('hl-regime-pill');

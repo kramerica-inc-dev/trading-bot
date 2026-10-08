@@ -150,7 +150,7 @@ class AsyncHLXSRunner(HLXSRunner):
     # --- Phase 2: event-driven risk monitor + fill-driven reconcile --------
     def _cb_halted(self) -> bool:
         cb = (self._latest_health or {}).get("cb_state")
-        return cb in ("halted", "op_halt", "catastrophe_halt")
+        return cb in ("halted", "cooldown", "op_halt", "catastrophe_halt")
 
     def _capture_mtm_baseline(self) -> None:
         """Snapshot the live book + the mids it was marked at + last settled

@@ -43,6 +43,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from xs_core import XSState, Position, compute_target_weights  # noqa: E402
+from xs_cooldown import market_stability, resumes_in_window, hard_floor_equity  # noqa: E402
 from hl_adapter import (  # noqa: E402
     HLAdapter, MODE_TESTNET, MODE_MAINNET_DRY, MODE_MAINNET_LIVE, _mask,
 )
@@ -81,6 +82,27 @@ class HLXSConfig:
     # 1 = legacy immediate behaviour. Mirrors equity_jump_confirm_cycles on the
     # upside (that guard was asymmetric — upside confirmed, downside not).
     catastrophe_confirm_cycles: int = 1
+    # --- Cooldown + auto-resume (2026-10-08; hl-lanes/LANE-hl-xsectional.md) ---
+    # A breaker trip (intracycle / confirmed catastrophe drawdown / halt_drawdown)
+    # no longer strands the book: it flattens and enters `cooldown`, and resumes
+    # automatically once the MARKET (hourly closes of the universe, never our own
+    # equity) has stabilised — xs_cooldown.market_stability. All values are
+    # proposals pending operator confirmation.
+    cooldown_min_hours: float = 24.0          # S0: minimum time flat after a trip
+    cooldown_check_interval_sec: float = 900.0  # how often the market test runs while cooling down
+    cooldown_stable_checks: int = 2           # S4: consecutive passing checks required
+    stab_window_hours: int = 24               # measurement window
+    stab_baseline_days: int = 30              # baseline: preceding N windows
+    stab_min_coins: int = 4                   # fewer coins with data → not stable (fail-safe)
+    stab_max_vol_ratio: float = 1.5           # S1
+    stab_max_disp_ratio: float = 1.5          # S2
+    stab_max_move_ratio: float = 3.0          # S3
+    # Hard floor — these stay TERMINAL (manual clear) so a structurally broken
+    # strategy can't restart forever.
+    hard_floor_pct: float = 0.30              # H1: equity <= HWM*(1-x), confirmed over catastrophe_confirm_cycles
+    max_auto_resumes: int = 2                 # H2: a trip with this many auto-resumes in the window → terminal
+    auto_resume_window_days: float = 30.0
+    breaker_alerts: bool = True               # Telegram on cut-off / auto-resume / terminal (live modes only)
     # fast safety cadence: how often run_safety_once() checks equity/CB/reconcile
     # between the (slow) rebalances — so a live book isn't only seen hourly. 180s
     # tightens the window in which a fast move is caught (P0 #5); the cost is a
@@ -163,11 +185,48 @@ def load_config(path: str) -> HLXSConfig:
     if cfg.catastrophe_confirm_cycles < 1:
         raise ValueError(
             f"catastrophe_confirm_cycles must be >= 1, got {cfg.catastrophe_confirm_cycles!r}")
+    if not (0.0 <= cfg.hard_floor_pct < 1.0):
+        raise ValueError(f"hard_floor_pct must be in [0,1), got {cfg.hard_floor_pct!r}")
+    if cfg.max_auto_resumes < 0 or cfg.cooldown_stable_checks < 1:
+        raise ValueError("max_auto_resumes must be >= 0 and cooldown_stable_checks >= 1")
     return cfg
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def breaker_health(cfg: "HLXSConfig", s: XSState) -> dict:
+    """Breaker observability for health.json / dashboard: hard floor, resume
+    budget, terminal reason and — while cooling down — when a resume is
+    possible and the last market-stability verdict. Best-effort, no I/O."""
+    try:
+        now = _utcnow()
+        recent = resumes_in_window(getattr(s, "auto_resume_ts", []), now.timestamp(),
+                                   cfg.auto_resume_window_days)
+        floor = hard_floor_equity(getattr(s, "hwm_equity", None), cfg.hard_floor_pct)
+        b = {"state": s.cb_state,
+             "hwm_equity": round(s.hwm_equity, 2) if s.hwm_equity else None,
+             "hard_floor_equity": round(floor, 2) if floor else None,
+             "auto_resumes_window": len(recent),
+             "max_auto_resumes": cfg.max_auto_resumes,
+             "auto_resume_window_days": cfg.auto_resume_window_days,
+             "terminal_reason": s.terminal_reason if s.cb_state == "catastrophe_halt" else None}
+        if s.cb_state in ("cooldown", "halted"):
+            since = (datetime.fromisoformat(s.cooldown_since_ts)
+                     if s.cooldown_since_ts else now)
+            min_until = since.timestamp() + cfg.cooldown_min_hours * 3600
+            b["cooldown"] = {
+                "since": s.cooldown_since_ts, "trigger": s.cooldown_trigger,
+                "min_until": datetime.fromtimestamp(min_until, timezone.utc).isoformat(),
+                "min_elapsed": now.timestamp() >= min_until,
+                "stable_streak": s.cooldown_stable_streak,
+                "stable_needed": cfg.cooldown_stable_checks,
+                "check_interval_sec": cfg.cooldown_check_interval_sec,
+                "last_check": s.cooldown_last_check}
+        return b
+    except Exception:
+        return {"state": s.cb_state}
 
 
 class HLXSRunner:
@@ -207,6 +266,7 @@ class HLXSRunner:
             # catastrophe_confirm_cycles > 1 the drawdown trigger could never fire.)
             if not getattr(self, "_streak_initialised", False):
                 s.catastrophe_streak = 0
+                s.floor_streak = 0                # same rule for the hard-floor confirm
                 self._streak_initialised = True
             return s
         return XSState(cash=self.cfg.initial_capital, equity=self.cfg.initial_capital,
@@ -664,6 +724,7 @@ class HLXSRunner:
              # not the per-call _targets instance flag
              "delever_active": s.delever_active,
              "catastrophe_streak": s.catastrophe_streak,
+             "breaker": breaker_health(self.cfg, s),
              **extra}
         if self.live_trading:
             # margin_read_ok makes a flaky margin endpoint VISIBLE in health
@@ -915,15 +976,31 @@ class HLXSRunner:
         # counter, so the operator's clear is just `cb_state="normal"` and the
         # resumed book starts from a clean baseline (it's flat — the halt
         # flattened it). Does NOT touch the 25% auto-resume "halted" path.
-        if s.last_cb_state in ("catastrophe_halt", "op_halt") and s.cb_state == "normal":
+        # A manual clear out of `cooldown` (or the legacy `halted`) re-anchors the
+        # same way. A manual clear of catastrophe_halt also re-anchors the hard
+        # floor's HWM and wipes the auto-resume budget: the operator has accepted
+        # the loss and starts a fresh episode.
+        if (s.last_cb_state in ("catastrophe_halt", "op_halt", "cooldown", "halted")
+                and s.cb_state == "normal"):
             s.peak_equity = eq
             s.last_settled_equity = eq
             s.catastrophe_streak = 0
+            s.floor_streak = 0
             s.delever_active = False
+            s.cooldown_since_ts = None
+            s.cooldown_trigger = None
+            s.cooldown_stable_streak = 0
+            if s.last_cb_state == "catastrophe_halt":
+                s.hwm_equity = eq
+                s.auto_resume_ts = []
+                s.terminal_reason = None
             self.log({"action": "resume_reanchor", "from": s.last_cb_state,
                       "equity": round(eq, 2)})
         if s.cycles_total == 1:                       # anchor peak to true starting equity
             s.peak_equity = s.equity
+            s.hwm_equity = s.equity
+        if s.hwm_equity is None:                      # pre-2026-10 state: seed from the known peak
+            s.hwm_equity = max(s.peak_equity or 0.0, s.equity)
         if self.live_trading and s.equity < 5.0:      # live account not funded yet
             s.skips_total += 1
             self.save_state(s)
@@ -931,84 +1008,236 @@ class HLXSRunner:
             return None, {"action": "skip",
                           "reason": f"account unfunded (eq={s.equity}); deposit USDC to {self.adapter.address}"}
         s.peak_equity = max(s.peak_equity, s.equity)
+        s.hwm_equity = max(s.hwm_equity or 0.0, s.equity)
         dd = (s.peak_equity - s.equity) / s.peak_equity if s.peak_equity > 0 else 0.0
         return dd, None
 
     def _apply_circuit_breaker(self, s: XSState, dd: float):
         """Evaluate every breaker on the freshly-settled equity. Returns a
-        short-circuit result dict if the cycle must HALT now (no rebalance),
-        else None to proceed. Trips, in priority order:
+        short-circuit result dict if the cycle must stop now (no rebalance),
+        else None to proceed. Design: hl-lanes/LANE-hl-xsectional.md (2026-10-08).
 
-          * catastrophe  — TERMINAL. dd-from-peak >= catastrophe_drawdown_pct OR a
-                            single-cycle settled-equity drop >= catastrophe_intracycle_pct.
-                            Flattens + sets cb_state="catastrophe_halt"; does NOT
-                            auto-resume (clears only via the manual op_halt path).
-          * halted       — the existing 25% drawdown breaker; auto-recovers when
-                            dd falls well below the line.
+        States:
+          * normal       — trading.
+          * cooldown     — CUT OFF: the book is flat; resumes AUTOMATICALLY once
+                            the market has stabilised (cooldown_min_hours elapsed
+                            AND xs_cooldown.market_stability passes on
+                            cooldown_stable_checks consecutive checks). On resume
+                            peak re-anchors to equity, the rebalance clock clears.
+          * catastrophe_halt — TERMINAL (manual clear): the hard floor (equity
+                            <= HWM*(1-hard_floor_pct), confirmed) or a trip with
+                            the auto-resume budget exhausted.
           * op_halt      — operational failure (set elsewhere); manual clear only.
 
-        `s.last_settled_equity` carries the previous accepted settled equity for
-        the intracycle delta; it is reused for the intracycle guard so a single
-        transient/settling low read (already filtered to None / via
-        _accept_post_trade_equity) can't fabricate a drop here."""
-        cfg = self.cfg
-        prev_settled = s.last_settled_equity
-        intracycle_drop = 0.0
-        if prev_settled is not None and prev_settled > 0:
-            intracycle_drop = max(0.0, (prev_settled - s.equity) / prev_settled)
+        Cut-off triggers (normal → cooldown), unchanged thresholds:
+          * intracycle: single-cycle settled-equity drop >= catastrophe_intracycle_pct
+            (a real flash crash) — IMMEDIATE.
+          * drawdown: dd-from-peak >= catastrophe_drawdown_pct, CONFIRMED over
+            catastrophe_confirm_cycles consecutive reads (the 2026-06-13 false trip).
+          * deep_drawdown: dd >= halt_drawdown_pct — immediate.
 
-        # 1. catastrophe (terminal, non-auto-resuming) — checked first.
-        #    Two triggers, treated asymmetrically:
-        #     - intracycle (real flash crash): fire IMMEDIATELY, no confirmation.
-        #     - drawdown-from-peak (slow bleed): CONFIRM over catastrophe_confirm_cycles
-        #       consecutive reads before this irreversible halt — a single transient
-        #       unified-margin mark under-read (the 2026-06-13 false trip, where the
-        #       flatten realised ~$170.84 vs the $163.30 trip-read) can't strand the
-        #       book. A sub-threshold read resets the streak.
-        if s.cb_state != "catastrophe_halt":
+        `s.last_settled_equity` carries the previous accepted settled equity for
+        the intracycle delta (filtered upstream by _read_equity /
+        _accept_post_trade_equity, so a transient low read can't fabricate a drop)."""
+        cfg = self.cfg
+        if s.cb_state == "halted":                    # legacy 25% state → cooldown semantics
+            s.cb_state = "cooldown"
+            s.cooldown_trigger = s.cooldown_trigger or "legacy_halted"
+            s.cooldown_since_ts = s.cooldown_since_ts or _utcnow().isoformat()
+
+        # 0. hard floor (H1) — evaluated in normal AND cooldown; terminal when
+        #    confirmed over catastrophe_confirm_cycles consecutive reads.
+        confirm = max(1, cfg.catastrophe_confirm_cycles)
+        floor = hard_floor_equity(s.hwm_equity, cfg.hard_floor_pct)
+        if s.cb_state in ("normal", "cooldown"):
+            if floor is not None and s.equity <= floor:
+                s.floor_streak += 1
+            else:
+                s.floor_streak = 0
+            if s.floor_streak >= confirm:
+                self._go_terminal(s, "hard_floor",
+                                  f"equity {s.equity:.2f} <= floor {floor:.2f} "
+                                  f"({cfg.hard_floor_pct:.0%} below HWM {s.hwm_equity:.2f})")
+
+        # 1. cut-off triggers (normal → cooldown, or terminal if budget spent).
+        if s.cb_state == "normal":
+            prev_settled = s.last_settled_equity
+            intracycle_drop = 0.0
+            if prev_settled is not None and prev_settled > 0:
+                intracycle_drop = max(0.0, (prev_settled - s.equity) / prev_settled)
             intracycle_trip = intracycle_drop >= cfg.catastrophe_intracycle_pct
             if dd >= cfg.catastrophe_drawdown_pct:
                 s.catastrophe_streak += 1
             else:
                 s.catastrophe_streak = 0
-            confirm = max(1, cfg.catastrophe_confirm_cycles)
             drawdown_trip = s.catastrophe_streak >= confirm
-            if intracycle_trip or drawdown_trip:
-                trigger = "intracycle" if intracycle_trip else "drawdown"
-                s.cb_state = "catastrophe_halt"
+            deep_trip = dd >= cfg.halt_drawdown_pct
+            if intracycle_trip or drawdown_trip or deep_trip:
+                trigger = ("intracycle" if intracycle_trip
+                           else "drawdown" if drawdown_trip else "deep_drawdown")
                 s.catastrophe_streak = 0
-                flat = self.flatten_all() if self.live_trading else []
-                self.log({"action": "catastrophe_halt", "trigger": trigger,
-                          "drawdown_pct": round(dd * 100, 2),
+                now_ts = _utcnow().timestamp()
+                recent = resumes_in_window(s.auto_resume_ts, now_ts, cfg.auto_resume_window_days)
+                s.auto_resume_ts = recent
+                detail = {"trigger": trigger, "drawdown_pct": round(dd * 100, 2),
                           "intracycle_drop_pct": round(intracycle_drop * 100, 2),
-                          "confirm_cycles": confirm, "flattened": flat})
+                          "confirm_cycles": confirm}
+                if len(recent) >= cfg.max_auto_resumes:
+                    self._go_terminal(s, "resume_budget",
+                                      f"{trigger} trip with {len(recent)} auto-resumes in "
+                                      f"{cfg.auto_resume_window_days:g}d (max {cfg.max_auto_resumes})",
+                                      detail)
+                else:
+                    self._enter_cooldown(s, trigger, detail)
 
-        # 2. the auto-resuming 25% drawdown breaker. On a NEW halt, FLATTEN.
-        if dd >= cfg.halt_drawdown_pct and s.cb_state not in (
-                "halted", "op_halt", "catastrophe_halt"):
-            s.cb_state = "halted"
-            flat = self.flatten_all() if self.live_trading else []
-            self.log({"action": "circuit_breaker_halt", "drawdown_pct": round(dd * 100, 2),
-                      "flattened": flat})
+        # 2. cooldown: wait for a stabilised market, then resume automatically.
+        if s.cb_state == "cooldown":
+            if self._cooldown_ready(s):
+                return self._auto_resume(s)
+            return self._hold_flat(s, dd)
 
-        # 3. any active halt: auto-resume only the "halted" state; the terminal
-        #    states (op_halt / catastrophe_halt) keep the book flat + short-circuit.
-        if s.cb_state in ("halted", "op_halt", "catastrophe_halt"):
-            if s.cb_state == "halted" and dd < cfg.halt_drawdown_pct * 0.5:
-                s.cb_state = "normal"
-                self.log({"action": "circuit_breaker_resume", "drawdown_pct": round(dd * 100, 2)})
-            else:
-                if self.live_trading:                 # keep the book flat while halted
-                    self.flatten_all()
-                s.last_cb_state = s.cb_state           # carry terminal state → resume re-anchor
-                self.save_state(s)
-                self.write_health(s, {"last_action": "halted", "cb_state": s.cb_state,
-                                      "drawdown_pct": round(dd * 100, 2)})
-                return {"action": "halted", "cb_state": s.cb_state,
-                        "drawdown_pct": round(dd * 100, 2)}
+        # 3. terminal states keep the book flat + short-circuit.
+        if s.cb_state in ("op_halt", "catastrophe_halt"):
+            return self._hold_flat(s, dd)
         s.last_settled_equity = s.equity              # record the accepted settled equity
         s.last_cb_state = s.cb_state                  # for next cycle's resume-transition check
         return None
+
+    # -- breaker helpers (cooldown / terminal / notify) ---------------------
+    def _breaker_notify(self, text: str) -> None:
+        """Best-effort Telegram for breaker transitions; live modes only (DRY
+        papers silently). Never raises — alerting can't take the money path down."""
+        if not self.live_trading or not getattr(self.cfg, "breaker_alerts", True):
+            return
+        try:
+            import notify
+            notify.send(f"[{self.cfg.instance_name} · {getattr(self, 'mode', '?')}] {text}")
+        except Exception:
+            pass
+
+    def _cut_book(self, s: XSState) -> list:
+        """Flatten the live book; in sim, realise the simulated basket at its
+        current mark so a flat cooldown is flat in paper too."""
+        if self.live_trading:
+            return self.flatten_all()
+        s.cash = s.equity
+        s.positions = {}
+        return []
+
+    def _enter_cooldown(self, s: XSState, trigger: str, detail: dict) -> None:
+        now = _utcnow()
+        flat = self._cut_book(s)
+        s.cb_state = "cooldown"
+        s.cooldown_since_ts = now.isoformat()
+        s.cooldown_trigger = trigger
+        s.cooldown_stable_streak = 0
+        s.cooldown_last_check = None
+        s.delever_active = False
+        self.log({"action": "cooldown_enter", **detail, "flattened": flat})
+        earliest = now.timestamp() + self.cfg.cooldown_min_hours * 3600
+        self._breaker_notify(
+            f"STOP: book cut off ({trigger}; dd {detail.get('drawdown_pct')}%, "
+            f"intracycle {detail.get('intracycle_drop_pct')}%), equity {s.equity:.2f}. "
+            f"Cooldown; auto-resume at the earliest "
+            f"{datetime.fromtimestamp(earliest, timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC "
+            f"once the market has stabilised.")
+
+    def _go_terminal(self, s: XSState, reason: str, text: str, detail: Optional[dict] = None) -> None:
+        flat = self._cut_book(s)
+        s.cb_state = "catastrophe_halt"
+        s.terminal_reason = reason
+        s.catastrophe_streak = 0
+        s.floor_streak = 0
+        s.cooldown_since_ts = None
+        s.cooldown_stable_streak = 0
+        self.log({"action": "catastrophe_halt", "reason": reason, "detail": text,
+                  **(detail or {}), "flattened": flat})
+        self._breaker_notify(f"TERMINAL STOP ({reason}): {text}. Book flat; "
+                             f"manual clear required (cb_state → normal).")
+
+    def _cooldown_ready(self, s: XSState) -> bool:
+        """True when the cooldown may end: S0 minimum time elapsed AND the market
+        stability test has passed on cooldown_stable_checks consecutive checks
+        (spaced cooldown_check_interval_sec). Market data, never own equity."""
+        cfg = self.cfg
+        now = _utcnow()
+        try:
+            since = datetime.fromisoformat(s.cooldown_since_ts) if s.cooldown_since_ts else now
+        except ValueError:
+            since = now
+        if (now - since).total_seconds() < cfg.cooldown_min_hours * 3600:
+            return False
+        last = s.cooldown_last_check or {}
+        try:
+            last_ts = datetime.fromisoformat(last["ts"]).timestamp() if last.get("ts") else 0.0
+        except (ValueError, TypeError):
+            last_ts = 0.0
+        if now.timestamp() - last_ts < cfg.cooldown_check_interval_sec:
+            return False                              # throttled: keep the last verdict
+        w = max(2, int(cfg.stab_window_hours))
+        try:
+            hourly = self.adapter.hourly_closes(
+                list(cfg.universe), w * (int(cfg.stab_baseline_days) + 1) + 3)
+        except Exception as e:
+            hourly = {}
+            self.log({"action": "cooldown_check_error", "error": str(e)})
+        chk = market_stability(hourly, window_h=w, baseline_days=cfg.stab_baseline_days,
+                               min_coins=cfg.stab_min_coins,
+                               max_vol_ratio=cfg.stab_max_vol_ratio,
+                               max_disp_ratio=cfg.stab_max_disp_ratio,
+                               max_move_ratio=cfg.stab_max_move_ratio)
+        chk["ts"] = now.isoformat()
+        s.cooldown_last_check = chk
+        s.cooldown_stable_streak = s.cooldown_stable_streak + 1 if chk["ok"] else 0
+        self.log({"action": "cooldown_check", "ok": chk["ok"], "reason": chk["reason"],
+                  "vol_ratio": chk["vol_ratio"], "disp_ratio": chk["disp_ratio"],
+                  "move_ratio": chk["move_ratio"], "streak": s.cooldown_stable_streak})
+        return s.cooldown_stable_streak >= max(1, cfg.cooldown_stable_checks)
+
+    def _auto_resume(self, s: XSState) -> dict:
+        """cooldown → normal with the resume re-anchor: peak := equity now, streaks
+        and de-lever cleared, rebalance clock cleared so the next full cycle builds
+        a fresh book. Short-circuits THIS cycle (its dd was measured against the
+        old peak and must not reach _targets / _maybe_delever)."""
+        now = _utcnow()
+        since = s.cooldown_since_ts
+        s.cb_state = "normal"
+        s.last_cb_state = "normal"                    # re-anchored here; skip _read_equity's
+        s.peak_equity = s.equity
+        s.last_settled_equity = s.equity
+        s.catastrophe_streak = 0
+        s.floor_streak = 0
+        s.delever_active = False
+        s.last_rebalance_ts = None
+        s.auto_resume_ts = resumes_in_window(s.auto_resume_ts, now.timestamp(),
+                                             self.cfg.auto_resume_window_days) + [now.timestamp()]
+        chk = s.cooldown_last_check or {}
+        trigger = s.cooldown_trigger
+        s.cooldown_since_ts = None
+        s.cooldown_trigger = None
+        s.cooldown_stable_streak = 0
+        self.log({"action": "cooldown_resume", "since": since, "trigger": trigger,
+                  "equity": round(s.equity, 2), "check": chk,
+                  "auto_resumes_window": len(s.auto_resume_ts)})
+        self._breaker_notify(
+            f"RESUME: market stabilised (vol {chk.get('vol_ratio')}, disp {chk.get('disp_ratio')}, "
+            f"move {chk.get('move_ratio')}); trading resumes at the next full cycle. "
+            f"Peak re-anchored to {s.equity:.2f}. Auto-resumes in "
+            f"{self.cfg.auto_resume_window_days:g}d: {len(s.auto_resume_ts)}/{self.cfg.max_auto_resumes}.")
+        self.save_state(s)
+        self.write_health(s, {"last_action": "cooldown_resume"})
+        return {"action": "cooldown_resume", "cb_state": "normal",
+                "equity": round(s.equity, 2)}
+
+    def _hold_flat(self, s: XSState, dd: float) -> dict:
+        if self.live_trading:                         # keep the book flat while stopped
+            self.flatten_all()
+        s.last_cb_state = s.cb_state                  # carry stopped state → resume re-anchor
+        self.save_state(s)
+        self.write_health(s, {"last_action": "halted", "cb_state": s.cb_state,
+                              "drawdown_pct": round(dd * 100, 2)})
+        return {"action": "halted", "cb_state": s.cb_state,
+                "drawdown_pct": round(dd * 100, 2)}
 
     # -- soft de-lever (between-rebalance protection) ----------------------
     def _maybe_delever(self, s: XSState, dd: float) -> Optional[dict]:

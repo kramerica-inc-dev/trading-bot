@@ -39,7 +39,7 @@ RESTART=1
 # current repo state — keep the repo the single source of truth.
 FILES=(scripts/hl_xs_runner.py scripts/hl_runner_async.py scripts/hl_ws_feed.py
        scripts/hl_nonce.py scripts/regime_tag.py scripts/hl_adapter.py
-       scripts/hl_watchdog.py scripts/xs_core.py scripts/mode_gate.py scripts/notify.py
+       scripts/hl_watchdog.py scripts/xs_core.py scripts/xs_cooldown.py scripts/mode_gate.py scripts/notify.py
        scripts/equity_sampler.py scripts/hl_status_probe.py
        scripts/dashboard_api.py scripts/dashboard.html)
 
@@ -98,7 +98,7 @@ if ! grep -qs '^TELEGRAM_BOT_TOKEN=' /etc/trading-bot/hl-watchdog-mainnet.env; t
 fi
 EOF
   echo "→ Health snapshot:"
-  ssh "$HOST" "sleep 5; python3 -c \"import json;print(json.dumps({k:v for k,v in json.load(open('$REMOTE_DIR/state/hl_xsectional/mainnet/health.json')).items() if k in ('ts','mode','live_trading','equity','cb_state','gross_exposure','leverage_verified','delever_active','margin_ratio','margin_read_ok','reconcile_ok')}, indent=2))\"" \
+  ssh "$HOST" "sleep 5; python3 -c \"import json;print(json.dumps({k:v for k,v in json.load(open('$REMOTE_DIR/state/hl_xsectional/mainnet/health.json')).items() if k in ('ts','mode','live_trading','equity','cb_state','breaker','gross_exposure','leverage_verified','delever_active','margin_ratio','margin_read_ok','reconcile_ok')}, indent=2))\"" \
     || echo "⚠️  health snapshot unavailable (runner may still be starting — check: ssh $HOST cat $REMOTE_DIR/state/hl_xsectional/mainnet/health.json)"
 fi
 

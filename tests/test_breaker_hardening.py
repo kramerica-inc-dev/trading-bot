@@ -28,6 +28,18 @@ except ImportError:
     HAVE_SDK = False
 
 
+BREAKER_METHODS = ("_breaker_notify", "_cut_book", "_enter_cooldown", "_go_terminal",
+                   "_cooldown_ready", "_auto_resume", "_hold_flat")
+
+
+def bind_breaker(stub):
+    """Bind the real breaker helpers (cooldown / terminal / notify) onto a stub."""
+    for name in BREAKER_METHODS:
+        if not hasattr(stub, name):
+            setattr(stub, name, types.MethodType(getattr(R.HLXSRunner, name), stub))
+    return stub
+
+
 def _breaker_stub(*, live=False, confirm=3, cat_dd=0.12, cat_intra=0.08):
     cfg = R.HLXSConfig(catastrophe_drawdown_pct=cat_dd, catastrophe_intracycle_pct=cat_intra,
                        catastrophe_confirm_cycles=confirm, halt_drawdown_pct=0.25)
@@ -40,6 +52,7 @@ def _breaker_stub(*, live=False, confirm=3, cat_dd=0.12, cat_intra=0.08):
         return [{"act": "flatten", "verified_flat": True}]
     stub.flatten_all = _flat
     stub._apply_circuit_breaker = types.MethodType(R.HLXSRunner._apply_circuit_breaker, stub)
+    bind_breaker(stub)
     return stub
 
 
@@ -62,8 +75,8 @@ class TestCatastropheConfirmGuard(unittest.TestCase):
         self.assertIsNone(self._run(stub, s, 0.12))
         self.assertIsNone(self._run(stub, s, 0.13))
         out = self._run(stub, s, 0.14)
-        self.assertEqual(s.cb_state, "catastrophe_halt")
-        self.assertEqual(out["cb_state"], "catastrophe_halt")
+        self.assertEqual(s.cb_state, "cooldown")
+        self.assertEqual(out["cb_state"], "cooldown")
 
     def test_transient_spike_then_recovery_resets_streak(self):
         stub = _breaker_stub(confirm=3)
@@ -78,22 +91,22 @@ class TestCatastropheConfirmGuard(unittest.TestCase):
         # equity dropped 9% vs last settled in ONE cycle → flash-crash trigger
         s = XSState(equity=91.0, peak_equity=100.0, last_settled_equity=100.0)
         out = self._run(stub, s, 0.09)
-        self.assertEqual(s.cb_state, "catastrophe_halt")
-        self.assertEqual(out["cb_state"], "catastrophe_halt")
+        self.assertEqual(s.cb_state, "cooldown")
+        self.assertEqual(out["cb_state"], "cooldown")
 
     def test_confirm_1_is_legacy_immediate(self):
         stub = _breaker_stub(confirm=1)
         s = XSState(equity=88.0, peak_equity=100.0, last_settled_equity=88.0)
         out = self._run(stub, s, 0.12)
-        self.assertEqual(s.cb_state, "catastrophe_halt")
-        self.assertEqual(out["cb_state"], "catastrophe_halt")
+        self.assertEqual(s.cb_state, "cooldown")
+        self.assertEqual(out["cb_state"], "cooldown")
 
     def test_live_flattens_on_confirmed_trip(self):
         stub = _breaker_stub(live=True, confirm=2)
         s = XSState(equity=88.0, peak_equity=100.0, last_settled_equity=88.0)
         self._run(stub, s, 0.12)
         self._run(stub, s, 0.12)
-        self.assertEqual(s.cb_state, "catastrophe_halt")
+        self.assertEqual(s.cb_state, "cooldown")
         self.assertGreaterEqual(stub._flats, 1)
 
 
@@ -315,7 +328,7 @@ class TestCatastropheStreakAcrossSafetyCycles(unittest.TestCase):
             self.assertEqual(r.run_safety_once()["action"], "safety")
             out = r.run_safety_once()
             self.assertEqual(out["action"], "halted")
-            self.assertEqual(out["cb_state"], "catastrophe_halt")
+            self.assertEqual(out["cb_state"], "cooldown")
             self.assertGreaterEqual(r.flattens, 1)
 
     def test_restart_midway_resets_streak(self):
@@ -333,7 +346,7 @@ class TestCatastropheStreakAcrossSafetyCycles(unittest.TestCase):
             self.assertEqual(r2.load_state().catastrophe_streak, 1)
             r2.run_safety_once()
             out = r2.run_safety_once()                # third read in THIS process
-            self.assertEqual(out["cb_state"], "catastrophe_halt")
+            self.assertEqual(out["cb_state"], "cooldown")
 
     def test_recovery_between_reads_resets_streak(self):
         import tempfile
