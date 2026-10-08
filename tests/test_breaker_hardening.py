@@ -243,6 +243,112 @@ class TestStreakNotPersisted(unittest.TestCase):
             loaded = R.HLXSRunner.load_state(runner)
             self.assertEqual(loaded.catastrophe_streak, 0)
 
+    def test_streak_survives_reloads_within_one_process(self):
+        """Regression (2026-10): resetting on EVERY load capped the streak at 1,
+        because each cycle reloads state — the confirmed drawdown trigger could
+        never fire. Only the first load of a process may reset it."""
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            runner = R.HLXSRunner.__new__(R.HLXSRunner)
+            runner.cfg = R.HLXSConfig(instance_name="x")
+            runner.live_trading = False
+            runner.state_path = Path(d) / "state.json"
+            runner.state_path.write_text(json.dumps(
+                XSState(equity=100.0, peak_equity=100.0, catastrophe_streak=2).to_json()))
+            self.assertEqual(R.HLXSRunner.load_state(runner).catastrophe_streak, 0)
+            runner.state_path.write_text(json.dumps(
+                XSState(equity=100.0, peak_equity=100.0, catastrophe_streak=2).to_json()))
+            self.assertEqual(R.HLXSRunner.load_state(runner).catastrophe_streak, 2)
+
+
+def _safety_runner(state_path, equity_box, confirm=3):
+    """A real HLXSRunner (no adapter construction) wired for _run_safety_once:
+    real load_state/save_state/_read_equity/_apply_circuit_breaker on a temp
+    state file, a stub venue returning equity_box[0]. live_trading=True so the
+    breaker path is the live one; flatten/reconcile are stubbed."""
+    cfg = R.HLXSConfig(instance_name="x", catastrophe_confirm_cycles=confirm,
+                       catastrophe_drawdown_pct=0.12, catastrophe_intracycle_pct=0.08,
+                       halt_drawdown_pct=0.25, max_account_staleness_sec=0,
+                       venue_status_check=False, soft_delever_dd_pct=None)
+    r = R.HLXSRunner.__new__(R.HLXSRunner)
+    r.cfg = cfg
+    r.live_trading = True
+    r.mode = R.MODE_MAINNET_LIVE
+    r._venue_upgrade_until = 0.0
+    r._delever_active = False
+    r.state_path = Path(state_path)
+    r.dir = r.state_path.parent
+    r.flattens = 0
+    def _flat():
+        r.flattens += 1
+        return [{"act": "flatten_verify", "verified_flat": True, "remaining": []}]
+    r.flatten_all = _flat
+    r.reconcile = lambda s, t: {"ok": True}
+    r.log = lambda e: None
+    r.write_health = lambda s, extra: None
+    r.adapter = types.SimpleNamespace(
+        all_mids=lambda: {}, account_value=lambda: equity_box[0],
+        last_account_age_s=lambda: 0.0, exchange_status=lambda: None,
+        address="0xabc")
+    return r
+
+
+@unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
+class TestCatastropheStreakAcrossSafetyCycles(unittest.TestCase):
+    """End-to-end over the real per-cycle load/save round-trip."""
+
+    def _seed(self, path):
+        import json
+        s = XSState(equity=100.0, peak_equity=100.0, last_settled_equity=87.0,
+                    cycles_total=10, dry_run=False)
+        Path(path).write_text(json.dumps(s.to_json()))
+
+    def test_three_consecutive_safety_cycles_trip_catastrophe(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "state.json"
+            self._seed(p)
+            eq = [87.0]                               # 13% dd, no intracycle drop
+            r = _safety_runner(p, eq)
+            self.assertEqual(r.run_safety_once()["action"], "safety")
+            self.assertEqual(r.load_state().catastrophe_streak, 1)
+            self.assertEqual(r.run_safety_once()["action"], "safety")
+            out = r.run_safety_once()
+            self.assertEqual(out["action"], "halted")
+            self.assertEqual(out["cb_state"], "catastrophe_halt")
+            self.assertGreaterEqual(r.flattens, 1)
+
+    def test_restart_midway_resets_streak(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "state.json"
+            self._seed(p)
+            eq = [87.0]
+            r1 = _safety_runner(p, eq)
+            r1.run_safety_once()
+            r1.run_safety_once()                      # streak 2 persisted
+            r2 = _safety_runner(p, eq)                # "restart": fresh process
+            out = r2.run_safety_once()                # streak reset → 1, no trip
+            self.assertEqual(out["action"], "safety")
+            self.assertEqual(r2.load_state().catastrophe_streak, 1)
+            r2.run_safety_once()
+            out = r2.run_safety_once()                # third read in THIS process
+            self.assertEqual(out["cb_state"], "catastrophe_halt")
+
+    def test_recovery_between_reads_resets_streak(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "state.json"
+            self._seed(p)
+            eq = [87.0]
+            r = _safety_runner(p, eq)
+            r.run_safety_once(); r.run_safety_once()
+            eq[0] = 89.0                              # recovered below the 12% line (11%)
+            r.run_safety_once()
+            eq[0] = 87.0
+            self.assertEqual(r.run_safety_once()["action"], "safety")
+            self.assertEqual(r.load_state().catastrophe_streak, 1)
+
 
 @unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
 class TestConfirmConfigValidation(unittest.TestCase):

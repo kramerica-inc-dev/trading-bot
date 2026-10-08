@@ -198,10 +198,16 @@ class HLXSRunner:
         if self.state_path.exists():
             s = XSState.from_json(json.loads(self.state_path.read_text()))
             # catastrophe_streak counts CONSECUTIVE confirming reads within one
-            # uptime — a restart mid-confirm-sequence must not inherit a partial
-            # streak (a single post-restart read would then fire the terminal
-            # halt). Reset on every load; the persisted value is never trusted.
-            s.catastrophe_streak = 0
+            # process uptime — a restart mid-confirm-sequence must not inherit a
+            # partial streak (a single post-restart read would then fire the
+            # terminal halt). So reset it on the FIRST load of this process only;
+            # later loads in the same process trust the value this process saved.
+            # (Resetting on EVERY load — the pre-2026-10 behaviour — capped the
+            # streak at 1 because each cycle reloads state, so with
+            # catastrophe_confirm_cycles > 1 the drawdown trigger could never fire.)
+            if not getattr(self, "_streak_initialised", False):
+                s.catastrophe_streak = 0
+                self._streak_initialised = True
             return s
         return XSState(cash=self.cfg.initial_capital, equity=self.cfg.initial_capital,
                        peak_equity=self.cfg.initial_capital,
