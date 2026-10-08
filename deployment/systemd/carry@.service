@@ -1,5 +1,5 @@
 [Unit]
-Description=Carry runner (%i) — funding/basis cash-and-carry on OKX
+Description=Carry runner (%i) — funding/basis cash-and-carry (OKX: carry@btc, Hyperliquid: carry@hl-btc)
 After=network-online.target
 Wants=network-online.target
 
@@ -12,7 +12,22 @@ Environment=PYTHONUNBUFFERED=1
 # Per-instance credentials and overrides; the leading `-` makes it optional
 # so the unit can be loaded before the env-file is created. The runner will
 # log an error and skip its order/account paths if credentials are missing.
+#
+# Hyperliquid lane = carry@hl-btc (THE one unit for it; carry-hl@.service was
+# retired 2026-10-08 — it pointed at the same config/state/env, so two runners
+# could drive one book. The runner now also takes an exclusive flock on
+# state/carry/<instance>/runner.lock and a second instance exits.)
+# For carry@hl-btc the env file carry-hl-btc.env carries:
+#   HL_CARRY_PRIVATE_KEY (or HL_PRIVATE_KEY) — AGENT wallet key (signs only).
+#   HL_CARRY_ACCOUNT_ADDRESS — the dedicated carry wallet 0x… (REQUIRED for any
+#       non-DRY mode; config hl_account_address overrides).
+#   HL_CONFIRM_LIVE=YES — only via `scripts.carry_hl_go go`, never by hand.
 EnvironmentFile=-/etc/trading-bot/carry-%i.env
+# Telegram alerts (open/close/halt/basis-blowout/legging-abort/reconcile-fail):
+# ONLY TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID. Deliberately a separate file —
+# never point this at an env that holds HL_PRIVATE_KEY/HL_ACCOUNT_ADDRESS of
+# another lane: the carry runner falls back to those names.
+EnvironmentFile=-/etc/trading-bot/carry-alerts.env
 ExecStart=/usr/bin/python3 -m scripts.carry_runner --loop --config /opt/trading-bot/configs/carry-%i.json
 Restart=on-failure
 RestartSec=30

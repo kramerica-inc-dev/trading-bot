@@ -51,6 +51,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -74,8 +75,13 @@ from carry_position import (  # noqa: E402
     CarryPosition, DriftReport, annualize_funding,
     delta_neutral_drift, funding_accrual_step,
     green_button_on, projected_next_funding_usd,
-    target_position_for,
+    target_position_for, go_sizing, basis_pnl_usd,
 )
+
+try:  # best-effort Telegram; alerting must never take the money path down
+    import notify  # noqa: E402
+except Exception:  # pragma: no cover
+    notify = None  # type: ignore[assignment]
 
 
 # =========================  Config  =========================
@@ -131,6 +137,26 @@ class CarryRunnerConfig:
     # unwind (reduce-only market_close) on a shared account could flatten
     # another lane's position in the same coin. Identity-checked bool True.
     hl_dedicated_account_confirmed: bool = False
+    # Green-button minimum history. The validating backtest
+    # (research backtest/sweep/hl_carry.py MIN_WINDOW_SAMPLES) requires ≥50% of
+    # the 90d hourly window = 1080 samples before the gate may read ON; the HL
+    # config pins that. Default 1 keeps the OKX lanes' historic behaviour
+    # (their page-capped window holds only 100 settlements).
+    gate_min_samples: int = 1
+    # DRY-RUN book simulation. In DRY mode a would_open/would_unwind is
+    # applied to `simulated_position` at the cycle's mids, with taker fees on
+    # both legs, funding accrued from the venue's SETTLED funding history and
+    # basis P&L marked to market — so DRY produces a measured paper result.
+    sim_enabled: bool = True
+    # Sizing source for the simulation. None → initial_notional_usd ×
+    # target_dn_notional_fraction (book-based). Set → size exactly like
+    # `carry_hl_go go` would from a deposit of this size split
+    # sim_spot_fraction to spot / rest to perp (carry_position.go_sizing).
+    sim_deposit_usd: Optional[float] = None
+    sim_spot_fraction: float = 0.55
+    # Telegram re-alert interval for a condition that stays active
+    # (basis blowout, reconcile failure, margin low, halted).
+    alert_cooldown_sec: int = 6 * 3600
 
 
 def load_config(path: Optional[str]) -> CarryRunnerConfig:
@@ -218,6 +244,19 @@ class CarryRunnerState:
     legging_aborts_total: int = 0
     # Persisted dry-run flag - sanity check on reload (informational).
     dry_run: bool = True
+    # Book bookkeeping (all modes): last funding settlement (ms) accrued into
+    # simulated_position.funding_accrued, and the closed round trips' net P&L.
+    funding_last_accrued_ms: Optional[int] = None
+    realized_pnl: float = 0.0
+    round_trips: int = 0
+    # DRY simulation anchor: set on the first simulated open. A state file
+    # carrying this can NEVER be run by a live mode (fail closed — the
+    # simulated book would be mistaken for a real one).
+    sim_started_ts: Optional[str] = None
+    sim_deposit_usd: float = 0.0
+    # Alert de-dup: condition key → ISO ts of the last Telegram send while
+    # that condition stayed active. Cleared when the condition resolves.
+    alerts_active: Dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -637,6 +676,19 @@ def _order_state(order_detail: Dict[str, Any]) -> Optional[str]:
     return row.get("state")
 
 
+def _iso_to_ms(ts: Optional[str]) -> Optional[int]:
+    if not ts:
+        return None
+    try:
+        return int(datetime.fromisoformat(ts).timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ms_to_iso(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).isoformat()
+
+
 # =========================  Runner  =========================
 
 class CarryRunner:
@@ -822,8 +874,16 @@ class CarryRunner:
         if self._startup_probes_done:
             return
         if self.mode == MODE_DRY and not self.have_private_creds:
-            # Pure DRY without creds → use fallback constants, mark done.
-            self.fees = {**FALLBACK_FEES, "sources": {k: "fallback" for k in FALLBACK_FEES}}
+            # Pure DRY without creds → the venue's documented static schedule
+            # when the adapter publishes one (HL: no auth needed — the DRY
+            # simulation must charge HL's fees, not OKX's), else fallback.
+            if callable(getattr(self.adapter, "static_fee_schedule", None)):
+                self.fees = pull_live_fees(
+                    self.adapter, spot_inst=self.cfg.spot_symbol,
+                    perp_inst=self.cfg.perp_symbol)
+            else:
+                self.fees = {**FALLBACK_FEES,
+                             "sources": {k: "fallback" for k in FALLBACK_FEES}}
             self.leverage_check = {
                 "configured_cap": self.cfg.leverage_cap,
                 "ok": True,
@@ -930,7 +990,8 @@ class CarryRunner:
         except (TypeError, ValueError, IndexError):
             return None
 
-    def fetch_funding_history(self, limit: int = 100) -> List[float]:
+    def fetch_funding_history_rows(self, limit: int = 100) -> List[Tuple[int, float]]:
+        """Settled funding as (settlement_time_ms, rate) pairs, OLDEST-first."""
         # OKX caps funding-history pages at 100 rows; the HL shim paginates
         # internally and honors the full window (e.g. 2160 = 90d hourly).
         lim = int(limit)
@@ -943,13 +1004,21 @@ class CarryRunner:
         )
         if not isinstance(resp, dict) or not resp.get("data"):
             return []
-        out: List[float] = []
+        out: List[Tuple[int, float]] = []
         for row in reversed(resp["data"]):
             try:
-                out.append(float(row.get("fundingRate", "0")))
+                rate = float(row.get("fundingRate", "0"))
             except (TypeError, ValueError):
                 continue
+            try:
+                t_ms = int(float(row.get("fundingTime") or 0))
+            except (TypeError, ValueError):
+                t_ms = 0
+            out.append((t_ms, rate))
         return out
+
+    def fetch_funding_history(self, limit: int = 100) -> List[float]:
+        return [r for _, r in self.fetch_funding_history_rows(limit=limit)]
 
     def fetch_account_snapshot(self) -> Optional[Dict[str, Any]]:
         if not self.have_private_creds:
@@ -1172,20 +1241,239 @@ class CarryRunner:
         self, state: CarryRunnerState, *, qty_btc: float,
         spot_px: float, perp_px: float, now_iso: str,
     ) -> None:
-        """Update simulated_position to reflect a successful open."""
+        """Update simulated_position to reflect a successful open.
+
+        Books the estimated taker fees of both legs and anchors funding
+        accrual at the open (settlements before it never accrue)."""
+        open_fees = self._leg_fees(qty_btc, spot_px, perp_px)
         state.simulated_position = asdict(CarryPosition(
             spot_qty=qty_btc, perp_qty=-qty_btc,
             entry_spot_price=spot_px, entry_perp_price=perp_px,
+            fees_paid=open_fees,
             opened_ts=now_iso, last_updated_ts=now_iso,
         ))
+        state.funding_last_accrued_ms = _iso_to_ms(now_iso)
 
     def _apply_unwind_result(
         self, state: CarryRunnerState, *, now_iso: str,
-    ) -> None:
-        """Clear simulated_position after a successful unwind."""
+        spot_px: Optional[float] = None, perp_px: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Close the book: realise funding − fees (incl. close fees) + basis
+        P&L into `realized_pnl`, then clear simulated_position."""
+        pos = CarryPosition.from_json(state.simulated_position or {})
+        closed: Dict[str, Any] = {}
+        if not pos.is_flat:
+            sp = float(spot_px or pos.entry_spot_price)
+            pp = float(perp_px or pos.entry_perp_price)
+            close_fees = self._leg_fees(pos.spot_qty, sp, pp)
+            basis = basis_pnl_usd(pos, sp, pp)
+            net = pos.funding_accrued - pos.fees_paid - close_fees + basis
+            closed = {
+                "qty_btc": pos.spot_qty,
+                "opened_ts": pos.opened_ts, "closed_ts": now_iso,
+                "funding_accrued": pos.funding_accrued,
+                "fees_paid": pos.fees_paid + close_fees,
+                "basis_pnl": basis,
+                "net_pnl": net,
+            }
+            state.realized_pnl += net
+            state.round_trips += 1
         state.simulated_position = asdict(CarryPosition(
             last_updated_ts=now_iso,
         ))
+        state.funding_last_accrued_ms = None
+        return closed
+
+    # ---------- book bookkeeping (fees / funding / mark-to-market) ----------
+
+    def _leg_fees(self, qty_btc: float, spot_px: float, perp_px: float) -> float:
+        """Taker fees for one transition of both legs (market orders)."""
+        fees = self.fees or {}
+        spot_t = float(fees.get("spot_taker") or FALLBACK_FEES["spot_taker"])
+        perp_t = float(fees.get("perp_taker") or FALLBACK_FEES["perp_taker"])
+        q = abs(float(qty_btc))
+        return q * float(spot_px) * spot_t + q * float(perp_px) * perp_t
+
+    def _accrue_funding(self, state: CarryRunnerState,
+                        rows: List[Tuple[int, float]],
+                        price: Optional[float]) -> Dict[str, Any]:
+        """Accrue every SETTLED funding row newer than the last accrued one
+        into the open book (idempotent: each settlement counts once, also
+        after a gap — the next successful history read catches up).
+
+        Payment per settlement = |perp_qty| × price × rate, short receives a
+        positive rate. Price = this cycle's perp mid (HL settles on the oracle
+        price; the difference is second-order for a ~1h-old settlement)."""
+        pos = CarryPosition.from_json(state.simulated_position or {})
+        out = {"settlements": 0, "usd": 0.0}
+        if pos.is_flat or not rows:
+            return out
+        last = state.funding_last_accrued_ms
+        if last is None:
+            last = _iso_to_ms(pos.opened_ts) if pos.opened_ts else None
+        if last is None:
+            return out
+        px = float(price or pos.entry_perp_price or 0.0)
+        newest = last
+        for t_ms, rate in rows:
+            if t_ms > last:
+                out["usd"] += funding_accrual_step(pos, rate, px)
+                out["settlements"] += 1
+                newest = max(newest, t_ms)
+        if out["settlements"]:
+            pos.funding_accrued += out["usd"]
+            state.simulated_position = asdict(pos)
+            state.funding_last_accrued_ms = newest
+        return out
+
+    def _pnl(self, state: CarryRunnerState, spot_px: Optional[float],
+             perp_px: Optional[float]) -> Dict[str, Any]:
+        """P&L snapshot of the book: realised + open (funding − fees + basis)."""
+        pos = CarryPosition.from_json(state.simulated_position or {})
+        basis = 0.0
+        if not pos.is_flat and spot_px and perp_px:
+            basis = basis_pnl_usd(pos, spot_px, perp_px)
+        open_net = (pos.funding_accrued - pos.fees_paid + basis) if not pos.is_flat else 0.0
+        out = {
+            "funding_accrued": pos.funding_accrued,
+            "fees_paid": pos.fees_paid,
+            "basis_pnl": basis,
+            "open_net_pnl": open_net,
+            "realized_pnl": state.realized_pnl,
+            "net_pnl": state.realized_pnl + open_net,
+            "round_trips": state.round_trips,
+            "leg_notional_usd": (pos.spot_qty * float(spot_px)
+                                 if (not pos.is_flat and spot_px) else 0.0),
+        }
+        return out
+
+    def _sim_leg_notional(self) -> float:
+        """Per-leg notional the DRY simulation deploys (see sim_deposit_usd)."""
+        if self.cfg.sim_deposit_usd:
+            dep = float(self.cfg.sim_deposit_usd)
+            sz = go_sizing(dep * self.cfg.sim_spot_fraction,
+                           dep * (1.0 - self.cfg.sim_spot_fraction),
+                           self.cfg.live_max_usd,
+                           self.cfg.target_dn_notional_fraction)
+            return sz["per_leg_notional_usd"]
+        return self.cfg.initial_notional_usd * self.cfg.target_dn_notional_fraction
+
+    @property
+    def simulating(self) -> bool:
+        return self.mode == MODE_DRY and bool(self.cfg.sim_enabled)
+
+    # ---------- alerts ----------
+
+    def _send(self, text: str) -> bool:
+        if notify is None:
+            return False
+        try:
+            return bool(notify.send(
+                f"[carry {self.cfg.instance_name} {self.mode}] {text}"))
+        except Exception:  # never let alerting break a cycle
+            return False
+
+    def _alert_event(self, text: str) -> None:
+        """One-shot event (open/close/legging abort/halt trip)."""
+        self._send(text)
+
+    def _alert_condition(self, state: CarryRunnerState, key: str, active: bool,
+                         text: str, now: datetime) -> None:
+        """Persistent condition: alert when it becomes active, re-alert after
+        alert_cooldown_sec while it stays active, clear when it resolves."""
+        if not active:
+            state.alerts_active.pop(key, None)
+            return
+        last = state.alerts_active.get(key)
+        if last:
+            try:
+                age = (now - datetime.fromisoformat(last)).total_seconds()
+            except ValueError:
+                age = float("inf")
+            if age < self.cfg.alert_cooldown_sec:
+                return
+        self._send(text)
+        state.alerts_active[key] = now.isoformat()
+
+    # ---------- single-instance lock ----------
+
+    def acquire_instance_lock(self) -> Any:
+        """Exclusive non-blocking flock on `<instance>/runner.lock`.
+
+        Two processes on the same config/state (e.g. carry@hl-btc and a stray
+        carry-hl@btc, or a cron `--once` next to the unit) would race
+        state.json and — live — double-place orders. The second one exits.
+        The returned file object must be kept alive for the process lifetime.
+        """
+        lock_path = self.state_path.parent / "runner.lock"
+        fh = open(lock_path, "a+")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            raise RuntimeError(
+                f"another carry runner holds {lock_path} — refusing to start "
+                "a second instance on the same state")
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+        self._lock_fh = fh
+        return fh
+
+    # ---------- read-only gate snapshot (green-button watcher) ----------
+
+    def gate_snapshot(self) -> Dict[str, Any]:
+        """Green-button state straight from the venue's settled history.
+        Reads NOTHING from and writes NOTHING to state; places no orders."""
+        window: List[float] = []
+        for attempt in range(3):           # HL info API is occasionally flaky
+            window = self.fetch_funding_history(
+                limit=self.cfg.trailing_window_samples)
+            if window:
+                break
+            time.sleep(2.0 * (attempt + 1))
+        window = window[-self.cfg.trailing_window_samples:]
+        gate = green_button_on(
+            window, self.cfg.funding_on_threshold_annualised,
+            min_samples=self.cfg.gate_min_samples,
+            settlements_per_year=self.cfg.settlements_per_year,
+        )
+        return {"mode": "GATE_ONLY", "instance": self.cfg.instance_name,
+                "ts": datetime.now(timezone.utc).isoformat(), "gate": gate}
+
+    def _do_unwind(self, state: CarryRunnerState, cur_pos: CarryPosition,
+                   action: Dict[str, Any], spot_px: float, perp_px: float,
+                   now_iso: str) -> Optional[Dict[str, Any]]:
+        """Unwind the book: real orders in P2/P3, simulated at mids in DRY."""
+        if self.mode != MODE_DRY:
+            order_result = self.unwind_carry(cur_pos.spot_qty, now_iso=now_iso)
+            if order_result["ok"]:
+                closed = self._apply_unwind_result(
+                    state, now_iso=now_iso, spot_px=spot_px, perp_px=perp_px)
+                action["closed"] = closed
+                self._alert_event(
+                    f"CLOSE carry ({action.get('reason')}): net "
+                    f"${closed.get('net_pnl', 0.0):+,.2f} (funding "
+                    f"${closed.get('funding_accrued', 0.0):+,.2f}, fees "
+                    f"${closed.get('fees_paid', 0.0):,.2f})")
+            else:
+                state.legging_aborts_total += 1
+                self._alert_event(
+                    f"LEGGING ABORT on unwind ({action.get('reason')}): "
+                    f"{order_result.get('reason')} — check the venue book NOW")
+            return order_result
+        if self.simulating:
+            closed = self._apply_unwind_result(
+                state, now_iso=now_iso, spot_px=spot_px, perp_px=perp_px)
+            action["simulated"] = True
+            action["closed"] = closed
+            self._alert_event(
+                f"SIM CLOSE ({action.get('reason')}): net "
+                f"${closed.get('net_pnl', 0.0):+,.2f} (funding "
+                f"${closed.get('funding_accrued', 0.0):+,.2f}, fees "
+                f"${closed.get('fees_paid', 0.0):,.2f}) — DRY-RUN")
+        return None
 
     # ---------- halt management ----------
 
@@ -1213,6 +1501,7 @@ class CarryRunner:
             now_iso = datetime.now(timezone.utc).isoformat()
             self._trip_halt(state, f"startup_probe_failure: {e}", now_iso)
             self.save_state(state)
+            self._alert_event(f"STARTUP HALT — probes failed: {e}")
             self.append_log({
                 "ts": now_iso, "instance": self.cfg.instance_name,
                 "mode": self.mode, "action": {"kind": "startup_halt", "reason": str(e)},
@@ -1222,6 +1511,17 @@ class CarryRunner:
         state = self.load_state()
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
+
+        # Fail closed: a state file that carries a DRY simulation must never
+        # be driven by a live mode — the simulated book would be taken for a
+        # real one (unwinding legs that do not exist). `carry_hl_go go`
+        # archives the DRY state before arming; this is the backstop.
+        if self.mode != MODE_DRY and state.sim_started_ts:
+            msg = ("state.json carries a DRY-RUN simulation (sim_started_ts="
+                   f"{state.sim_started_ts}); archive it before running mode "
+                   f"{self.mode} — refusing to trade on a simulated book")
+            self._alert_condition(state, "sim_state_in_live", True, msg, now)
+            raise RuntimeError(msg)
 
         spot_px = self.fetch_spot_price()
         perp_px = self.fetch_perp_price()
@@ -1249,27 +1549,34 @@ class CarryRunner:
                 refresh_due = (now - last_refresh).total_seconds() >= period_sec
             except ValueError:
                 refresh_due = True
+        funding_accrual: Dict[str, Any] = {"settlements": 0, "usd": 0.0}
         if refresh_due:
-            window = self.fetch_funding_history(
+            rows = self.fetch_funding_history_rows(
                 limit=self.cfg.trailing_window_samples)
-            if window:
-                window = window[-self.cfg.trailing_window_samples:]
-                state.funding_samples = [float(r) for r in window]
-                state.funding_samples_ts = [now_iso] * len(window)
+            if rows:
+                rows = rows[-self.cfg.trailing_window_samples:]
+                state.funding_samples = [float(r) for _, r in rows]
+                state.funding_samples_ts = [
+                    _ms_to_iso(t) if t > 0 else now_iso for t, _ in rows]
                 state.funding_window_last_refresh_ts = now_iso
+                # Settled funding → the open book (all modes; DRY makes this
+                # the simulation's funding leg).
+                funding_accrual = self._accrue_funding(
+                    state, rows, perp_px or spot_px)
 
-        # Green-button decision (annualised at the venue's funding cadence)
+        # Green-button decision (annualised at the venue's funding cadence).
+        # min_samples matches the validating backtest (gate_min_samples).
         gate = green_button_on(
             state.funding_samples,
             self.cfg.funding_on_threshold_annualised,
-            min_samples=1,
+            min_samples=self.cfg.gate_min_samples,
             settlements_per_year=self.cfg.settlements_per_year,
         )
 
-        target_notional = (
-            self.cfg.initial_notional_usd * self.cfg.target_dn_notional_fraction
-            if gate["on"] else 0.0
-        )
+        leg_notional = (self._sim_leg_notional() if self.simulating else
+                        self.cfg.initial_notional_usd
+                        * self.cfg.target_dn_notional_fraction)
+        target_notional = leg_notional if gate["on"] else 0.0
         target = None
         if spot_px and target_notional > 0:
             target = target_position_for(
@@ -1342,12 +1649,8 @@ class CarryRunner:
                     "spot_sell_qty": cur_pos.spot_qty,
                     "perp_buy_qty": -cur_pos.perp_qty,
                 }
-                if self.mode != MODE_DRY:
-                    order_result = self.unwind_carry(cur_pos.spot_qty, now_iso=now_iso)
-                    if order_result["ok"]:
-                        self._apply_unwind_result(state, now_iso=now_iso)
-                    else:
-                        state.legging_aborts_total += 1
+                order_result = self._do_unwind(state, cur_pos, action,
+                                               spot_px, perp_px, now_iso)
             else:
                 action = {"kind": "noop", "reason": "manual_halt_flat"}
         elif basis_kill_trip:
@@ -1358,13 +1661,14 @@ class CarryRunner:
                 "spot_sell_qty": cur_pos.spot_qty,
                 "perp_buy_qty": -cur_pos.perp_qty,
             }
-            if self.mode != MODE_DRY:
-                order_result = self.unwind_carry(cur_pos.spot_qty, now_iso=now_iso)
-                if order_result["ok"]:
-                    self._apply_unwind_result(state, now_iso=now_iso)
-                else:
-                    state.legging_aborts_total += 1
+            order_result = self._do_unwind(state, cur_pos, action,
+                                           spot_px, perp_px, now_iso)
             self._trip_halt(state, "basis_blowout", now_iso)
+            self._alert_event(
+                f"HALT basis-kill: |basis| {basis_frac:.3%} > "
+                f"{self.cfg.basis_kill_pct:.2%} — book unwound"
+                f"{' (simulated)' if self.mode == MODE_DRY else ''}; "
+                "sticky halt until cleared")
         elif state.halted:
             action = {
                 "kind": "noop",
@@ -1379,12 +1683,8 @@ class CarryRunner:
                 "perp_buy_qty": -cur_pos.perp_qty,
                 "spot_price": spot_px, "perp_price": perp_px,
             }
-            if self.mode != MODE_DRY:
-                order_result = self.unwind_carry(cur_pos.spot_qty, now_iso=now_iso)
-                if order_result["ok"]:
-                    self._apply_unwind_result(state, now_iso=now_iso)
-                else:
-                    state.legging_aborts_total += 1
+            order_result = self._do_unwind(state, cur_pos, action,
+                                           spot_px, perp_px, now_iso)
         elif gate["on"] and cur_pos.is_flat and target is not None and target.spot_qty > 0:
             action = {
                 "kind": "do_open" if self.mode != MODE_DRY else "would_open",
@@ -1402,8 +1702,33 @@ class CarryRunner:
                         state, qty_btc=target.spot_qty,
                         spot_px=spot_px, perp_px=perp_px, now_iso=now_iso,
                     )
+                    self._alert_event(
+                        f"OPEN carry {target.spot_qty:.6f} BTC "
+                        f"(leg ${target.notional_usd:,.2f}) spot {spot_px} / "
+                        f"perp {perp_px}")
                 else:
                     state.legging_aborts_total += 1
+                    self._alert_event(
+                        f"LEGGING ABORT on open: {order_result.get('reason')} "
+                        "— check the venue book NOW (one leg may be naked)")
+            elif self.simulating:
+                if not state.sim_started_ts:
+                    # Anchor the paper result at the first simulated open.
+                    state.sim_started_ts = now_iso
+                    state.sim_deposit_usd = float(
+                        self.cfg.sim_deposit_usd or self.cfg.initial_notional_usd)
+                    state.realized_pnl = 0.0
+                    state.round_trips = 0
+                self._apply_open_result(
+                    state, qty_btc=target.spot_qty,
+                    spot_px=spot_px, perp_px=perp_px, now_iso=now_iso,
+                )
+                action["simulated"] = True
+                action["sim_open_fees_usd"] = state.simulated_position["fees_paid"]
+                self._alert_event(
+                    f"SIM OPEN {target.spot_qty:.6f} BTC "
+                    f"(leg ${target.notional_usd:,.2f}) spot {spot_px} / "
+                    f"perp {perp_px} — DRY-RUN, no orders")
         elif gate["on"] and not cur_pos.is_flat and target is not None:
             target_qty = target.spot_qty
             qty_diff = target_qty - cur_pos.spot_qty
@@ -1427,6 +1752,30 @@ class CarryRunner:
         )
         state.last_reconcile_ok = recon.ok
         state.last_reconcile_errors = list(recon.errors)
+
+        pnl = self._pnl(state, spot_px, perp_px)
+        if self.mode == MODE_DRY and state.sim_started_ts:
+            state.simulated_equity = state.sim_deposit_usd + pnl["net_pnl"]
+
+        # Persistent-condition alerts (de-duplicated, see _alert_condition).
+        self._alert_condition(
+            state, "reconcile_fail", not recon.ok,
+            f"RECONCILE FAIL: {'; '.join(recon.errors)[:500]}", now)
+        blow = [a for a in risk_alerts if a["kind"] == "basis_blowout"]
+        self._alert_condition(
+            state, "basis_blowout", bool(blow),
+            (f"BASIS BLOWOUT |basis| {blow[0]['basis_frac']:.3%} > "
+             f"{self.cfg.basis_kill_pct:.2%} (spot {spot_px} / perp {perp_px})"
+             if blow else ""), now)
+        low = [a for a in risk_alerts if a["kind"] == "margin_low"]
+        self._alert_condition(
+            state, "margin_low", bool(low),
+            (f"MARGIN LOW ratio {low[0]['margin_ratio']} < "
+             f"{self.cfg.margin_ratio_alarm}" if low else ""), now)
+        self._alert_condition(
+            state, "halted", bool(state.halted or manual_halt),
+            f"HALTED: {state.halt_reason or ('manual sentinel' if manual_halt else 'unknown')}",
+            now)
 
         if spot_px is not None:
             state.last_spot_price = float(spot_px)
@@ -1460,6 +1809,9 @@ class CarryRunner:
             "current_position": cur_pos.to_json(),
             "drift": asdict(drift) if drift else None,
             "projected_next_funding_usd": projected,
+            "funding_accrual": funding_accrual,
+            "pnl": pnl,
+            "simulated_equity": state.simulated_equity,
             "action": action,
             "order_result": order_result,
             "risk_alerts": risk_alerts,
@@ -1480,7 +1832,10 @@ class CarryRunner:
 
         self.save_state(state)
         self.append_log(entry)
-        self.write_health(self.health(state, recon))
+        self.write_health(self.health(state, recon, extra={
+            "gate": gate, "pnl": pnl, "last_action": action.get("kind"),
+            "last_action_reason": action.get("reason"),
+        }))
 
         log_msg = (
             f"[{self.cfg.instance_name}] cycle #{state.cycles_total} "
@@ -1511,8 +1866,9 @@ class CarryRunner:
     # ---------- health ----------
 
     def health(self, state: CarryRunnerState,
-               recon: Optional[CarryReconcileResult] = None) -> Dict[str, Any]:
-        return {
+               recon: Optional[CarryReconcileResult] = None,
+               extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        out = {
             "alive": True,
             "instance": self.cfg.instance_name,
             "mode": self.mode,
@@ -1537,10 +1893,42 @@ class CarryRunner:
                 len(recon.errors) if recon else len(state.last_reconcile_errors)
             ),
             "have_private_creds": self.have_private_creds,
+            "simulating": self.simulating,
+            "sim_started_ts": state.sim_started_ts,
+            "sim_deposit_usd": state.sim_deposit_usd,
+            "realized_pnl": state.realized_pnl,
+            "round_trips": state.round_trips,
+            "fees": ({k: self.fees.get(k) for k in FALLBACK_FEES}
+                     if self.fees else None),
         }
+        if extra:
+            out.update(extra)
+        return out
 
 
 # =========================  CLI  =========================
+
+_CRED_ENV_KEYS = (
+    "HL_PRIVATE_KEY", "HL_CARRY_PRIVATE_KEY", "HL_CONFIRM_LIVE",
+    "OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE",
+)
+
+
+def gate_only(cfg: CarryRunnerConfig) -> Dict[str, Any]:
+    """Read-only green-button check for the daily watcher.
+
+    Whatever the config says (it is live after `carry_hl_go go`), this
+    builds a DRY runner WITHOUT credentials: no orders are possible, no
+    account is read, state.json is not touched."""
+    from dataclasses import replace
+    dry = replace(cfg, dry_run=True, okx_demo=False, allow_live=False)
+    saved = {k: os.environ.pop(k) for k in _CRED_ENV_KEYS if k in os.environ}
+    try:
+        runner = CarryRunner(dry)
+    finally:
+        os.environ.update(saved)
+    return runner.gate_snapshot()
+
 
 def main(argv: Optional[List[str]] = None) -> int:
     # Guarantee live journald output regardless of PYTHONUNBUFFERED in the unit.
@@ -1556,6 +1944,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--max-cycles", type=int, default=None,
                     help="for --loop, exit after N cycles (test/dev)")
+    ap.add_argument("--gate-only", action="store_true",
+                    help="print the green-button state from the venue's "
+                         "settled funding history and exit. Forced DRY, no "
+                         "credentials, reads/writes no state, takes no lock "
+                         "(safe next to the running unit)")
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args(argv)
 
@@ -1565,7 +1958,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     cfg = load_config(args.config)
+
+    if args.gate_only:
+        print(json.dumps(gate_only(cfg), indent=2, default=str))
+        return 0
+
     runner = CarryRunner(cfg)
+    runner.acquire_instance_lock()
 
     if args.loop:
         runner.loop(max_cycles=args.max_cycles)

@@ -13,7 +13,7 @@
   "okx_demo": false,
   "allow_live": false,
   "live_max_usd": 1000,
-  "_mode_comment": "GREEN-BUTTON flipped ON 2026-07-20 (trailing-90d +5.49%/yr > +5%). Ships DRY_RUN until funded; activation = scripts.carry_hl_go go (sets sizing from actual balances, flips dry_run=false + allow_live=true + env HL_CONFIRM_LIVE=YES, restarts carry@hl-btc). Live needs all of those AND per-leg notional <= live_max_usd; okx_demo must stay false (HL has no demo venue — the runner rejects it). Testnet paper = hl_network=testnet + dry_run=false + allow_live=true.",
+  "_mode_comment": "GREEN-BUTTON flipped ON 2026-07-20 (trailing-90d +5.49%/yr > +5%). Ships DRY_RUN until funded; activation = scripts.carry_hl_go go (sets sizing from actual balances, flips dry_run=false + allow_live=true + env HL_CONFIRM_LIVE=YES, restarts carry@hl-btc with rollback on a failed start/verify; archives the DRY state first). Live needs all of those AND per-leg notional <= live_max_usd; okx_demo must stay false (HL has no demo venue — the runner rejects it). Testnet paper = hl_network=testnet + dry_run=false + allow_live=true.",
   "initial_notional_usd": 5000.0,
   "target_dn_notional_fraction": 0.6,
   "leverage_cap": 2.0,
@@ -22,9 +22,15 @@
   "trailing_window_samples": 2160,
   "_cadence_comment": "Hyperliquid funding settles HOURLY: native hourly samples, 24*365=8760 settlements/yr, 90d window = 2160 samples. Do NOT aggregate to 8h. The runner refreshes the window WHOLESALE from funding HISTORY once per settlement (one sample per settled hour) — never per 60s cycle — so 2160 samples really is trailing 90d.",
   "funding_on_threshold_annualised": 0.05,
+  "gate_min_samples": 1080,
+  "_gate_min_samples_comment": "Green-button needs >=1080 settled hourly samples (50% of the 90d window) before it may read ON — identical to MIN_WINDOW_SAMPLES in the validating backtest (research backtest/sweep/hl_carry.py, HL-CARRY-STUDY B0). Was min_samples=1 until 2026-10-08.",
   "basis_kill_pct": 0.01,
   "margin_ratio_alarm": 1.5,
   "legging_window_sec": 5,
   "rebalance_threshold_pct": 0.05,
-  "cycle_interval_sec": 60
+  "cycle_interval_sec": 60,
+  "sim_enabled": true,
+  "sim_deposit_usd": 1500.0,
+  "sim_spot_fraction": 0.55,
+  "_sim_comment": "DRY-RUN proef (2026-10-08): in DRY the runner opens/closes a SIMULATED book on the green-button, sized exactly like `carry_hl_go go` would from a $1,500 deposit split 55% spot / 45% perp (per-leg = min(spot/1.02, perp/0.8, live_max_usd) = $808.82). Fills at the cycle's mids, HL base-tier taker fees on both legs (spot 0.07%, perp 0.045%), funding accrued per SETTLED hourly row from HL fundingHistory, basis P&L marked to market. Result in health.json (pnl, simulated_equity). Proef criteria: ~/Projects/trading/hl-lanes/LANE-carry.md."
 }

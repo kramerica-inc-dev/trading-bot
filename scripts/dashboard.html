@@ -1830,8 +1830,13 @@ function renderCarry() {
     psEl.style.color = 'var(--text-dim)';
     subEl.textContent = 'No open carry pair';
     detEl.innerHTML = '';
+    const pf = h.pnl || null;
+    if (pf && (pf.round_trips || 0) > 0) {
+      detEl.innerHTML = configRow('Realized P&L (' + pf.round_trips + ' round trips)', fmtSignedUsd(pf.realized_pnl || 0),
+        (pf.realized_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)');
+    }
   } else {
-    psEl.textContent = '+' + spotQ.toFixed(6) + ' BTC';
+    psEl.textContent = '+' + spotQ.toFixed(6) + ' BTC' + (h.simulating ? ' (SIM)' : '');
     psEl.style.color = 'var(--green)';
     subEl.textContent = perpQ.toFixed(6) + ' BTC perp (short)';
     // Realized + unrealized P&L (best-effort from state + latest cycle prices).
@@ -1850,6 +1855,15 @@ function renderCarry() {
     d += configRow('Funding accrued', fmtSignedUsd(pos.funding_accrued || 0),
       (pos.funding_accrued || 0) >= 0 ? 'var(--green)' : 'var(--red)');
     d += configRow('Fees paid', fmtUsd(pos.fees_paid || 0), 'var(--amber)');
+    const pnl = h.pnl || null;
+    if (pnl) {
+      d += configRow('Net P&L (funding − fees + basis)', fmtSignedUsd(pnl.net_pnl || 0),
+        (pnl.net_pnl || 0) >= 0 ? 'var(--green)' : 'var(--red)');
+    }
+    if (h.simulating && h.sim_started_ts) {
+      d += configRow('Simulated equity (DRY proef)', '$' + fmt(h.simulated_equity || 0, 2));
+      d += configRow('Proef since', relTime(h.sim_started_ts));
+    }
     if (pos.opened_ts) d += configRow('Opened', relTime(pos.opened_ts));
     detEl.innerHTML = d;
   }

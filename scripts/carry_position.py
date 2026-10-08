@@ -18,6 +18,7 @@ running sum in USD (positive = received).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, Optional
 
@@ -294,3 +295,49 @@ def green_button_on(
         "samples": samples,
         "reason": "above_threshold" if on else "below_threshold",
     }
+
+
+# ---------------------------------------------------------------------------
+# Activation sizing (shared by carry_hl_go `go` and the DRY simulation)
+# ---------------------------------------------------------------------------
+
+# Sizing buffers (HL-CARRY-STUDY + go-script design note):
+#   spot leg needs notional × (fees+slippage buffer);
+#   perp leg gets ≥ 0.8 × notional so margin_ratio starts ≥ 1.6 at L=2
+#   (alarm threshold is 1.5) and the S1 worst-rally bound keeps headroom.
+GO_SPOT_BUFFER = 1.02
+GO_PERP_FUND_FRACTION = 0.8
+
+
+def go_sizing(spot_free_usd: float, perp_account_value_usd: float,
+              live_max_usd: float, notional_fraction: float) -> Dict[str, float]:
+    """Per-leg notional `carry_hl_go go` applies from the wallet's balances.
+
+    Single source of truth so the DRY simulation sizes EXACTLY like the live
+    activation would (a $1,500 deposit split 55/45 → per-leg ≈ $808.82).
+    """
+    cap = float(live_max_usd)
+    frac = float(notional_fraction)
+    notional = min(float(spot_free_usd) / GO_SPOT_BUFFER,
+                   float(perp_account_value_usd) / GO_PERP_FUND_FRACTION, cap)
+    notional = max(0.0, round(notional, 2))
+    return {
+        "per_leg_notional_usd": notional,
+        # FLOORED to the cent: rounding up would make the runner's P3 guard
+        # (initial × fraction ≤ live_max_usd) trip by $0.002 whenever the
+        # live_max cap is the binding term.
+        "initial_notional_usd": (math.floor(notional / frac * 100.0) / 100.0
+                                 if frac > 0 else 0.0),
+        "live_max_usd": cap,
+    }
+
+
+def basis_pnl_usd(position: CarryPosition, spot_price: float,
+                  perp_price: float) -> float:
+    """Mark-to-market P&L of both legs vs entry (USD). For a delta-neutral
+    carry this is the basis P&L: price moves cancel, basis changes do not."""
+    if position.is_flat:
+        return 0.0
+    spot_leg = position.spot_qty * (float(spot_price) - position.entry_spot_price)
+    perp_leg = position.perp_qty * (float(perp_price) - position.entry_perp_price)
+    return spot_leg + perp_leg
