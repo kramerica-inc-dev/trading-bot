@@ -109,11 +109,22 @@ class TestParseOrder(unittest.TestCase):
 
 class _FakeInfo:
     """Network-free stand-in exposing the two reads account_value uses."""
-    def __init__(self, perp=None, spot=None, raise_perp=False, raise_spot=False):
+    def __init__(self, perp=None, spot=None, raise_perp=False, raise_spot=False,
+                 abstraction="unifiedAccount"):
         self._perp = perp or {}
         self._spot = spot or {}
         self._raise_perp = raise_perp
         self._raise_spot = raise_spot
+        self._abstraction = abstraction       # str, or an Exception to raise
+        self.abstraction_calls = 0
+
+    def post(self, path, payload):
+        if payload.get("type") == "userAbstraction":
+            self.abstraction_calls += 1
+            if isinstance(self._abstraction, Exception):
+                raise self._abstraction
+            return self._abstraction
+        raise AssertionError(f"unexpected post {payload}")
 
     def user_state(self, addr):
         if self._raise_perp:
@@ -135,47 +146,109 @@ def _adapter_with(info, address="0xMaster"):
 
 @unittest.skipUnless(HAVE_SDK, "hyperliquid-python-sdk not installed")
 class TestAccountValue(unittest.TestCase):
-    # equity = perp marginSummary.accountValue + free spot USDC (total - hold)
+    # equity model (combine_equity): unified/portfolio-margin → spot USDC total;
+    # standard → perp accountValue + spot USDC total.
     def test_standard_mode_uses_perp_account_value(self):
         # funds on perp side, spot empty → perp accountValue is the equity
         info = _FakeInfo(perp={"marginSummary": {"accountValue": "999.0"}},
-                         spot={"balances": []})
+                         spot={"balances": []}, abstraction="default")
         self.assertAlmostEqual(_adapter_with(info).account_value(), 999.0)
 
+    def test_standard_mode_adds_spot_usdc_total(self):
+        info = _FakeInfo(perp={"marginSummary": {"accountValue": "600.0"}},
+                         spot={"balances": [{"coin": "USDC", "total": "400.0", "hold": "50.0"}]},
+                         abstraction="default")
+        self.assertAlmostEqual(_adapter_with(info).account_value(), 1000.0)
+
     def test_unified_mode_no_positions_uses_spot(self):
-        # perp marginSummary is the 'not meaningful' 0, all USDC free in spot
+        # perp marginSummary is the 'not meaningful' 0, all USDC in spot
         info = _FakeInfo(perp={"marginSummary": {"accountValue": "0.0"}},
                          spot={"balances": [{"coin": "USDC", "total": "999.0", "hold": "0.0"}]})
         self.assertAlmostEqual(_adapter_with(info).account_value(), 999.0)
 
-    def test_unified_mode_with_positions_sums_perp_and_free_spot(self):
-        # empirically-observed unified-with-positions shape: equity = perp AV +
-        # free spot (total-hold) = 198.85 + (990.01-197.99) = 990.87. Subtracting
-        # `hold` removes the margin that unified mode also counts in perp AV;
-        # NOT subtracting it would wrongly give 1188 on a ~991 account.
+    def test_unified_with_positions_is_spot_total_live_fixture(self):
+        # REAL response pair from the mainnet account (0x70Cb…4c89), captured
+        # 2026-10-08 08:34Z with 6 legs open (gross ~468). HL portfolio = 155.714183
+        # = spot USDC total. The old model (perp AV + total - hold) gave 155.526.
         info = _FakeInfo(
-            perp={"marginSummary": {"accountValue": "198.85"}},
-            spot={"balances": [{"coin": "USDC", "total": "990.01", "hold": "197.99"}]})
-        self.assertAlmostEqual(_adapter_with(info).account_value(), 990.87, places=2)
+            perp={"marginSummary": {"accountValue": "93.493092", "totalNtlPos": "468.406094",
+                                    "totalRawUsd": "0.0", "totalMarginUsed": "93.681218"}},
+            spot={"balances": [{"coin": "USDC", "token": 0, "total": "155.714183",
+                                "hold": "93.681218", "entryNtl": "0.0"}]})
+        self.assertAlmostEqual(_adapter_with(info).account_value(), 155.714183, places=6)
+
+    def test_unified_does_not_add_perp_minus_hold(self):
+        # Shape of the 2026-08-22 false 25% halt: perp AV well BELOW the spot hold
+        # (open book with losing legs) — the old model read ~23 USD low (135 vs
+        # ~157 true). Equity must be the spot total, independent of perp AV/hold.
+        info = _FakeInfo(
+            perp={"marginSummary": {"accountValue": "60.0"}},
+            spot={"balances": [{"coin": "USDC", "total": "157.0", "hold": "83.0"}]})
+        self.assertAlmostEqual(_adapter_with(info).account_value(), 157.0)
+
+    def test_live_unified_fixtures_match_portfolio(self):
+        # Third-party unified accounts with open cross positions (public info API,
+        # 2026-10-08): HL portfolio accountValue == spot USDC total in every case.
+        for perp_av, total, hold, portfolio in (
+                ("597.509513", "6422.88", "597.31", 6422.88),
+                ("778.401205", "4503.56", "779.06", 4503.56),
+                ("305.355503", "1824.51", "306.15", 1824.51)):
+            info = _FakeInfo(perp={"marginSummary": {"accountValue": perp_av}},
+                             spot={"balances": [{"coin": "USDC", "total": total, "hold": hold}]})
+            self.assertAlmostEqual(_adapter_with(info).account_value(), portfolio, places=2)
+
+    def test_portfolio_margin_treated_as_unified(self):
+        info = _FakeInfo(perp={"marginSummary": {"accountValue": "50.0"}},
+                         spot={"balances": [{"coin": "USDC", "total": "200.0", "hold": "48.0"}]},
+                         abstraction="portfolioMargin")
+        self.assertAlmostEqual(_adapter_with(info).account_value(), 200.0)
 
     def test_genuinely_unfunded_returns_zero(self):
         info = _FakeInfo(perp={"marginSummary": {"accountValue": "0.0"}},
                          spot={"balances": [{"coin": "USDC", "total": "0.0", "hold": "0.0"}]})
         self.assertEqual(_adapter_with(info).account_value(), 0.0)
 
-    def test_spot_outage_perp_funded_uses_perp(self):
-        # a perp-funded (standard-mode) account must NOT skip on a spot outage
+    def test_spot_outage_standard_perp_funded_uses_perp(self):
+        # a perp-funded standard-mode account must NOT skip on a spot outage
+        import hl_adapter
+        with unittest.mock.patch.object(hl_adapter.time, "sleep", lambda *_: None):
+            info = _FakeInfo(perp={"marginSummary": {"accountValue": "750.0"}},
+                             raise_spot=True, abstraction="default")
+            self.assertAlmostEqual(_adapter_with(info).account_value(), 750.0)
+
+    def test_spot_outage_unified_returns_none(self):
+        # unified equity IS the spot balance → unreadable spot = unknown → None
         import hl_adapter
         with unittest.mock.patch.object(hl_adapter.time, "sleep", lambda *_: None):
             info = _FakeInfo(perp={"marginSummary": {"accountValue": "750.0"}}, raise_spot=True)
-            self.assertAlmostEqual(_adapter_with(info).account_value(), 750.0)
+            self.assertIsNone(_adapter_with(info).account_value())
 
     def test_spot_outage_no_perp_returns_none(self):
-        # perp ~0 + spot unreadable → genuinely undeterminable → None (skip, no halt)
         import hl_adapter
         with unittest.mock.patch.object(hl_adapter.time, "sleep", lambda *_: None):
-            info = _FakeInfo(perp={"marginSummary": {"accountValue": "0.0"}}, raise_spot=True)
+            info = _FakeInfo(perp={"marginSummary": {"accountValue": "0.0"}},
+                             raise_spot=True, abstraction="default")
             self.assertIsNone(_adapter_with(info).account_value())
+
+    def test_abstraction_unreadable_returns_none(self):
+        # never guess the equity model: no abstraction read → transient skip
+        import hl_adapter
+        with unittest.mock.patch.object(hl_adapter.time, "sleep", lambda *_: None):
+            info = _FakeInfo(perp={"marginSummary": {"accountValue": "10.0"}},
+                             spot={"balances": [{"coin": "USDC", "total": "100.0", "hold": "9.0"}]},
+                             abstraction=RuntimeError("down"))
+            self.assertIsNone(_adapter_with(info).account_value())
+
+    def test_abstraction_cached_and_kept_on_later_failure(self):
+        info = _FakeInfo(perp={"marginSummary": {"accountValue": "10.0"}},
+                         spot={"balances": [{"coin": "USDC", "total": "100.0", "hold": "9.0"}]})
+        a = _adapter_with(info)
+        self.assertAlmostEqual(a.account_value(), 100.0)
+        self.assertAlmostEqual(a.account_value(), 100.0)
+        self.assertEqual(info.abstraction_calls, 1)            # cached within TTL
+        a._abstraction_ts = 0.0                                 # TTL expired
+        info._abstraction = RuntimeError("down")
+        self.assertAlmostEqual(a.account_value(), 100.0)        # last known mode kept
 
     def test_no_address_returns_zero(self):
         self.assertEqual(_adapter_with(_FakeInfo(), address=None).account_value(), 0.0)

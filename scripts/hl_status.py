@@ -2,9 +2,10 @@
 """Read-only Hyperliquid account monitor — balance, positions, PnL.
 
 Hits the PUBLIC Hyperliquid info API (no wallet / no keys), so it is safe to run
-anywhere (laptop, LXC, cron). Mirrors hl_adapter.account_value()'s equity model:
-unified-account equity = perp marginSummary.accountValue + free spot USDC
-(spot total - hold), so the number matches what hl_xs_runner sizes the book on.
+anywhere (laptop, LXC, cron). Mirrors hl_adapter.combine_equity()'s equity model:
+unified/portfolio-margin account equity = spot USDC total (HL's portfolio value);
+standard mode = perp marginSummary.accountValue + spot USDC total — so the number
+matches what hl_xs_runner sizes the book on.
 
 Usage:
     python -m scripts.hl_status                      # pretty, default address
@@ -65,7 +66,15 @@ def fetch(address: str) -> dict:
             usdc_hold = float(b.get("hold") or 0.0)
             break
     spot_free = max(0.0, usdc_total - usdc_hold)
-    equity = perp_av + spot_free  # matches hl_adapter.account_value()
+    try:
+        abstraction = _post({"type": "userAbstraction", "user": address})
+    except Exception:
+        abstraction = None
+    # matches hl_adapter.combine_equity() (kept dependency-free: no SDK import)
+    if abstraction in ("unifiedAccount", "portfolioMargin"):
+        equity = usdc_total
+    else:
+        equity = perp_av + usdc_total
 
     positions = []
     gross = net_upnl = 0.0
@@ -92,6 +101,7 @@ def fetch(address: str) -> dict:
 
     return {
         "address": address,
+        "abstraction": abstraction,
         "equity": equity,
         "perp_account_value": perp_av,
         "spot_usdc_total": usdc_total,

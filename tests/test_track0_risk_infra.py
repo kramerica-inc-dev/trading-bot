@@ -193,6 +193,8 @@ class _FakeInfo:
         return self._spot
 
     def post(self, path, payload):
+        if payload.get("type") == "userAbstraction":
+            return "unifiedAccount"
         if isinstance(self._post, Exception):
             raise self._post
         return self._post
@@ -218,11 +220,12 @@ class TestMarginState(unittest.TestCase):
         self.assertAlmostEqual(m["withdrawable"], 700.0)
 
     def test_unified_account_ratio_uses_total_equity(self):
-        # perp side holds ~just the margin earmark; the buffer sits free in spot.
-        # ratio must be used/(perp_av + free spot), NOT used/perp_av (~1.0).
+        # unified: equity = spot USDC total (HL portfolio value); the perp side
+        # holds ~just the margin earmark. ratio must be used/spot_total, NOT
+        # used/perp_av (~1.0) and NOT used/(perp_av + total - hold).
         info = _FakeInfo(
             user={"marginSummary": {"accountValue": "67.0", "totalMarginUsed": "67.0"}},
-            spot={"balances": [{"coin": "USDC", "total": "106.0", "hold": "0.0"}]})
+            spot={"balances": [{"coin": "USDC", "total": "173.0", "hold": "67.0"}]})
         m = _adapter_with(info).margin_state()
         self.assertAlmostEqual(m["margin_ratio"], 67.0 / 173.0, places=4)
         self.assertAlmostEqual(m["account_value"], 173.0)

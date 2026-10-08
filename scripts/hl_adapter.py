@@ -64,6 +64,36 @@ def _mask(addr: Optional[str]) -> str:
     return f"{addr[:6]}…{addr[-4:]}" if addr and len(addr) > 12 else str(addr)
 
 
+# Account-abstraction modes in which the SPOT clearinghouse is the single
+# collateral ledger (HL docs, "Account abstraction modes": "unified account and
+# portfolio margin show all balances and holds in the spot clearinghouse state.
+# Individual perp dex user states are not meaningful").
+UNIFIED_ABSTRACTIONS = frozenset({"unifiedAccount", "portfolioMargin"})
+
+
+def combine_equity(abstraction: Optional[str], perp_av: float,
+                   usdc_total: float, usdc_hold: float) -> float:
+    """Total account equity in USD from the two clearinghouse reads.
+
+    * UNIFIED / portfolio-margin account: equity = spot USDC `total`. That
+      balance is already marked-to-market (it moves with perp unrealized PnL)
+      and IS what HL's own portfolio page reports. The perp marginSummary is a
+      sub-view of the same collateral, so adding it — even net of the spot
+      `hold` — double-counts: `perp accountValue - hold` is NOT zero and drifts
+      with the open book. That drift was the 2026-08-22 false 25% halt: the bot
+      read 135.28 while HL showed ~157 (flatten realised 156.01), and the
+      2026-06-13 false catastrophe (163.30 read vs 170.84 realised). Verified
+      2026-10-08 on 12 live unified accounts with open positions: portfolio
+      accountValue == spot USDC total exactly, while perp_av + total - hold was
+      off by up to 1%; on our own account the error ranged -22..+10 USD.
+    * Standard ("default"/"disabled"/dexAbstraction/unknown): perp and spot are
+      separate ledgers → equity = perp accountValue + spot USDC total (a spot
+      `hold` is a resting spot order — still the account's money)."""
+    if abstraction in UNIFIED_ABSTRACTIONS:
+        return usdc_total
+    return perp_av + usdc_total
+
+
 @dataclass
 class HLOrderResult:
     ok: bool
@@ -134,6 +164,8 @@ class HLAdapter:
         self._meta_cache: Optional[dict] = None
         self._spot_meta_cache: Optional[dict] = None
         self._last_av_time_ms: Optional[int] = None   # chain `time` from the last account_value read (staleness gate)
+        self._abstraction: Optional[str] = None       # cached userAbstraction mode (see account_abstraction)
+        self._abstraction_ts: float = 0.0
         self._latency = _LatencyRing()
         self._instrument_latency()
 
@@ -403,39 +435,56 @@ class HLAdapter:
         except Exception:
             return None
 
-    def _spot_usdc_free(self) -> Optional[float]:
-        """FREE (un-held) USDC in the spot clearinghouse: total − hold. `hold` is
-        spot USDC that is reserved — in a UNIFIED account the perp-margin earmark
-        (which is ALSO counted in perp marginSummary.accountValue), plus any
-        resting spot orders / pending transfers. Subtracting it is exactly what
-        stops `account_value` double-counting the margin once positions are open.
-        Empirically verified on-chain: perp_av 198.85 + free 792.02 = 990.87 on a
-        ~991 account (vs 1188 if `hold` were NOT removed). None on a read failure."""
+    def _spot_usdc(self) -> Optional[tuple]:
+        """(total, hold) of USDC in the spot clearinghouse; (0.0, 0.0) when the
+        account holds no USDC; None on a read failure."""
         try:
             ss = self.info.spot_user_state(self.address)
             for b in ss.get("balances", []) or []:
                 if b.get("coin") == "USDC":
-                    total = float(b.get("total") or 0.0)
-                    hold = float(b.get("hold") or 0.0)
-                    return max(0.0, total - hold)
-            return 0.0
+                    return float(b.get("total") or 0.0), float(b.get("hold") or 0.0)
+            return 0.0, 0.0
         except Exception:
             return None
 
+    def _spot_usdc_free(self) -> Optional[float]:
+        """FREE (un-held) spot USDC: total − hold. None on a read failure. Kept
+        for callers that want withdrawable-style spot cash; NOT an equity term
+        (see combine_equity)."""
+        t = self._spot_usdc()
+        return None if t is None else max(0.0, t[0] - t[1])
+
+    ABSTRACTION_TTL_SEC = 3600.0
+
+    def account_abstraction(self) -> Optional[str]:
+        """The account's abstraction mode ("unifiedAccount", "portfolioMargin",
+        "default", "disabled", "dexAbstraction", ...) via the public
+        userAbstraction info request. Cached for ABSTRACTION_TTL_SEC (a mode
+        switch is a rare user action); on a read failure the last known value is
+        kept, and None is returned only if it was never read."""
+        now = time.time()
+        cached = getattr(self, "_abstraction", None)        # getattr: __new__-built test stubs
+        if cached is not None and now - getattr(self, "_abstraction_ts", 0.0) < self.ABSTRACTION_TTL_SEC:
+            return cached
+        try:
+            r = self.info.post("/info", {"type": "userAbstraction", "user": self.address})
+            if isinstance(r, str) and r:
+                self._abstraction = r
+                self._abstraction_ts = now
+        except Exception:
+            pass
+        return getattr(self, "_abstraction", None)
+
     def account_value(self) -> Optional[float]:
-        """Total account equity (USD) usable as perp collateral — correct for
-        BOTH standard and UNIFIED (HL default) account modes:
+        """Total account equity (USD), matching HL's own portfolio value in
+        every account-abstraction mode — see combine_equity for the model:
+        unified/portfolio-margin → spot USDC total; standard → perp
+        accountValue + spot USDC total.
 
-            equity = perp marginSummary.accountValue + free spot USDC
-
-        In standard mode spot USDC is ~0, so this is just the perp account value.
-        In a unified account the collateral SPLITS between the perp side
-        (accountValue, which already carries unrealized PnL and the margin
-        earmark) and the un-held spot balance; their sum is the true equity. This
-        avoids the 'unfunded' false-skip (perp reads ~0 before any position) and
-        the 80%-false-drawdown (perp accountValue alone ignores the spot
-        remainder once positions open). Retries; returns None on a TRANSIENT read
-        so a hiccup isn't mistaken for a real 0; a genuine empty account is 0.0."""
+        Retries; returns None on a TRANSIENT read so a hiccup isn't mistaken for
+        a real 0; a genuine empty account is 0.0. If the abstraction mode can't
+        be read (never read successfully), returns None — sizing or breaking on
+        a guessed equity model is worse than skipping a cycle."""
         if not self.address:
             return 0.0
         for i in range(3):
@@ -451,16 +500,18 @@ class HLAdapter:
                 if ms is None or "accountValue" not in ms:
                     time.sleep(0.4 * (i + 1)); continue
                 perp_av = float(ms["accountValue"])
-                spot_free = self._spot_usdc_free()
-                if spot_free is None:
-                    # Spot-endpoint hiccup. A perp-FUNDED (standard-mode) account
-                    # doesn't need the spot read — mark off perp alone rather than
-                    # skipping the whole cycle. If perp is ~0 the funds may be
-                    # unified in spot, so we genuinely can't tell → retry/None.
-                    if perp_av > 1e-9:
+                abstraction = self.account_abstraction()
+                if abstraction is None:
+                    time.sleep(0.4 * (i + 1)); continue
+                spot = self._spot_usdc()
+                if spot is None:
+                    # Spot-endpoint hiccup. A STANDARD-mode perp-funded account
+                    # can be marked off perp alone; a unified account cannot
+                    # (its equity IS the spot balance) → retry/None.
+                    if abstraction not in UNIFIED_ABSTRACTIONS and perp_av > 1e-9:
                         return perp_av
                     time.sleep(0.4 * (i + 1)); continue
-                return perp_av + spot_free
+                return combine_equity(abstraction, perp_av, spot[0], spot[1])
             except Exception:
                 time.sleep(0.4 * (i + 1))
         return None
@@ -544,11 +595,11 @@ class HLAdapter:
     def margin_state(self) -> Optional[dict]:
         """Perp margin snapshot for risk observability: {account_value,
         total_margin_used, total_ntl_pos, withdrawable, margin_ratio}.
-        margin_ratio = totalMarginUsed / TOTAL equity (perp accountValue +
-        free spot USDC) — in a UNIFIED account the perp accountValue is mostly
-        just the margin earmark itself (the rest of the collateral sits free
-        on the spot side), so a perp-only ratio would read ~1.0 on a perfectly
-        healthy book. Falls back to the perp-only (conservative, overstated)
+        margin_ratio = totalMarginUsed / TOTAL equity (combine_equity: spot
+        USDC total in a UNIFIED account, perp accountValue + spot USDC total in
+        standard mode) — in a unified account the perp accountValue is mostly
+        just the margin earmark, so a perp-only ratio would read ~1.0 on a
+        perfectly healthy book. Falls back to the perp-only (conservative, overstated)
         ratio when the spot read fails. None on a read failure / no address —
         callers treat that as 'unknown', never as safe."""
         if not self.address:
@@ -560,7 +611,12 @@ class HLAdapter:
                 return None
             av = float(ms["accountValue"])
             used = float(ms.get("totalMarginUsed") or 0.0)
-            equity = av + (self._spot_usdc_free() or 0.0)
+            spot = self._spot_usdc()
+            abstraction = self.account_abstraction()
+            if spot is None or abstraction is None:
+                equity = av                          # conservative: overstated ratio
+            else:
+                equity = combine_equity(abstraction, av, spot[0], spot[1])
             return {"account_value": equity,
                     "total_margin_used": used,
                     "total_ntl_pos": float(ms.get("totalNtlPos") or 0.0),
